@@ -152,7 +152,7 @@ for pair in "${MODELS[@]}"; do
   convert_output=$(ct2-transformers-converter \
       --model "${model}" \
       --output_dir "${out_dir}" \
-      --quantization int8 \
+      --quantization float32 \
       --copy_files source.spm target.spm \
       --force 2>&1) && convert_ok=true || convert_ok=false
   # Print output with warnings stripped

@@ -17,7 +17,7 @@ impl LoadedModel {
         let tokenizer = SpmTokenizer::new(model_dir)
             .map_err(|e| TranslatorError::Ct2(e.to_string()))?;
         let config = Config {
-            compute_type: ComputeType::INT8_FLOAT32,
+            compute_type: ComputeType::FLOAT32,
             ..Config::default()
         };
         let translator = Translator::with_tokenizer(model_dir, tokenizer, &config)
