@@ -1,0 +1,18 @@
+[package]
+name    = "translator-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "translator"
+path = "src/main.rs"
+
+[dependencies]
+translator-core    = { workspace = true }
+lingua             = { workspace = true }
+clap               = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

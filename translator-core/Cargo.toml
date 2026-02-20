@@ -1,0 +1,13 @@
+[package]
+name    = "translator-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ct2rs     = { workspace = true }
+lingua    = { workspace = true }
+dashmap   = { workspace = true }
+tokio     = { workspace = true, features = ["rt"] }
+thiserror = { workspace = true }
+serde     = { workspace = true }
+tracing   = { workspace = true }
