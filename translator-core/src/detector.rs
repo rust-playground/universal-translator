@@ -16,14 +16,18 @@ impl Detector {
 
     /// Returns a lowercase ISO 639-1 code, e.g. `"en"`.
     pub fn detect(&self, text: &str) -> Result<String, TranslatorError> {
-        self.inner
-            .detect_language_of(text)
-            .map(|lang| language_to_iso639_1(&lang))
-            .ok_or_else(|| {
-                TranslatorError::DetectionFailed(format!(
-                    "Could not detect language for text: {text:?}"
-                ))
-            })
+        // Lingua first — covers 75 languages including all but 1 of our supported set.
+        if let Some(lang) = self.inner.detect_language_of(text) {
+            return Ok(language_to_iso639_1(&lang));
+        }
+        // Lingua returned None. Fall back to script-based detection for languages
+        // outside lingua's coverage (currently: Malayalam).
+        if let Some(code) = detect_script(text) {
+            return Ok(code.to_string());
+        }
+        Err(TranslatorError::DetectionFailed(format!(
+            "Could not detect language for text: {text:?}"
+        )))
     }
 }
 
@@ -31,6 +35,17 @@ impl Default for Detector {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Script-based language detection fallback for languages not covered by lingua.
+///
+/// Malayalam uses a unique Unicode block (U+0D00–U+0D7F). No other language uses
+/// these codepoints, so a single character scan is unambiguous.
+fn detect_script(text: &str) -> Option<&'static str> {
+    if text.chars().any(|c| ('\u{0D00}'..='\u{0D7F}').contains(&c)) {
+        return Some("ml");
+    }
+    None
 }
 
 fn language_to_iso639_1(language: &Language) -> String {

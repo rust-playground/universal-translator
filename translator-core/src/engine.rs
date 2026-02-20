@@ -10,6 +10,29 @@ use crate::error::TranslatorError;
 use crate::model::LoadedModel;
 use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
 
+/// Fix character-encoding corruption produced by the en-is (Icelandic) model.
+///
+/// The Helsinki-NLP opus-mt-en-is model consistently substitutes three Icelandic
+/// characters with visually similar Latin Extended characters:
+///   ó (U+00F3) → ķ (U+0137)
+///   ð (U+00F0) → đ (U+0111)
+///   þ (U+00FE) → ū (U+016B)
+/// and their uppercase counterparts. None of these substitutes are valid Icelandic
+/// characters, so the reversal is unambiguous.
+fn fix_icelandic_chars(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'ķ' => 'ó',
+            'Ķ' => 'Ó',
+            'đ' => 'ð',
+            'Đ' => 'Ð',
+            'ū' => 'þ',
+            'Ū' => 'Þ',
+            _ => c,
+        })
+        .collect()
+}
+
 /// en-mul target token for Tier-1 languages that have a dedicated en-X model on disk,
 /// used as fallback when the dedicated model directory is missing.
 fn mul_target_token(lang: &str) -> Option<&'static str> {
@@ -17,12 +40,10 @@ fn mul_target_token(lang: &str) -> Option<&'static str> {
         "cy" => Some(">>cym<<"),  // Welsh (fallback if en-cy missing)
         "eo" => Some(">>epo<<"),  // Esperanto (fallback if en-eo missing)
         "eu" => Some(">>eus<<"),  // Basque (fallback if en-eu missing)
-        "gl" => Some(">>glg<<"),  // Galician (fallback if en-gl missing)
         "hy" => Some(">>hye<<"),  // Armenian (fallback if en-hy missing)
         "is" => Some(">>isl<<"),  // Icelandic (fallback if en-is missing)
         "lv" => Some(">>lav<<"),  // Latvian (fallback if en-lv missing)
         "mk" => Some(">>mkd<<"),  // Macedonian (fallback if en-mk missing)
-        "mt" => Some(">>mlt<<"),  // Maltese (fallback if en-mt missing)
         _ => None,
     }
 }
@@ -43,20 +64,27 @@ fn normalize_lang_code(code: &str) -> &str {
     }
 }
 
+// Not supported — source detection impossible without adding a new dependency:
+//   gl (Galician): Latin script, statistically indistinct from Portuguese/Spanish;
+//                  all speakers are fluent in the already-supported `es`.
+//   mt (Maltese):  Latin script, ~520K speakers with near-universal `en` proficiency;
+//                  lingua excludes it due to unreliable detection accuracy.
+// Malayalam (ml) is supported via script-based fallback detection in detector.rs.
+
 /// All target language codes supported by this engine.
 /// Only languages verified to produce correct output via smoke testing.
 pub fn supported_target_languages() -> &'static [&'static str] {
     &[
-        "af", "ar", "bg", "ca", "cs", "cy", "da", "de", "el", "eo",
-        "es", "et", "eu", "fi", "fr", "gl", "he", "hi", "hu", "hy",
-        "id", "is", "it", "lt", "lv", "mk", "ml", "mr", "mt", "nl",
-        "pt", "ro", "ru", "sk", "sq", "sv", "sw", "tl", "tr", "uk",
-        "ur", "vi", "zh",
+        "af", "ar", "bg", "ca", "cs", "cy", "da", "de", "el", "en",
+        "eo", "es", "et", "eu", "fi", "fr", "he", "hi", "hu",
+        "hy", "id", "is", "it", "ja", "lt", "lv", "mk", "ml", "mr",
+        "nl", "pt", "ro", "ru", "sk", "sq", "sv", "sw", "tl",
+        "tr", "uk", "ur", "vi", "zh",
     ]
 }
 
 /// Language codes that are fully supported: detectable as source AND translatable as target.
-/// This is the intersection of lingua's detectable set and supported_target_languages().
+/// 42 languages are detected by lingua; Malayalam (ml) is detected via Unicode script analysis.
 pub fn supported_languages() -> Vec<&'static str> {
     use lingua::Language;
     let detectable: std::collections::HashSet<String> = Language::all()
@@ -66,7 +94,7 @@ pub fn supported_languages() -> Vec<&'static str> {
     let mut langs: Vec<&'static str> = supported_target_languages()
         .iter()
         .copied()
-        .filter(|&code| detectable.contains(code))
+        .filter(|&code| detectable.contains(code) || code == "ml")
         .collect();
     langs.sort_unstable();
     langs
@@ -231,6 +259,11 @@ impl TranslationEngine {
                     }
                 }
             }
+        }
+
+        // Apply per-language post-processing fixes for known model output bugs.
+        if let Some(t) = translations.get_mut("is") {
+            *t = fix_icelandic_chars(t);
         }
 
         // Always include the detected source language in translations for caller convenience.

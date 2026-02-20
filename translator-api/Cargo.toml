@@ -2,6 +2,7 @@
 name    = "translator-api"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "translator-api"

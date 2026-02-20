@@ -2,6 +2,7 @@
 name    = "translator-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ct2rs     = { workspace = true }

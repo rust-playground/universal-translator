@@ -74,6 +74,49 @@ The table below lists common Helsinki-NLP model pairs. Any pair available on Hug
 
 The engine scans the `models/` directory at startup and loads every valid model it finds. Adding a new language pair requires no Rust code changes — drop the converted directory in and restart.
 
+## Hosting pre-converted models
+
+The converted model directories (model.bin + tokenizer files) are too large to
+check into git (~50–200 MB each, ~4 GB total). Three options for distributing
+them to teammates or CI:
+
+### Option A — Hugging Face Hub (recommended)
+
+Create a private HuggingFace repository of type **model** and push the
+converted directories there with `huggingface-cli upload`. Anyone with access
+can then pull them with `huggingface-cli download` and no Python conversion
+tooling is needed on their machine. This also keeps the models discoverable and
+versioned alongside the rest of the ML ecosystem.
+
+```bash
+# Upload (once, after running download.sh)
+huggingface-cli upload your-org/universal-translator-models models/ --repo-type model
+
+# Download (on a new machine)
+huggingface-cli download your-org/universal-translator-models --local-dir models/ --repo-type model
+```
+
+### Option B — GitHub Releases
+
+Zip the `models/` directory and attach it as a release asset. Useful if you
+want the models version-locked to a specific code release. Free up to 2 GB per
+release asset; for the full set you would need to split into multiple archives.
+
+### Option C — Cloud object storage (S3 / GCS / R2)
+
+Upload the `models/` directory to a bucket and sync it down in CI. Cloudflare
+R2 has no egress fees, which makes it cost-effective for frequent downloads.
+
+```bash
+# Upload
+aws s3 sync models/ s3://your-bucket/models/
+
+# Download (e.g. in CI)
+aws s3 sync s3://your-bucket/models/ models/
+```
+
+---
+
 ## Lingua: fully local language detection
 
 universal-translator uses [Lingua](https://github.com/pemistahl/lingua-rs) to automatically detect the source language of incoming text. Lingua is entirely self-contained:
