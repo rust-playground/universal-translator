@@ -33,6 +33,63 @@ fn fix_icelandic_chars(s: &str) -> String {
         .collect()
 }
 
+/// All en-mul prefix tokens for languages reachable via en-mul.
+fn all_mul_tokens(lang: &str) -> Option<&'static str> {
+    match lang {
+        "af" => Some(">>afr<<"),
+        "ar" => Some(">>ara<<"),
+        "bg" => Some(">>bul<<"),
+        "ca" => Some(">>cat<<"),
+        "cs" => Some(">>ces<<"),
+        "cy" => Some(">>cym<<"),
+        "da" => Some(">>dan<<"),
+        "de" => Some(">>deu<<"),
+        "el" => Some(">>ell<<"),
+        "eo" => Some(">>epo<<"),
+        "es" => Some(">>spa<<"),
+        "et" => Some(">>est<<"),
+        "eu" => Some(">>eus<<"),
+        "fi" => Some(">>fin<<"),
+        "fr" => Some(">>fra<<"),
+        "he" => Some(">>heb<<"),
+        "hi" => Some(">>hin<<"),
+        "hu" => Some(">>hun<<"),
+        "hy" => Some(">>hye<<"),
+        "id" => Some(">>ind<<"),
+        "is" => Some(">>isl<<"),
+        "it" => Some(">>ita<<"),
+        "ja" => Some(">>jpn<<"),
+        "lt" => Some(">>lit<<"),
+        "lv" => Some(">>lav<<"),
+        "mk" => Some(">>mkd<<"),
+        "ml" => Some(">>mal<<"),
+        "mr" => Some(">>mar<<"),
+        "nl" => Some(">>nld<<"),
+        "pt" => Some(">>por<<"),
+        "ro" => Some(">>ron<<"),
+        "ru" => Some(">>rus<<"),
+        "sk" => Some(">>slk<<"),
+        "sq" => Some(">>sqi<<"),
+        "sv" => Some(">>swe<<"),
+        "sw" => Some(">>swh<<"),
+        "tl" => Some(">>tgl<<"),
+        "tr" => Some(">>tur<<"),
+        "uk" => Some(">>ukr<<"),
+        "ur" => Some(">>urd<<"),
+        "vi" => Some(">>vie<<"),
+        "zh" => Some(">>zho<<"),
+        _ => None,
+    }
+}
+
+/// Languages where the dedicated en-X model produces clearly inferior output
+/// and en-mul should be preferred instead.
+///
+/// Determined by side-by-side comparison of all 42 dual-model languages.
+fn prefer_mul(lang: &str) -> bool {
+    matches!(lang, "cy" | "mr" | "ja")
+}
+
 /// en-mul target token for Tier-1 languages that have a dedicated en-X model on disk,
 /// used as fallback when the dedicated model directory is missing.
 fn mul_target_token(lang: &str) -> Option<&'static str> {
@@ -201,6 +258,38 @@ impl TranslationEngine {
             // English target — already have it from the pivot step.
             if norm_lang == "en" {
                 translations.insert(target_lang.clone(), english_text.clone());
+                continue;
+            }
+
+            // Languages where en-mul beats the dedicated model — route directly to en-mul.
+            if prefer_mul(norm_lang) {
+                if let Some(token) = all_mul_tokens(norm_lang) {
+                    match self.get_or_load_model("en-mul").await {
+                        Ok(model) => {
+                            let input = vec![english_text.clone()];
+                            let token = token.to_string();
+                            let model_ref = model.clone();
+                            match task::spawn_blocking(move || {
+                                model_ref.translate_batch_with_prefix(&input, &token)
+                            })
+                            .await
+                            .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))
+                            {
+                                Ok(Ok(mut out)) => {
+                                    translations.insert(target_lang.clone(), out.pop().unwrap_or_default());
+                                }
+                                Ok(Err(e)) => { errors.insert(target_lang.clone(), e.to_string()); }
+                                Err(e) => { errors.insert(target_lang.clone(), e.to_string()); }
+                            }
+                        }
+                        Err(e) => { errors.insert(target_lang.clone(), e.to_string()); }
+                    }
+                } else {
+                    errors.insert(
+                        target_lang.clone(),
+                        format!("No mul token for en-{norm_lang}"),
+                    );
+                }
                 continue;
             }
 

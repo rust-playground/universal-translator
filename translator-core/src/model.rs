@@ -1,14 +1,16 @@
 use std::path::Path;
 
+use ct2rs::sys::Translator as SysTranslator;
 use ct2rs::tokenizers::sentencepiece::Tokenizer as SpmTokenizer;
-use ct2rs::{ComputeType, Config, TranslationOptions, Translator};
+use ct2rs::{ComputeType, Config, Tokenizer, TranslationOptions};
 
 use crate::error::TranslatorError;
 
 /// A loaded CTranslate2 model with its SentencePiece tokenizer.
 /// The tokenizer auto-loads `source.spm` and `target.spm` from `model_dir`.
 pub struct LoadedModel {
-    translator: Translator<SpmTokenizer>,
+    sys_translator: SysTranslator,
+    tokenizer: SpmTokenizer,
 }
 
 impl LoadedModel {
@@ -20,46 +22,70 @@ impl LoadedModel {
             compute_type: ComputeType::FLOAT32,
             ..Config::default()
         };
-        let translator = Translator::with_tokenizer(model_dir, tokenizer, &config)
+        let sys_translator = SysTranslator::new(model_dir, &config)
             .map_err(|e| TranslatorError::Ct2(e.to_string()))?;
-        Ok(Self { translator })
+        Ok(Self {
+            sys_translator,
+            tokenizer,
+        })
     }
 
-    /// Translate a batch of strings. Synchronous — always call from `spawn_blocking`.
-    pub fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
+    fn run_batch(&self, tokenized: Vec<Vec<String>>) -> Result<Vec<String>, TranslatorError> {
         let options = TranslationOptions::<String, String> {
             beam_size: 4,
             replace_unknowns: true,
             ..Default::default()
         };
         let results = self
-            .translator
-            .translate_batch(texts, &options, None)
+            .sys_translator
+            .translate_batch(&tokenized, &options, None)
             .map_err(|e| TranslatorError::Ct2(e.to_string()))?;
-
-        Ok(results.into_iter().map(|(text, _score)| text).collect())
+        results
+            .into_iter()
+            .map(|r| {
+                let tokens = r
+                    .hypotheses
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| TranslatorError::Ct2("no hypothesis returned".to_string()))?;
+                self.tokenizer
+                    .decode(tokens)
+                    .map_err(|e| TranslatorError::Ct2(e.to_string()))
+            })
+            .collect()
     }
 
-    /// Translate using a mandatory target-language prefix token (e.g. `">>tha<<"` for Thai,
-    /// `">>jpn<<"` for Japanese). The prefix is stripped from output automatically by ct2rs.
+    /// Translate a batch of strings. Synchronous — always call from `spawn_blocking`.
+    pub fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
+        let tokenized = texts
+            .iter()
+            .map(|t| self.tokenizer.encode(t))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| TranslatorError::Ct2(e.to_string()))?;
+        self.run_batch(tokenized)
+    }
+
+    /// Translate using a source-side language prefix token (e.g. `">>jpn<<"` for Japanese).
+    /// Helsinki-NLP opus-mt multilingual models expect the token prepended to the encoder input,
+    /// not used as a decoder target prefix. The prefix is inserted directly as a token piece
+    /// (bypassing re-tokenization) so SentencePiece's character-level fallback cannot split it.
     pub fn translate_batch_with_prefix(
         &self,
         texts: &[String],
         prefix_token: &str,
     ) -> Result<Vec<String>, TranslatorError> {
-        let prefixes: Vec<Vec<String>> = texts
+        let tokenized = texts
             .iter()
-            .map(|_| vec![prefix_token.to_string()])
-            .collect();
-        let options = TranslationOptions::<String, String> {
-            beam_size: 4,
-            replace_unknowns: true,
-            ..Default::default()
-        };
-        let results = self
-            .translator
-            .translate_batch_with_target_prefix(texts, &prefixes, &options, None)
-            .map_err(|e| TranslatorError::Ct2(e.to_string()))?;
-        Ok(results.into_iter().map(|(text, _score)| text).collect())
+            .map(|t| {
+                self.tokenizer
+                    .encode(t)
+                    .map_err(|e| TranslatorError::Ct2(e.to_string()))
+                    .map(|mut tokens| {
+                        tokens.insert(0, prefix_token.to_string());
+                        tokens
+                    })
+            })
+            .collect::<Result<Vec<_>, TranslatorError>>()?;
+        self.run_batch(tokenized)
     }
 }
