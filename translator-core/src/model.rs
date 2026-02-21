@@ -15,11 +15,12 @@ pub struct LoadedModel {
 
 impl LoadedModel {
     /// Load a model directory containing `model.bin`, `source.spm`, and `target.spm`.
-    pub fn load(model_dir: &Path) -> Result<Self, TranslatorError> {
+    pub fn load(model_dir: &Path, num_threads: usize) -> Result<Self, TranslatorError> {
         let tokenizer = SpmTokenizer::new(model_dir)
             .map_err(|e| TranslatorError::Ct2(e.to_string()))?;
         let config = Config {
             compute_type: ComputeType::FLOAT32,
+            num_threads_per_replica: num_threads,
             ..Config::default()
         };
         let sys_translator = SysTranslator::new(model_dir, &config)

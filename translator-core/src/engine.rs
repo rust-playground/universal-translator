@@ -157,6 +157,23 @@ pub fn supported_languages() -> Vec<&'static str> {
     langs
 }
 
+/// Resolved plan for one target language — model key + prefix only, no loaded model yet.
+struct WorkPlan {
+    target_lang: String,
+    to_translate: Vec<usize>,
+    texts_batch: Vec<String>,
+    model_key: String,
+    prefix: Option<String>,
+}
+
+struct WorkItem {
+    target_lang: String,
+    to_translate: Vec<usize>,
+    texts_batch: Vec<String>,
+    model: Arc<LoadedModel>,
+    prefix: Option<String>,
+}
+
 /// The central translation engine. Cheap to clone — all heavy state is reference-counted.
 #[derive(Clone)]
 pub struct TranslationEngine {
@@ -164,6 +181,8 @@ pub struct TranslationEngine {
     /// Key: "en-fr", "en-de", etc.
     cache: Arc<DashMap<String, Arc<LoadedModel>>>,
     detector: Arc<Detector>,
+    /// 0 = dynamic (compute per-request from work item count), n > 0 = fixed.
+    threads_per_model: usize,
 }
 
 impl TranslationEngine {
@@ -172,7 +191,19 @@ impl TranslationEngine {
             models_dir: models_dir.as_ref().to_path_buf(),
             cache: Arc::new(DashMap::new()),
             detector: Arc::new(Detector::new()),
+            threads_per_model: 0,
         }
+    }
+
+    /// Override the thread count used when loading models.
+    /// Use for API/operator deployments; `0` (the default) means dynamic.
+    pub fn with_threads_per_model(mut self, n: usize) -> Self {
+        self.threads_per_model = n;
+        self
+    }
+
+    fn model_exists(&self, pair: &str) -> bool {
+        self.models_dir.join(pair).exists()
     }
 
     /// Detect the language of `text`, returning a lowercase ISO 639-1 code.
@@ -199,151 +230,191 @@ impl TranslationEngine {
                 .collect();
         }
 
-        let mut results = Vec::with_capacity(batch.texts.len());
-        for text in &batch.texts {
-            let result = self.translate_text(text, &batch.target_languages).await?;
-            results.push(result);
+        let n = batch.texts.len();
+        let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+
+        // Phase 1 — detect all languages in parallel.
+        let detect_handles: Vec<_> = batch.texts.iter()
+            .map(|text| {
+                let engine = self.clone();
+                let text = text.clone();
+                task::spawn(async move { engine.detect_language(&text).await })
+            })
+            .collect();
+        let mut source_langs = Vec::with_capacity(n);
+        for handle in detect_handles {
+            source_langs.push(
+                handle.await.map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??
+            );
         }
-        Ok(TranslationResultSet { results })
-    }
 
-    async fn translate_text(
-        &self,
-        text: &str,
-        target_languages: &[String],
-    ) -> Result<TranslationResult, TranslatorError> {
-        // Detect source language.
-        let source_lang = self.detect_language(text).await?;
-
-        // Pivot: if the source isn't English, translate to English first.
-        let english_text = if source_lang != "en" {
-            let model = match self.get_or_load_model(&format!("{source_lang}-en")).await {
+        // Phase 2 — pivot non-English texts to English, grouped by source language.
+        // Phase 2 loads one model at a time so give it full parallelism.
+        let mut english_texts: Vec<String> = batch.texts.clone();
+        let mut pivot_groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, lang) in source_langs.iter().enumerate() {
+            if lang != "en" {
+                pivot_groups.entry(lang.clone()).or_default().push(i);
+            }
+        }
+        for (src_lang, indices) in &pivot_groups {
+            let texts_for_model: Vec<String> = indices.iter().map(|&i| batch.texts[i].clone()).collect();
+            let model = match self.get_or_load_model(&format!("{src_lang}-en"), parallelism).await {
                 Ok(m) => m,
                 Err(TranslatorError::ModelNotFound(_)) => {
-                    // Fallback to multilingual→English for languages without a dedicated model.
-                    self.get_or_load_model("mul-en").await
-                        .map_err(|_| TranslatorError::ModelNotFound(
-                            format!("{source_lang}-en")
-                        ))?
+                    self.get_or_load_model("mul-en", parallelism).await
+                        .map_err(|_| TranslatorError::ModelNotFound(format!("{src_lang}-en")))?
                 }
                 Err(e) => return Err(e),
             };
-            let input = vec![text.to_string()];
             let model_ref = model.clone();
-            task::spawn_blocking(move || model_ref.translate_batch(&input))
+            let translated = task::spawn_blocking(move || model_ref.translate_batch(&texts_for_model))
                 .await
-                .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??
-                .into_iter()
-                .next()
-                .unwrap_or_default()
-        } else {
-            text.to_string()
-        };
+                .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;
+            for (&orig_idx, en_text) in indices.iter().zip(translated) {
+                english_texts[orig_idx] = en_text;
+            }
+        }
 
-        let mut translations: HashMap<String, String> = HashMap::new();
-        let mut errors: HashMap<String, String> = HashMap::new();
+        // Phase 3 — translate to each target language, batching all texts per language.
+        let mut all_translations: Vec<HashMap<String, String>> = (0..n).map(|_| HashMap::new()).collect();
+        let mut all_errors: Vec<HashMap<String, String>> = (0..n).map(|_| HashMap::new()).collect();
 
-        for target_lang in target_languages {
+        // Phase 3a-plan — determine model key and prefix for each target language (sync, no I/O).
+        // Passthrough and error cases are handled immediately; translatable items are
+        // collected into WorkPlans for loading and dispatch in subsequent phases.
+        let mut work_plans: Vec<WorkPlan> = vec![];
+
+        for target_lang in &batch.target_languages {
             // Normalise regional variants (e.g. zh-cn → zh) for model directory lookup.
             // We keep `target_lang` as the key in the result maps so callers see their
             // original code back; only the model path uses `norm_lang`.
             let norm_lang = normalize_lang_code(target_lang);
 
-            // Same language (or regional variant of source) — return original text unchanged.
-            if norm_lang == source_lang || target_lang == &source_lang {
-                translations.insert(target_lang.clone(), text.to_string());
-                continue;
+            let mut to_translate: Vec<usize> = vec![];
+            let mut texts_batch: Vec<String> = vec![];
+
+            for i in 0..n {
+                let src = source_langs[i].as_str();
+                if norm_lang == src || target_lang.as_str() == src {
+                    // Same language (or regional variant of source) — return original text unchanged.
+                    all_translations[i].insert(target_lang.clone(), batch.texts[i].clone());
+                } else if norm_lang == "en" {
+                    // English target — already have it from the pivot step.
+                    all_translations[i].insert(target_lang.clone(), english_texts[i].clone());
+                } else {
+                    to_translate.push(i);
+                    texts_batch.push(english_texts[i].clone());
+                }
             }
 
-            // English target — already have it from the pivot step.
-            if norm_lang == "en" {
-                translations.insert(target_lang.clone(), english_text.clone());
+            if to_translate.is_empty() {
                 continue;
             }
 
             // Languages where en-mul beats the dedicated model — route directly to en-mul.
             if prefer_mul(norm_lang) {
-                if let Some(token) = all_mul_tokens(norm_lang) {
-                    match self.get_or_load_model("en-mul").await {
-                        Ok(model) => {
-                            let input = vec![english_text.clone()];
-                            let token = token.to_string();
-                            let model_ref = model.clone();
-                            match task::spawn_blocking(move || {
-                                model_ref.translate_batch_with_prefix(&input, &token)
-                            })
-                            .await
-                            .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))
-                            {
-                                Ok(Ok(mut out)) => {
-                                    translations.insert(target_lang.clone(), out.pop().unwrap_or_default());
-                                }
-                                Ok(Err(e)) => { errors.insert(target_lang.clone(), e.to_string()); }
-                                Err(e) => { errors.insert(target_lang.clone(), e.to_string()); }
-                            }
+                match all_mul_tokens(norm_lang) {
+                    None => {
+                        let msg = format!("No mul token for en-{norm_lang}");
+                        for &i in &to_translate {
+                            all_errors[i].insert(target_lang.clone(), msg.clone());
                         }
-                        Err(e) => { errors.insert(target_lang.clone(), e.to_string()); }
                     }
-                } else {
-                    errors.insert(
-                        target_lang.clone(),
-                        format!("No mul token for en-{norm_lang}"),
-                    );
+                    Some(token) => work_plans.push(WorkPlan {
+                        target_lang: target_lang.clone(),
+                        to_translate,
+                        texts_batch,
+                        model_key: "en-mul".into(),
+                        prefix: Some(token.to_string()),
+                    }),
                 }
                 continue;
             }
 
-            // Dedicated model path.
-            match self.get_or_load_model(&format!("en-{norm_lang}")).await {
-                Err(TranslatorError::ModelNotFound(_)) => {
-                    if let Some(token) = mul_target_token(norm_lang) {
-                        match self.get_or_load_model("en-mul").await {
-                            Ok(model) => {
-                                let input = vec![english_text.clone()];
-                                let token = token.to_string();
-                                let model_ref = model.clone();
-                                match task::spawn_blocking(move || {
-                                    model_ref.translate_batch_with_prefix(&input, &token)
-                                })
-                                .await
-                                .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))
-                                {
-                                    Ok(Ok(mut out)) => {
-                                        translations.insert(target_lang.clone(), out.pop().unwrap_or_default());
-                                    }
-                                    Ok(Err(e)) => { errors.insert(target_lang.clone(), e.to_string()); }
-                                    Err(e) => { errors.insert(target_lang.clone(), e.to_string()); }
-                                }
-                            }
-                            Err(e) => { errors.insert(target_lang.clone(), e.to_string()); }
+            // Dedicated model path with mul fallback.
+            if self.model_exists(&format!("en-{norm_lang}")) {
+                work_plans.push(WorkPlan {
+                    target_lang: target_lang.clone(),
+                    to_translate,
+                    texts_batch,
+                    model_key: format!("en-{norm_lang}"),
+                    prefix: None,
+                });
+            } else {
+                match mul_target_token(norm_lang) {
+                    None => {
+                        let msg = format!("No model available for en-{norm_lang}");
+                        for &i in &to_translate {
+                            all_errors[i].insert(target_lang.clone(), msg.clone());
                         }
-                    } else {
-                        errors.insert(
-                            target_lang.clone(),
-                            format!("No model available for en-{norm_lang}"),
-                        );
+                    }
+                    Some(token) => work_plans.push(WorkPlan {
+                        target_lang: target_lang.clone(),
+                        to_translate,
+                        texts_batch,
+                        model_key: "en-mul".into(),
+                        prefix: Some(token.to_string()),
+                    }),
+                }
+            }
+        }
+
+        // Phase 3a-load — compute thread count, load each unique model, convert WorkPlan → WorkItem.
+        let threads_per_model = if self.threads_per_model > 0 {
+            self.threads_per_model
+        } else {
+            let concurrent = work_plans.len().min(parallelism).max(1);
+            (parallelism / concurrent).max(1)
+        };
+
+        let mut work_items: Vec<WorkItem> = Vec::with_capacity(work_plans.len());
+        for plan in work_plans {
+            match self.get_or_load_model(&plan.model_key, threads_per_model).await {
+                Ok(model) => work_items.push(WorkItem {
+                    target_lang: plan.target_lang,
+                    to_translate: plan.to_translate,
+                    texts_batch: plan.texts_batch,
+                    model,
+                    prefix: plan.prefix,
+                }),
+                Err(e) => {
+                    for &i in &plan.to_translate {
+                        all_errors[i].insert(plan.target_lang.clone(), e.to_string());
                     }
                 }
-                Err(e) => {
-                    errors.insert(target_lang.clone(), e.to_string());
-                }
-                Ok(model) => {
-                    let input = vec![english_text.clone()];
-                    let model_ref = model.clone();
-                    match task::spawn_blocking(move || model_ref.translate_batch(&input)).await {
-                        Err(e) => {
-                            errors.insert(
-                                target_lang.clone(),
-                                TranslatorError::TranslationFailed(e.to_string()).to_string(),
-                            );
+            }
+        }
+
+        // Phase 3b — dispatch work items in concurrent rounds of available_parallelism().
+        // Each model uses threads_per_model intra-op threads; round size ensures total active
+        // threads stays within parallelism. Processing in rounds prevents thread explosion.
+        let mut work_iter = work_items.into_iter().peekable();
+        while work_iter.peek().is_some() {
+            let handles: Vec<_> = work_iter.by_ref().take(parallelism)
+                .map(|item| {
+                    task::spawn_blocking(move || {
+                        let result = match item.prefix {
+                            Some(ref p) => item.model.translate_batch_with_prefix(&item.texts_batch, p),
+                            None => item.model.translate_batch(&item.texts_batch),
+                        };
+                        (item.target_lang, item.to_translate, result)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (target_lang, to_translate, result) = handle
+                    .await
+                    .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))?;
+                match result {
+                    Ok(out) => {
+                        for (&i, t) in to_translate.iter().zip(out) {
+                            all_translations[i].insert(target_lang.clone(), t);
                         }
-                        Ok(Err(e)) => {
-                            errors.insert(target_lang.clone(), e.to_string());
-                        }
-                        Ok(Ok(mut translated)) => {
-                            if let Some(result) = translated.pop() {
-                                translations.insert(target_lang.clone(), result);
-                            }
+                    }
+                    Err(e) => {
+                        for &i in &to_translate {
+                            all_errors[i].insert(target_lang.clone(), e.to_string());
                         }
                     }
                 }
@@ -351,23 +422,32 @@ impl TranslationEngine {
         }
 
         // Apply per-language post-processing fixes for known model output bugs.
-        if let Some(t) = translations.get_mut("is") {
-            *t = fix_icelandic_chars(t);
+        for translations in &mut all_translations {
+            if let Some(t) = translations.get_mut("is") {
+                *t = fix_icelandic_chars(t);
+            }
         }
 
-        // Always include the detected source language in translations for caller convenience.
-        translations.entry(source_lang.clone()).or_insert_with(|| text.to_string());
-
-        Ok(TranslationResult {
-            source_text: text.to_string(),
-            detected_language: source_lang,
-            translations,
-            errors,
-        })
+        // Assemble results, preserving original order.
+        let results = (0..n)
+            .map(|i| {
+                let mut translations = std::mem::take(&mut all_translations[i]);
+                // Always include the detected source language for caller convenience.
+                translations.entry(source_langs[i].clone()).or_insert_with(|| batch.texts[i].clone());
+                TranslationResult {
+                    source_text: batch.texts[i].clone(),
+                    detected_language: source_langs[i].clone(),
+                    translations,
+                    errors: std::mem::take(&mut all_errors[i]),
+                }
+            })
+            .collect();
+        Ok(TranslationResultSet { results })
     }
 
-    /// Returns a cached model, loading it on first access.
-    async fn get_or_load_model(&self, pair: &str) -> Result<Arc<LoadedModel>, TranslatorError> {
+    /// Returns a cached model, loading it on first access with `num_threads` intra-op threads.
+    /// On a cache hit the cached model is returned as-is regardless of `num_threads`.
+    async fn get_or_load_model(&self, pair: &str, num_threads: usize) -> Result<Arc<LoadedModel>, TranslatorError> {
         // Fast path: already cached.
         if let Some(model) = self.cache.get(pair) {
             return Ok(model.clone());
@@ -379,7 +459,7 @@ impl TranslationEngine {
         }
 
         // Slow path: load from disk on a blocking thread.
-        let model = task::spawn_blocking(move || LoadedModel::load(&model_dir))
+        let model = task::spawn_blocking(move || LoadedModel::load(&model_dir, num_threads))
             .await
             .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;
 
