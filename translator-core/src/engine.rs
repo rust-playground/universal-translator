@@ -233,24 +233,31 @@ impl TranslationEngine {
         let n = batch.texts.len();
         let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
-        // Phase 1 — detect all languages in parallel.
-        let detect_handles: Vec<_> = batch.texts.iter()
-            .map(|text| {
-                let engine = self.clone();
-                let text = text.clone();
-                task::spawn(async move { engine.detect_language(&text).await })
-            })
-            .collect();
-        let mut source_langs = Vec::with_capacity(n);
-        for handle in detect_handles {
-            source_langs.push(
-                handle.await.map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??
-            );
-        }
+        // Phase 1 — resolve source languages: use caller hint or detect in parallel.
+        let source_langs: Vec<String> = if let Some(ref src) = batch.source_language {
+            let normalized = normalize_lang_code(src).to_string();
+            vec![normalized; n]
+        } else {
+            let detect_handles: Vec<_> = batch.texts.iter()
+                .map(|text| {
+                    let engine = self.clone();
+                    let text = text.clone();
+                    task::spawn(async move { engine.detect_language(&text).await })
+                })
+                .collect();
+            let mut langs = Vec::with_capacity(n);
+            for handle in detect_handles {
+                langs.push(
+                    handle.await.map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??
+                );
+            }
+            langs
+        };
 
         // Phase 2 — pivot non-English texts to English, grouped by source language.
         // Phase 2 loads one model at a time so give it full parallelism.
-        let mut english_texts: Vec<String> = batch.texts.clone();
+        // None = "use batch.texts[i] as-is" (no allocation for English-source texts).
+        let mut english_texts: Vec<Option<String>> = vec![None; n];
         let mut pivot_groups: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, lang) in source_langs.iter().enumerate() {
             if lang != "en" {
@@ -272,7 +279,7 @@ impl TranslationEngine {
                 .await
                 .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;
             for (&orig_idx, en_text) in indices.iter().zip(translated) {
-                english_texts[orig_idx] = en_text;
+                english_texts[orig_idx] = Some(en_text);
             }
         }
 
@@ -301,10 +308,10 @@ impl TranslationEngine {
                     all_translations[i].insert(target_lang.clone(), batch.texts[i].clone());
                 } else if norm_lang == "en" {
                     // English target — already have it from the pivot step.
-                    all_translations[i].insert(target_lang.clone(), english_texts[i].clone());
+                    all_translations[i].insert(target_lang.clone(), english_texts[i].as_deref().unwrap_or(&batch.texts[i]).to_string());
                 } else {
                     to_translate.push(i);
-                    texts_batch.push(english_texts[i].clone());
+                    texts_batch.push(english_texts[i].as_deref().unwrap_or(&batch.texts[i]).to_string());
                 }
             }
 
@@ -386,9 +393,10 @@ impl TranslationEngine {
             }
         }
 
-        // Phase 3b — dispatch work items in concurrent rounds of available_parallelism().
+        // Phase 3b — dispatch all work items in concurrent rounds bounded by available_parallelism().
         // Each model uses threads_per_model intra-op threads; round size ensures total active
         // threads stays within parallelism. Processing in rounds prevents thread explosion.
+        // en-mul items (with Some(prefix)) are handled by the same branch as other prefixed items.
         let mut work_iter = work_items.into_iter().peekable();
         while work_iter.peek().is_some() {
             let handles: Vec<_> = work_iter.by_ref().take(parallelism)

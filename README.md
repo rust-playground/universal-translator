@@ -37,7 +37,8 @@ No API keys required. No network calls at runtime. Everything runs on your machi
 | fr | French | ru | Russian | | |
 | he | Hebrew | | | | |
 
-Source language is detected automatically — no configuration required.
+Source language is detected automatically — no configuration required. Use `-s` to
+supply a known source language and skip detection when it is already known.
 43 of the 43 supported languages are detectable as source. Malayalam detection uses script analysis (U+0D00–U+0D7F); the remaining 42 use lingua.
 
 Galician (gl) and Maltese (mt) are not supported: both use the Latin script, making
@@ -97,14 +98,19 @@ The server listens on `http://localhost:3000` by default.
 # Translate to French
 cargo run -p translator-cli -- translate -t "Hello world" -l fr
 
-# Translate to multiple languages
-cargo run -p translator-cli -- translate -t "Hello world" -l fr -l de -l ja
+# Translate to multiple languages (comma-separated or repeated flag)
+cargo run -p translator-cli -- translate -t "Hello world" -l fr,de,ja
+
+# Translate with known source language (skips auto-detection)
+cargo run -p translator-cli -- translate -t "Bonjour le monde" -s fr -l en,de
 
 # List all supported languages
 cargo run -p translator-cli -- languages
 ```
 
-The `-l` flag accepts ISO 639-1 codes. The source language is detected automatically.
+The `-l` flag accepts ISO 639-1 codes, and can be repeated (`-l fr -l de`) or
+comma-separated (`-l fr,de`). Use `-s` to supply a known source language and skip
+auto-detection.
 
 ## Integration tests
 
@@ -149,6 +155,19 @@ prints warnings for any translation errors detected during generation.
 ## Language detection
 
 Lingua is fully local — no API keys, no network calls. Detection data ships as compiled-in Rust crates. 42 of the 43 supported languages are detected by lingua. Malayalam (ml) is detected via Unicode script analysis (U+0D00–U+0D7F block) as a fallback when lingua returns no result.
+
+## Limits
+
+**Per-text token limit: 512 SentencePiece tokens** (roughly 300–500 words depending on language and script).
+
+OPUS-MT models have positional embeddings up to 512 tokens. Both encoder (input) and decoder (output) are bounded by this limit:
+
+- **Input exceeds 512 tokens:** the input is silently truncated before inference. The
+  translation will correspond only to the truncated portion with no error returned.
+- **Output exceeds 512 tokens:** generation stops at 512 tokens. The translation will be
+  incomplete with no error returned.
+
+Split long documents into paragraphs or sentences before translating and reassemble the results.
 
 ## Adding language pairs
 

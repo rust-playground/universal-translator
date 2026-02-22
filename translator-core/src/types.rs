@@ -8,6 +8,8 @@ pub struct TranslationBatch {
     pub texts: Vec<String>,
     /// ISO 639-1 codes, e.g. ["fr", "de"]
     pub target_languages: Vec<String>,
+    /// ISO 639-1 code for all texts in this batch. When set, skips auto-detection.
+    pub source_language: Option<String>,
 }
 
 /// Translation result for a single source text.
