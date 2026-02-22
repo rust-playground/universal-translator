@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 
 use axum::{
     routing::{get, post},
@@ -21,8 +22,14 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let models_dir = env::var("MODELS_DIR").unwrap_or_else(|_| "./models".to_string());
-    tracing::info!(models_dir, "Loading translation engine");
+    let models_dir = env::var("MODELS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::cache_dir()
+                .unwrap_or_else(|| PathBuf::from(".cache"))
+                .join("ut/models")
+        });
+    tracing::info!(?models_dir, "Loading translation engine");
 
     let engine = TranslationEngine::new(&models_dir);
     let state = AppState { engine };

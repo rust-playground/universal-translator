@@ -2,13 +2,12 @@
 # Download and convert Helsinki-NLP OPUS-MT models to CTranslate2 format.
 #
 # Usage:
-#   ./models/download.sh              # convert all pairs in MODELS list
-#   ./models/download.sh en-fr fr-en  # convert specific pairs only
+#   bash models/download.sh                              # → ~/.cache/ut/models/ (Linux)
+#                                                        # → ~/Library/Caches/ut/models/ (macOS)
+#   MODELS_DIR=/custom/path bash models/download.sh      # override output directory
+#   bash models/download.sh en-fr fr-en                  # specific pairs only
 #
-# Run from the project root:
-#   bash models/download.sh
-#
-# Prerequisites: pip install ctranslate2 transformers sentencepiece torch
+# Prerequisites: cmake, pip install ctranslate2 transformers sentencepiece torch
 #
 # License policy: only add models with commercially permissive licenses.
 #   Standard Helsinki-NLP/opus-mt-*     → Apache-2.0
@@ -18,8 +17,15 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_DIR="${SCRIPT_DIR}"
+# Resolve platform-appropriate cache dir (mirrors dirs::cache_dir() in Rust)
+case "$(uname -s)" in
+  Darwin) _cache_base="${HOME}/Library/Caches" ;;
+  *)      _cache_base="${XDG_CACHE_HOME:-${HOME}/.cache}" ;;
+esac
+DEFAULT_MODELS_DIR="${_cache_base}/ut/models"
+MODELS_DIR="${MODELS_DIR:-${DEFAULT_MODELS_DIR}}"
+
+mkdir -p "${MODELS_DIR}"
 
 
 # All known Helsinki-NLP standard simple-pair OPUS-MT models.
@@ -31,23 +37,30 @@ MODELS=(
   en-bg   # Bulgarian
   en-ca   # Catalan
   en-cs   # Czech
+  en-cy   # Welsh
   en-da   # Danish
   en-de   # German
   en-el   # Greek
+  en-eo   # Esperanto
   en-es   # Spanish
   en-et   # Estonian
+  en-eu   # Basque
   en-fi   # Finnish
   en-fr   # French
   en-he   # Hebrew
   en-hi   # Hindi
   en-hu   # Hungarian
+  en-hy   # Armenian
   en-id   # Indonesian
+  en-is   # Icelandic
   en-it   # Italian
-  en-ja   # Japanese  (HuggingFace: opus-mt-tc-big-en-ja → overridden below)
-  en-ko   # Korean    (HuggingFace: opus-mt-tc-big-en-ko → overridden below)
+  en-ja   # Japanese  (HuggingFace: gsarti/opus-mt-tc-base-en-ja → overridden below)
   en-lt   # Lithuanian (HuggingFace: opus-mt-tc-big-en-lt → overridden below)
+  en-lv   # Latvian    (HuggingFace: opus-mt-tc-big-en-lv → overridden below)
+  en-mk   # Macedonian
   en-ml   # Malayalam
   en-mr   # Marathi
+  en-mul  # Multilingual fallback (120 targets including Thai)
   en-nl   # Dutch
   en-pt   # Portuguese (HuggingFace: opus-mt-tc-big-en-pt → overridden below)
   en-ro   # Romanian
@@ -62,22 +75,11 @@ MODELS=(
   en-ur   # Urdu
   en-vi   # Vietnamese
   en-zh   # Chinese
-  en-mul  # Multilingual fallback (120 targets including Thai)
-  en-lv   # Latvian    (HuggingFace: opus-mt-tc-big-en-lv → overridden below)
-  en-mk   # Macedonian
-  en-is   # Icelandic
-  en-cy   # Welsh
-  en-mt   # Maltese     (confirmed: Helsinki-NLP/opus-mt-en-mt)
-  en-gl   # Galician
-  en-eu   # Basque
-  en-eo   # Esperanto
-  en-hy   # Armenian
 
   # X → English
   af-en   # Afrikaans
   ar-en   # Arabic
   bg-en   # Bulgarian
-  bn-en   # Bengali
   ca-en   # Catalan
   cs-en   # Czech
   cy-en   # Welsh
@@ -95,24 +97,20 @@ MODELS=(
   is-en   # Icelandic
   it-en   # Italian
   ja-en   # Japanese
-  ko-en   # Korean
   lv-en   # Latvian
   mr-en   # Marathi
-  mt-en   # Maltese
+  mul-en  # Multilingual→English pivot fallback (100+ source languages)
   nl-en   # Dutch
-  pl-en   # Polish
   ru-en   # Russian
   sk-en   # Slovak
   sv-en   # Swedish
-  th-en   # Thai
+  sw-en   # Swahili  (HuggingFace: opus-mt-swc-en → overridden below)
   tl-en   # Filipino/Tagalog
   tr-en   # Turkish
   uk-en   # Ukrainian
   ur-en   # Urdu
   vi-en   # Vietnamese
   zh-en   # Chinese
-  mul-en  # Multilingual→English pivot fallback (100+ source languages)
-  sw-en   # Swahili  (HuggingFace: opus-mt-swc-en → overridden below)
 )
 
 # If specific pairs are given as arguments, use those instead
@@ -130,7 +128,6 @@ for pair in "${MODELS[@]}"; do
   # Some pairs have non-standard HuggingFace model IDs; others follow Helsinki-NLP/opus-mt-{src}-{tgt}.
   case "${pair}" in
     en-ja) model="gsarti/opus-mt-tc-base-en-ja" ;;      # Helsinki tc-base; tc-big-en-ja does not exist publicly
-    en-ko) model="Helsinki-NLP/opus-mt-tc-big-en-ko" ;;
     en-lt) model="Helsinki-NLP/opus-mt-tc-big-en-lt" ;;
     en-lv) model="Helsinki-NLP/opus-mt-tc-big-en-lv" ;;    # confirmed tc-big variant
     en-pt) model="Helsinki-NLP/opus-mt-tc-big-en-pt" ;;

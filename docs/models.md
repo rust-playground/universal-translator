@@ -4,6 +4,18 @@ This guide explains how to convert and install Helsinki-NLP OPUS-MT models for u
 
 ---
 
+## Default model directory
+
+| Platform | Default path |
+|----------|-------------|
+| Linux    | `~/.cache/ut/models` (respects `$XDG_CACHE_HOME`) |
+| macOS    | `~/Library/Caches/ut/models` |
+
+You can override the default by setting the `MODELS_DIR` environment variable (for the API server)
+or passing `--models-dir` to the CLI.
+
+---
+
 ## Prerequisites
 
 - Python 3.x
@@ -25,11 +37,13 @@ Example: English to French
 ```bash
 ct2-transformers-converter \
   --model Helsinki-NLP/opus-mt-en-fr \
-  --output_dir models/en-fr \
-  --quantization int8 \
+  --output_dir $MODELS_DIR/en-fr \
+  --quantization float32 \
   --copy_files source.spm target.spm \
   --force
 ```
+
+Where `$MODELS_DIR` is `~/.cache/ut/models` on Linux or `~/Library/Caches/ut/models` on macOS.
 
 ### Flag reference
 
@@ -43,10 +57,10 @@ ct2-transformers-converter \
 
 ## Verify the output
 
-After conversion, `models/en-fr/` should contain:
+After conversion, `$MODELS_DIR/en-fr/` should contain:
 
 ```
-models/en-fr/
+~/.cache/ut/models/en-fr/
 ├── model.bin              # Converted CTranslate2 weights (~77 MB with int8)
 ├── source.spm             # Source-language SentencePiece model
 ├── target.spm             # Target-language SentencePiece model
@@ -62,17 +76,17 @@ The table below lists common Helsinki-NLP model pairs. Any pair available on Hug
 
 | Language Pair | HuggingFace Model | Output Dir |
 |---------------|-------------------|------------|
-| English -> French | `Helsinki-NLP/opus-mt-en-fr` | `models/en-fr` |
-| English -> German | `Helsinki-NLP/opus-mt-en-de` | `models/en-de` |
-| English -> Spanish | `Helsinki-NLP/opus-mt-en-es` | `models/en-es` |
-| English -> Italian | `Helsinki-NLP/opus-mt-en-it` | `models/en-it` |
-| English -> Portuguese | `Helsinki-NLP/opus-mt-en-pt` | `models/en-pt` |
-| English -> Chinese | `Helsinki-NLP/opus-mt-en-zh` | `models/en-zh` |
-| French -> English | `Helsinki-NLP/opus-mt-fr-en` | `models/fr-en` |
-| German -> English | `Helsinki-NLP/opus-mt-de-en` | `models/de-en` |
-| Spanish -> English | `Helsinki-NLP/opus-mt-es-en` | `models/es-en` |
+| English -> French | `Helsinki-NLP/opus-mt-en-fr` | `$MODELS_DIR/en-fr` |
+| English -> German | `Helsinki-NLP/opus-mt-en-de` | `$MODELS_DIR/en-de` |
+| English -> Spanish | `Helsinki-NLP/opus-mt-en-es` | `$MODELS_DIR/en-es` |
+| English -> Italian | `Helsinki-NLP/opus-mt-en-it` | `$MODELS_DIR/en-it` |
+| English -> Portuguese | `Helsinki-NLP/opus-mt-en-pt` | `$MODELS_DIR/en-pt` |
+| English -> Chinese | `Helsinki-NLP/opus-mt-en-zh` | `$MODELS_DIR/en-zh` |
+| French -> English | `Helsinki-NLP/opus-mt-fr-en` | `$MODELS_DIR/fr-en` |
+| German -> English | `Helsinki-NLP/opus-mt-de-en` | `$MODELS_DIR/de-en` |
+| Spanish -> English | `Helsinki-NLP/opus-mt-es-en` | `$MODELS_DIR/es-en` |
 
-The engine scans the `models/` directory at startup and loads every valid model it finds. Adding a new language pair requires no Rust code changes — drop the converted directory in and restart.
+The engine scans the default model directory (see above) at startup and loads every valid model it finds. Adding a new language pair requires no Rust code changes — drop the converted directory in and restart.
 
 ## Hosting pre-converted models
 
@@ -90,29 +104,29 @@ versioned alongside the rest of the ML ecosystem.
 
 ```bash
 # Upload (once, after running download.sh)
-huggingface-cli upload your-org/universal-translator-models models/ --repo-type model
+huggingface-cli upload your-org/universal-translator-models ~/.cache/ut/models/ --repo-type model
 
 # Download (on a new machine)
-huggingface-cli download your-org/universal-translator-models --local-dir models/ --repo-type model
+huggingface-cli download your-org/universal-translator-models --local-dir ~/.cache/ut/models/ --repo-type model
 ```
 
 ### Option B — GitHub Releases
 
-Zip the `models/` directory and attach it as a release asset. Useful if you
+Zip the model directory and attach it as a release asset. Useful if you
 want the models version-locked to a specific code release. Free up to 2 GB per
 release asset; for the full set you would need to split into multiple archives.
 
 ### Option C — Cloud object storage (S3 / GCS / R2)
 
-Upload the `models/` directory to a bucket and sync it down in CI. Cloudflare
+Upload the model directory to a bucket and sync it down in CI. Cloudflare
 R2 has no egress fees, which makes it cost-effective for frequent downloads.
 
 ```bash
 # Upload
-aws s3 sync models/ s3://your-bucket/models/
+aws s3 sync ~/.cache/ut/models/ s3://your-bucket/models/
 
 # Download (e.g. in CI)
-aws s3 sync s3://your-bucket/models/ models/
+aws s3 sync s3://your-bucket/models/ ~/.cache/ut/models/
 ```
 
 ---

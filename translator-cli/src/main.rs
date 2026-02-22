@@ -6,12 +6,19 @@ use translator_core::engine::TranslationEngine;
 
 mod commands;
 
+fn default_models_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("ut/models")
+}
+
 #[derive(Parser)]
-#[command(name = "translator", about = "Universal translation CLI")]
+#[command(name = "ut", about = "Universal translation CLI")]
 struct Cli {
     /// Directory containing language-pair model directories.
-    #[arg(long, default_value = "./models")]
-    models_dir: PathBuf,
+    /// [default: ~/.cache/ut/models  (macOS: ~/Library/Caches/ut/models)]
+    #[arg(long)]
+    models_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: commands::Commands,
@@ -25,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let engine = TranslationEngine::new(&cli.models_dir);
+    let models_dir = cli.models_dir.unwrap_or_else(default_models_dir);
+    let engine = TranslationEngine::new(&models_dir);
     cli.command.run(engine).await
 }

@@ -34,6 +34,7 @@ impl LoadedModel {
     fn run_batch(&self, tokenized: Vec<Vec<String>>) -> Result<Vec<String>, TranslatorError> {
         let options = TranslationOptions::<String, String> {
             beam_size: 4,
+            no_repeat_ngram_size: 3,
             replace_unknowns: true,
             ..Default::default()
         };

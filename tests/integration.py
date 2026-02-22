@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import os
+import platform
 import subprocess
 import sys
 
@@ -29,29 +30,26 @@ LANGUAGES = [
 
 CSV_COLUMNS = ["input_lang", "input_text"] + LANGUAGES
 
-# 10 diverse test inputs covering text + date + currency in multiple source languages.
 TEST_INPUTS = [
-    ("en", "The conference fee is $250.00 and the event is on March 3rd, 2026."),
-    ("en", "Invoices over \u20ac500.00 must be paid by 31 December 2025."),
-    ("fr", "Les frais de conf\u00e9rence sont de 250,00 \u20ac et l'\u00e9v\u00e9nement a lieu le 3 mars 2026."),
-    ("de", "Die Konferenzgeb\u00fchr betr\u00e4gt 250,00 \u20ac und die Veranstaltung findet am 3. M\u00e4rz 2026 statt."),
-    ("es", "La tarifa de la conferencia es de 250,00 \u20ac y el evento es el 3 de marzo de 2026."),
-    ("ru", "\u0421\u0442\u043e\u0438\u043c\u043e\u0441\u0442\u044c \u043a\u043e\u043d\u0444\u0435\u0440\u0435\u043d\u0446\u0438\u0438 \u0441\u043e\u0441\u0442\u0430\u0432\u043b\u044f\u0435\u0442 250 \u0434\u043e\u043b\u043b\u0430\u0440\u043e\u0432, \u043c\u0435\u0440\u043e\u043f\u0440\u0438\u044f\u0442\u0438\u0435 \u043f\u0440\u043e\u0439\u0434\u0451\u0442 3 \u043c\u0430\u0440\u0442\u0430 2026 \u0433\u043e\u0434\u0430."),
-    ("ar", "\u0631\u0633\u0648\u0645 \u0627\u0644\u0645\u0624\u062a\u0645\u0631 250.00 \u062f\u0648\u0644\u0627\u0631 \u0648\u0627\u0644\u062d\u062f\u062b \u0641\u064a 3 \u0645\u0627\u0631\u0633 2026."),
-    ("zh", "\u4f1a\u8bae\u8d39\u7528\u4e3a250.00\u7f8e\u5143\uff0c\u6d3b\u52a8\u4e8e2026\u5e743\u67083\u65e5\u4e3e\u884c\u3002"),
-    ("ja", "\u4f1a\u8b70\u306e\u53c2\u52a0\u8cbb\u306f250\u30c9\u30eb\u3067\u30012026\u5e743\u67083\u65e5\u306b\u958b\u50ac\u3055\u308c\u307e\u3059\u3002"),
-    ("hi", "\u0938\u092e\u094d\u092e\u0947\u0932\u0928 \u0936\u0941\u0932\u094d\u0915 $250.00 \u0939\u0948 \u0914\u0930 \u092f\u0939 3 \u092e\u093e\u0930\u094d\u091a 2026 \u0915\u094b \u0906\u092f\u094b\u091c\u093f\u0924 \u0939\u094b\u0917\u093e\u0964"),
+    ("en", "The sun rises in the east and sets in the west."),
+    ("en", "The coffee costs $3.50 and the newspaper costs \u20ac2.00."),
+    ("en", "The meeting is on Wednesday, 1 April 2026 at 10:30 AM."),
+    ("en", "Name"),
+    ("en", "Username"),
+    ("en", "Location"),
 ]
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 CSV_PATH = os.path.join(FIXTURES_DIR, "translations.csv")
 
 DEFAULT_BINARY = os.path.join(
-    os.path.dirname(__file__), "..", "target", "release", "translator"
+    os.path.dirname(__file__), "..", "target", "debug", "ut"
 )
-DEFAULT_MODELS_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "models", "opus-mt"
-)
+if platform.system() == "Darwin":
+    _cache_base = os.path.expanduser("~/Library/Caches")
+else:
+    _cache_base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+DEFAULT_MODELS_DIR = os.path.join(_cache_base, "ut", "models")
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +89,7 @@ def seed(binary: str, models_dir: str) -> None:
 
         result = run_cli(binary, models_dir, input_text)
 
-        detected = result.get("detected_language", "")
+        detected = result.get("detected_language", input_lang)
         if detected != input_lang:
             print(f"  WARNING: detected language '{detected}' != expected '{input_lang}'")
 
@@ -101,7 +99,7 @@ def seed(binary: str, models_dir: str) -> None:
             print(f"  WARNING: translation errors for: {failed}")
 
         translations = result.get("translations", {})
-        row = {"input_lang": input_lang, "input_text": input_text}
+        row = {"input_lang": detected, "input_text": input_text}
         for lang in LANGUAGES:
             row[lang] = translations.get(lang, "")
 

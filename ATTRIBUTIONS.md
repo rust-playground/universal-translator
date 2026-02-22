@@ -58,3 +58,13 @@ Group at the University of Helsinki; conversion by Gabriele Sarti.
 **License:** Apache 2.0
 **Source:** https://huggingface.co/Helsinki-NLP/opus-mt-swc-en
 **Used for:** sw-en (Swahili → English pivot)
+
+---
+
+## CTranslate2 (runtime inference engine)
+
+**License:** MIT
+**Source:** https://github.com/OpenNMT/CTranslate2
+**Used for:** All model inference at runtime via the `ct2rs` Rust bindings
+
+No additional attribution action is required by the MIT license.

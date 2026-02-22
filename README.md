@@ -7,6 +7,10 @@ No API keys required. No network calls at runtime. Everything runs on your machi
 **License:** MIT OR Apache-2.0 — see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 **Model attributions:** see [ATTRIBUTIONS.md](ATTRIBUTIONS.md).
 
+[![CI](https://github.com/rust-playground/universal-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-playground/universal-translator/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)]()
+
 ---
 
 ## Supported languages
@@ -58,7 +62,8 @@ universal-translator/
 ## Prerequisites
 
 - Rust toolchain (stable, via [rustup](https://rustup.rs))
-- Models installed in `models/` — see [docs/models.md](docs/models.md)
+- Tested on Linux (x86\_64, arm64) and macOS (Apple Silicon).
+- Models installed in the default directory (`~/.cache/ut/models` on Linux, `~/Library/Caches/ut/models` on macOS) — see [docs/models.md](docs/models.md)
 
 ## Quick start
 
@@ -71,7 +76,7 @@ cargo build --release
 ### Get the models
 
 ```bash
-# Requires: pip install ctranslate2 transformers sentencepiece torch
+# Requires: cmake, pip install ctranslate2 transformers sentencepiece torch
 bash models/download.sh
 ```
 
@@ -81,7 +86,7 @@ See [docs/models.md](docs/models.md) for details and alternative hosting options
 ### Run the API server
 
 ```bash
-MODELS_DIR=./models cargo run -p translator-api
+cargo run -p translator-api
 ```
 
 The server listens on `http://localhost:3000` by default.
@@ -100,6 +105,46 @@ cargo run -p translator-cli -- languages
 ```
 
 The `-l` flag accepts ISO 639-1 codes. The source language is detected automatically.
+
+## Integration tests
+
+The integration test suite (`tests/integration.py`) calls the CLI binary and compares
+translations against a golden CSV fixture.
+
+### Prerequisites
+
+- Python 3
+- Models downloaded (see [Get the models](#get-the-models) above)
+- CLI binary built (`cargo build -p translator-cli`)
+
+### Run the tests
+
+```bash
+cargo build -p translator-cli && python3 tests/integration.py \
+  --binary ./target/debug/ut
+```
+
+Pass `--models-dir /custom/path` to override the default model directory.
+Add `--verbose` to see full actual vs. expected diffs on failures.
+
+### Regenerate the golden fixture
+
+Run this after changing `TEST_INPUTS` or when intentionally updating expected output:
+
+```bash
+cargo build -p translator-cli && python3 tests/integration.py --seed \
+  --binary ./target/debug/ut
+```
+
+Review the generated `tests/fixtures/translations.csv` before committing — the seed script
+prints warnings for any translation errors detected during generation.
+
+> **Note on single-word inputs:** Very short inputs (e.g. `"Name"`, `"Username"`) may be
+> detected as a language other than English. The seed script records the *actual detected
+> language* in the CSV so that test mode always passes. Detection warnings during seeding
+> are expected for these rows.
+
+---
 
 ## Language detection
 

@@ -5,11 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "translator"
+name = "ut"
 path = "src/main.rs"
 
 [dependencies]
 translator-core    = { workspace = true }
+dirs               = { workspace = true }
 lingua             = { workspace = true }
 clap               = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
