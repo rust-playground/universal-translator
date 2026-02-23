@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use dashmap::DashMap;
 use tokio::task;
 
 use crate::detector::Detector;
@@ -10,138 +9,150 @@ use crate::error::TranslatorError;
 use crate::model::LoadedModel;
 use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
 
-/// Fix character-encoding corruption produced by the en-is (Icelandic) model.
+/// Fix character-encoding corruption produced by the MADLAD-400 model for Icelandic.
 ///
-/// The Helsinki-NLP opus-mt-en-is model consistently substitutes three Icelandic
-/// characters with visually similar Latin Extended characters:
+/// Three Icelandic characters are consistently substituted with visually similar
+/// Latin Extended characters:
 ///   ó (U+00F3) → ķ (U+0137)
 ///   ð (U+00F0) → đ (U+0111)
 ///   þ (U+00FE) → ū (U+016B)
-/// and their uppercase counterparts. None of these substitutes are valid Icelandic
-/// characters, so the reversal is unambiguous.
+/// and their uppercase counterparts. None of these substitutes are valid Icelandic,
+/// so the reversal is unambiguous.
 fn fix_icelandic_chars(s: &str) -> String {
     s.chars()
         .map(|c| match c {
-            'ķ' => 'ó',
-            'Ķ' => 'Ó',
-            'đ' => 'ð',
-            'Đ' => 'Ð',
-            'ū' => 'þ',
-            'Ū' => 'Þ',
+            'ķ' => 'ó', 'Ķ' => 'Ó',
+            'đ' => 'ð', 'Đ' => 'Ð',
+            'ū' => 'þ', 'Ū' => 'Þ',
             _ => c,
         })
         .collect()
 }
 
-/// All en-mul prefix tokens for languages reachable via en-mul.
-fn all_mul_tokens(lang: &str) -> Option<&'static str> {
+/// Map ISO 639-1 code → MADLAD-400 language token.
+/// Format: `<2{iso639-1}>` prepended to the source text before tokenization.
+/// MADLAD's spiece.model vocabulary uses 2-letter ISO 639-1 codes only.
+fn madlad_lang_token(lang: &str) -> Option<&'static str> {
     match lang {
-        "af" => Some(">>afr<<"),
-        "ar" => Some(">>ara<<"),
-        "bg" => Some(">>bul<<"),
-        "ca" => Some(">>cat<<"),
-        "cs" => Some(">>ces<<"),
-        "cy" => Some(">>cym<<"),
-        "da" => Some(">>dan<<"),
-        "de" => Some(">>deu<<"),
-        "el" => Some(">>ell<<"),
-        "eo" => Some(">>epo<<"),
-        "es" => Some(">>spa<<"),
-        "et" => Some(">>est<<"),
-        "eu" => Some(">>eus<<"),
-        "fi" => Some(">>fin<<"),
-        "fr" => Some(">>fra<<"),
-        "he" => Some(">>heb<<"),
-        "hi" => Some(">>hin<<"),
-        "hu" => Some(">>hun<<"),
-        "hy" => Some(">>hye<<"),
-        "id" => Some(">>ind<<"),
-        "is" => Some(">>isl<<"),
-        "it" => Some(">>ita<<"),
-        "ja" => Some(">>jpn<<"),
-        "lt" => Some(">>lit<<"),
-        "lv" => Some(">>lav<<"),
-        "mk" => Some(">>mkd<<"),
-        "ml" => Some(">>mal<<"),
-        "mr" => Some(">>mar<<"),
-        "nl" => Some(">>nld<<"),
-        "pt" => Some(">>por<<"),
-        "ro" => Some(">>ron<<"),
-        "ru" => Some(">>rus<<"),
-        "sk" => Some(">>slk<<"),
-        "sq" => Some(">>sqi<<"),
-        "sv" => Some(">>swe<<"),
-        "sw" => Some(">>swh<<"),
-        "tl" => Some(">>tgl<<"),
-        "tr" => Some(">>tur<<"),
-        "uk" => Some(">>ukr<<"),
-        "ur" => Some(">>urd<<"),
-        "vi" => Some(">>vie<<"),
-        "zh" => Some(">>zho<<"),
+        "af" => Some("<2af>"),
+        "ar" => Some("<2ar>"),
+        "az" => Some("<2az>"),
+        "be" => Some("<2be>"),
+        "bg" => Some("<2bg>"),
+        "bn" => Some("<2bn>"),
+        "ca" => Some("<2ca>"),
+        "cs" => Some("<2cs>"),
+        "cy" => Some("<2cy>"),
+        "da" => Some("<2da>"),
+        "de" => Some("<2de>"),
+        "el" => Some("<2el>"),
+        "en" => Some("<2en>"),
+        "es" => Some("<2es>"),
+        "et" => Some("<2et>"),
+        "eu" => Some("<2eu>"),
+        "fa" => Some("<2fa>"),
+        "fi" => Some("<2fi>"),
+        "fr" => Some("<2fr>"),
+        "gu" => Some("<2gu>"),
+        "he" => Some("<2he>"),
+        "hi" => Some("<2hi>"),
+        "hr" => Some("<2hr>"),
+        "hu" => Some("<2hu>"),
+        "hy" => Some("<2hy>"),
+        "id" => Some("<2id>"),
+        "is" => Some("<2is>"),
+        "it" => Some("<2it>"),
+        "ja" => Some("<2ja>"),
+        "kk" => Some("<2kk>"),
+        "ko" => Some("<2ko>"),
+        "lt" => Some("<2lt>"),
+        "lv" => Some("<2lv>"),
+        "mk" => Some("<2mk>"),
+        "ml" => Some("<2ml>"),
+        "mn" => Some("<2mn>"),
+        "mr" => Some("<2mr>"),
+        "ms" => Some("<2ms>"),
+        "nl" => Some("<2nl>"),
+        "no" => Some("<2no>"),
+        "pa" => Some("<2pa>"),
+        "pl" => Some("<2pl>"),
+        "pt" => Some("<2pt>"),
+        "ro" => Some("<2ro>"),
+        "ru" => Some("<2ru>"),
+        "sk" => Some("<2sk>"),
+        "sl" => Some("<2sl>"),
+        "so" => Some("<2so>"),
+        "sq" => Some("<2sq>"),
+        "sr" => Some("<2sr>"),
+        "sv" => Some("<2sv>"),
+        "sw" => Some("<2sw>"),
+        "ta" => Some("<2ta>"),
+        "te" => Some("<2te>"),
+        "th" => Some("<2th>"),
+        "tr" => Some("<2tr>"),
+        "uk" => Some("<2uk>"),
+        "ur" => Some("<2ur>"),
+        "vi" => Some("<2vi>"),
+        "xh" => Some("<2xh>"),
+        "yo" => Some("<2yo>"),
+        "zh" => Some("<2zh>"),
         _ => None,
     }
 }
 
-/// Languages where the dedicated en-X model produces clearly inferior output
-/// and en-mul should be preferred instead.
+/// Map regional locale codes to their base ISO 639-1 code for language token lookup.
 ///
-/// Determined by side-by-side comparison of all 42 dual-model languages.
-fn prefer_mul(lang: &str) -> bool {
-    matches!(lang, "cy" | "mr" | "ja")
-}
-
-/// en-mul target token for Tier-1 languages that have a dedicated en-X model on disk,
-/// used as fallback when the dedicated model directory is missing.
-fn mul_target_token(lang: &str) -> Option<&'static str> {
-    match lang {
-        "cy" => Some(">>cym<<"),  // Welsh (fallback if en-cy missing)
-        "eo" => Some(">>epo<<"),  // Esperanto (fallback if en-eo missing)
-        "eu" => Some(">>eus<<"),  // Basque (fallback if en-eu missing)
-        "hy" => Some(">>hye<<"),  // Armenian (fallback if en-hy missing)
-        "is" => Some(">>isl<<"),  // Icelandic (fallback if en-is missing)
-        "lv" => Some(">>lav<<"),  // Latvian (fallback if en-lv missing)
-        "mk" => Some(">>mkd<<"),  // Macedonian (fallback if en-mk missing)
-        _ => None,
-    }
-}
-
-/// Map regional locale codes to their base ISO 639-1 code for model directory lookup.
-///
-/// The engine stores models as `en-zh`, `en-fr`, etc. Callers may pass BCP-47 regional
-/// variants like `zh-cn` or `fr-ca`; this function normalises them before the lookup so
-/// the right model directory is found.
+/// Callers may pass BCP-47 regional variants like `zh-cn` or `fr-ca`; this normalises
+/// them before the `madlad_lang_token` lookup so the right prefix is selected.
 fn normalize_lang_code(code: &str) -> &str {
     match code {
         "zh-hk" | "zh-cn" | "zh-tw" => "zh",
         "fr-ca" => "fr",
         "es-mx" => "es",
         "pt-br" | "pt-pt" => "pt",
-        "nb" | "nn" => "no",  // Norwegian Bokmål / Nynorsk
+        "nb" | "nn" => "no", // Norwegian Bokmål / Nynorsk
         other => other,
     }
 }
 
-// Not supported — source detection impossible without adding a new dependency:
+// Not supported — source detection impossible or absent from MADLAD-400 vocabulary:
 //   gl (Galician): Latin script, statistically indistinct from Portuguese/Spanish;
 //                  all speakers are fluent in the already-supported `es`.
 //   mt (Maltese):  Latin script, ~520K speakers with near-universal `en` proficiency;
 //                  lingua excludes it due to unreliable detection accuracy.
+//   eo (Esperanto), tl (Tagalog): confirmed absent from MADLAD-400 vocabulary.
+//   ga (Irish):    low-resource in CommonCrawl, likely absent.
+//   bs (Bosnian):  maps to `sr` in MADLAD; detection overlaps heavily with `hr`/`sr`.
+//   lg (Ganda), mi (Māori), ts (Tsonga), tn (Tswana): too uncertain without spiece verification.
 // Malayalam (ml) is supported via script-based fallback detection in detector.rs.
+// `nb`/`nn` (Norwegian Bokmål/Nynorsk) are normalised to `no` in normalize_lang_code().
+//
+// Removed after smoke test (3-text × 66-language run, 2026-02):
+//   ka (Georgian):        garbage output across all 3 inputs — archaic/invalid codepoints,
+//                         no real Georgian words produced.
+//   zu (Zulu):            semantic failure — "Ngiyabonga" (Thank you) instead of greeting;
+//                         date partially untranslated.
+//   st (Southern Sotho):  semantic failure — greeting outputs "Thank you, I love you";
+//                         date returns source text unchanged (passthrough).
+//   sn (Shona):           date passthrough (source English returned verbatim);
+//                         greeting uses non-Shona "Heano". Partial coverage only.
 
 /// All target language codes supported by this engine.
 /// Only languages verified to produce correct output via smoke testing.
 pub fn supported_target_languages() -> &'static [&'static str] {
     &[
-        "af", "ar", "bg", "ca", "cs", "cy", "da", "de", "el", "en",
-        "eo", "es", "et", "eu", "fi", "fr", "he", "hi", "hu",
-        "hy", "id", "is", "it", "ja", "lt", "lv", "mk", "ml", "mr",
-        "nl", "pt", "ro", "ru", "sk", "sq", "sv", "sw", "tl",
-        "tr", "uk", "ur", "vi", "zh",
+        "af", "ar", "az", "be", "bg", "bn", "ca", "cs", "cy", "da",
+        "de", "el", "en", "es", "et", "eu", "fa", "fi", "fr", "gu",
+        "he", "hi", "hr", "hu", "hy", "id", "is", "it", "ja",
+        "kk", "ko", "lt", "lv", "mk", "ml", "mn", "mr", "ms", "nl",
+        "no", "pa", "pl", "pt", "ro", "ru", "sk", "sl", "so",
+        "sq", "sr", "sv", "sw", "ta", "te", "th", "tr", "uk",
+        "ur", "vi", "xh", "yo", "zh",
     ]
 }
 
 /// Language codes that are fully supported: detectable as source AND translatable as target.
-/// 42 languages are detected by lingua; Malayalam (ml) is detected via Unicode script analysis.
+/// 75 languages are detected by lingua; Malayalam (ml) is detected via Unicode script analysis.
 pub fn supported_languages() -> Vec<&'static str> {
     use lingua::Language;
     let detectable: std::collections::HashSet<String> = Language::all()
@@ -157,53 +168,22 @@ pub fn supported_languages() -> Vec<&'static str> {
     langs
 }
 
-/// Resolved plan for one target language — model key + prefix only, no loaded model yet.
-struct WorkPlan {
-    target_lang: String,
-    to_translate: Vec<usize>,
-    texts_batch: Vec<String>,
-    model_key: String,
-    prefix: Option<String>,
-}
-
-struct WorkItem {
-    target_lang: String,
-    to_translate: Vec<usize>,
-    texts_batch: Vec<String>,
-    model: Arc<LoadedModel>,
-    prefix: Option<String>,
-}
-
 /// The central translation engine. Cheap to clone — all heavy state is reference-counted.
 #[derive(Clone)]
 pub struct TranslationEngine {
     models_dir: PathBuf,
-    /// Key: "en-fr", "en-de", etc.
-    cache: Arc<DashMap<String, Arc<LoadedModel>>>,
+    /// Single MADLAD-400-3B-MT model shared across all language pairs.
+    model_cache: Arc<OnceLock<Arc<LoadedModel>>>,
     detector: Arc<Detector>,
-    /// 0 = dynamic (compute per-request from work item count), n > 0 = fixed.
-    threads_per_model: usize,
 }
 
 impl TranslationEngine {
     pub fn new(models_dir: impl AsRef<Path>) -> Self {
         Self {
             models_dir: models_dir.as_ref().to_path_buf(),
-            cache: Arc::new(DashMap::new()),
+            model_cache: Arc::new(OnceLock::new()),
             detector: Arc::new(Detector::new()),
-            threads_per_model: 0,
         }
-    }
-
-    /// Override the thread count used when loading models.
-    /// Use for API/operator deployments; `0` (the default) means dynamic.
-    pub fn with_threads_per_model(mut self, n: usize) -> Self {
-        self.threads_per_model = n;
-        self
-    }
-
-    fn model_exists(&self, pair: &str) -> bool {
-        self.models_dir.join(pair).exists()
     }
 
     /// Detect the language of `text`, returning a lowercase ISO 639-1 code.
@@ -231,7 +211,6 @@ impl TranslationEngine {
         }
 
         let n = batch.texts.len();
-        let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
         // Phase 1 — resolve source languages: use caller hint or detect in parallel.
         let source_langs: Vec<String> = if let Some(ref src) = batch.source_language {
@@ -254,178 +233,58 @@ impl TranslationEngine {
             langs
         };
 
-        // Phase 2 — pivot non-English texts to English, grouped by source language.
-        // Phase 2 loads one model at a time so give it full parallelism.
-        // None = "use batch.texts[i] as-is" (no allocation for English-source texts).
-        let mut english_texts: Vec<Option<String>> = vec![None; n];
-        let mut pivot_groups: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, lang) in source_langs.iter().enumerate() {
-            if lang != "en" {
-                pivot_groups.entry(lang.clone()).or_default().push(i);
-            }
-        }
-        for (src_lang, indices) in &pivot_groups {
-            let texts_for_model: Vec<String> = indices.iter().map(|&i| batch.texts[i].clone()).collect();
-            let model = match self.get_or_load_model(&format!("{src_lang}-en"), parallelism).await {
-                Ok(m) => m,
-                Err(TranslatorError::ModelNotFound(_)) => {
-                    self.get_or_load_model("mul-en", parallelism).await
-                        .map_err(|_| TranslatorError::ModelNotFound(format!("{src_lang}-en")))?
-                }
-                Err(e) => return Err(e),
-            };
-            let model_ref = model.clone();
-            let translated = task::spawn_blocking(move || model_ref.translate_batch(&texts_for_model))
-                .await
-                .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;
-            for (&orig_idx, en_text) in indices.iter().zip(translated) {
-                english_texts[orig_idx] = Some(en_text);
-            }
-        }
-
-        // Phase 3 — translate to each target language, batching all texts per language.
         let mut all_translations: Vec<HashMap<String, String>> = (0..n).map(|_| HashMap::new()).collect();
         let mut all_errors: Vec<HashMap<String, String>> = (0..n).map(|_| HashMap::new()).collect();
 
-        // Phase 3a-plan — determine model key and prefix for each target language (sync, no I/O).
-        // Passthrough and error cases are handled immediately; translatable items are
-        // collected into WorkPlans for loading and dispatch in subsequent phases.
-        let mut work_plans: Vec<WorkPlan> = vec![];
+        // Phase 2 — build a flat list of work items for all texts × target languages.
+        // MADLAD translates directly from source to target with no English pivot step.
+        // The language token (e.g. "<2fr>") is prepended to the source text AS A STRING
+        // before SentencePiece tokenization — inserting it post-tokenization maps to <unk>.
+        let mut work_texts: Vec<String> = vec![];
+        let mut work_indices: Vec<(usize, String)> = vec![];
 
         for target_lang in &batch.target_languages {
-            // Normalise regional variants (e.g. zh-cn → zh) for model directory lookup.
+            // Normalise regional variants (e.g. zh-cn → zh) for language token lookup.
             // We keep `target_lang` as the key in the result maps so callers see their
-            // original code back; only the model path uses `norm_lang`.
+            // original code back; only the token lookup uses `norm_lang`.
             let norm_lang = normalize_lang_code(target_lang);
-
-            let mut to_translate: Vec<usize> = vec![];
-            let mut texts_batch: Vec<String> = vec![];
 
             for i in 0..n {
                 let src = source_langs[i].as_str();
                 if norm_lang == src || target_lang.as_str() == src {
                     // Same language (or regional variant of source) — return original text unchanged.
                     all_translations[i].insert(target_lang.clone(), batch.texts[i].clone());
-                } else if norm_lang == "en" {
-                    // English target — already have it from the pivot step.
-                    all_translations[i].insert(target_lang.clone(), english_texts[i].as_deref().unwrap_or(&batch.texts[i]).to_string());
-                } else {
-                    to_translate.push(i);
-                    texts_batch.push(english_texts[i].as_deref().unwrap_or(&batch.texts[i]).to_string());
+                    continue;
                 }
-            }
 
-            if to_translate.is_empty() {
-                continue;
-            }
-
-            // Languages where en-mul beats the dedicated model — route directly to en-mul.
-            if prefer_mul(norm_lang) {
-                match all_mul_tokens(norm_lang) {
+                match madlad_lang_token(norm_lang) {
                     None => {
-                        let msg = format!("No mul token for en-{norm_lang}");
-                        for &i in &to_translate {
-                            all_errors[i].insert(target_lang.clone(), msg.clone());
-                        }
+                        all_errors[i].insert(
+                            target_lang.clone(),
+                            format!("No MADLAD token for language: {norm_lang}"),
+                        );
                     }
-                    Some(token) => work_plans.push(WorkPlan {
-                        target_lang: target_lang.clone(),
-                        to_translate,
-                        texts_batch,
-                        model_key: "en-mul".into(),
-                        prefix: Some(token.to_string()),
-                    }),
-                }
-                continue;
-            }
-
-            // Dedicated model path with mul fallback.
-            if self.model_exists(&format!("en-{norm_lang}")) {
-                work_plans.push(WorkPlan {
-                    target_lang: target_lang.clone(),
-                    to_translate,
-                    texts_batch,
-                    model_key: format!("en-{norm_lang}"),
-                    prefix: None,
-                });
-            } else {
-                match mul_target_token(norm_lang) {
-                    None => {
-                        let msg = format!("No model available for en-{norm_lang}");
-                        for &i in &to_translate {
-                            all_errors[i].insert(target_lang.clone(), msg.clone());
-                        }
-                    }
-                    Some(token) => work_plans.push(WorkPlan {
-                        target_lang: target_lang.clone(),
-                        to_translate,
-                        texts_batch,
-                        model_key: "en-mul".into(),
-                        prefix: Some(token.to_string()),
-                    }),
-                }
-            }
-        }
-
-        // Phase 3a-load — compute thread count, load each unique model, convert WorkPlan → WorkItem.
-        let threads_per_model = if self.threads_per_model > 0 {
-            self.threads_per_model
-        } else {
-            let concurrent = work_plans.len().min(parallelism).max(1);
-            (parallelism / concurrent).max(1)
-        };
-
-        let mut work_items: Vec<WorkItem> = Vec::with_capacity(work_plans.len());
-        for plan in work_plans {
-            match self.get_or_load_model(&plan.model_key, threads_per_model).await {
-                Ok(model) => work_items.push(WorkItem {
-                    target_lang: plan.target_lang,
-                    to_translate: plan.to_translate,
-                    texts_batch: plan.texts_batch,
-                    model,
-                    prefix: plan.prefix,
-                }),
-                Err(e) => {
-                    for &i in &plan.to_translate {
-                        all_errors[i].insert(plan.target_lang.clone(), e.to_string());
+                    Some(prefix) => {
+                        work_texts.push(format!("{prefix} {}", batch.texts[i]));
+                        work_indices.push((i, target_lang.clone()));
                     }
                 }
             }
         }
 
-        // Phase 3b — dispatch all work items in concurrent rounds bounded by available_parallelism().
-        // Each model uses threads_per_model intra-op threads; round size ensures total active
-        // threads stays within parallelism. Processing in rounds prevents thread explosion.
-        // en-mul items (with Some(prefix)) are handled by the same branch as other prefixed items.
-        let mut work_iter = work_items.into_iter().peekable();
-        while work_iter.peek().is_some() {
-            let handles: Vec<_> = work_iter.by_ref().take(parallelism)
-                .map(|item| {
-                    task::spawn_blocking(move || {
-                        let result = match item.prefix {
-                            Some(ref p) => item.model.translate_batch_with_prefix(&item.texts_batch, p),
-                            None => item.model.translate_batch(&item.texts_batch),
-                        };
-                        (item.target_lang, item.to_translate, result)
-                    })
-                })
-                .collect();
-            for handle in handles {
-                let (target_lang, to_translate, result) = handle
-                    .await
-                    .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))?;
-                match result {
-                    Ok(out) => {
-                        for (&i, t) in to_translate.iter().zip(out) {
-                            all_translations[i].insert(target_lang.clone(), t);
-                        }
-                    }
-                    Err(e) => {
-                        for &i in &to_translate {
-                            all_errors[i].insert(target_lang.clone(), e.to_string());
-                        }
-                    }
-                }
+        // Phase 3 — load the MADLAD model (cached after first call) and translate all work items
+        // in a single batched inference call. First call takes ~5–10 s to load the 3 GB model;
+        // subsequent calls within the same process are fast.
+        if !work_texts.is_empty() {
+            let model = self.get_or_load_model().await?;
+            let translated = task::spawn_blocking(move || {
+                model.translate_batch(&work_texts)
+            })
+            .await
+            .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;
+
+            for ((text_idx, target_lang), result) in work_indices.iter().zip(translated) {
+                all_translations[*text_idx].insert(target_lang.clone(), result);
             }
         }
 
@@ -453,28 +312,28 @@ impl TranslationEngine {
         Ok(TranslationResultSet { results })
     }
 
-    /// Returns a cached model, loading it on first access with `num_threads` intra-op threads.
-    /// On a cache hit the cached model is returned as-is regardless of `num_threads`.
-    async fn get_or_load_model(&self, pair: &str, num_threads: usize) -> Result<Arc<LoadedModel>, TranslatorError> {
-        // Fast path: already cached.
-        if let Some(model) = self.cache.get(pair) {
+    /// Returns the MADLAD model, loading it on first access.
+    /// On a cache hit the model is returned immediately with no locking overhead.
+    async fn get_or_load_model(&self) -> Result<Arc<LoadedModel>, TranslatorError> {
+        // Fast path: already loaded — OnceLock::get is atomic and lock-free after init.
+        if let Some(model) = self.model_cache.get() {
             return Ok(model.clone());
         }
 
-        let model_dir = self.models_dir.join(pair);
+        let model_dir = self.models_dir.join("madlad400-3b-mt");
         if !model_dir.exists() {
-            return Err(TranslatorError::ModelNotFound(pair.to_string()));
+            return Err(TranslatorError::ModelNotFound("madlad400-3b-mt".to_string()));
         }
 
-        // Slow path: load from disk on a blocking thread.
+        // Slow path: load from disk on a blocking thread (reached only once).
+        let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let model = task::spawn_blocking(move || LoadedModel::load(&model_dir, num_threads))
             .await
             .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;
 
-        let model = Arc::new(model);
-        // Benign race: if another thread inserted concurrently, we drop our copy.
-        self.cache.entry(pair.to_string()).or_insert_with(|| model.clone());
+        // Benign race: if another task loaded concurrently, set() returns Err and we ignore it.
+        let _ = self.model_cache.set(Arc::new(model));
 
-        Ok(model)
+        Ok(self.model_cache.get().unwrap().clone())
     }
 }

@@ -13,7 +13,11 @@
 #   Standard Helsinki-NLP/opus-mt-*     → Apache-2.0
 #   Helsinki-NLP/opus-mt-tc-big-*       → CC-BY-4.0
 #   gsarti/opus-mt-tc-base-en-ja        → CC-BY-4.0
+#   google/madlad400-3b-mt              → Apache-2.0
 # Both Apache-2.0 and CC-BY-4.0 permit commercial use (attribution required).
+#
+# Disk requirements for MADLAD-400-3B-MT:
+#   ~12 GB download from HuggingFace → ~3 GB model.bin after int8 quantization.
 
 set -euo pipefail
 
@@ -170,6 +174,26 @@ for pair in "${MODELS[@]}"; do
   fi
   echo ""
 done
+
+# ── MADLAD-400-3B-MT ─────────────────────────────────────────────────────────
+# Single model covering 400+ languages; replaces all per-pair en-X models.
+# Disk: ~12 GB download, ~3 GB output (int8). Runtime RAM: ~3 GB (always hot).
+MADLAD_DIR="${MODELS_DIR}/madlad400-3b-mt"
+if [[ ! -f "${MADLAD_DIR}/model.bin" ]]; then
+  echo "━━━  madlad400-3b-mt  (google/madlad400-3b-mt)"
+  ct2-transformers-converter \
+      --model google/madlad400-3b-mt \
+      --output_dir "${MADLAD_DIR}" \
+      --quantization int8 \
+      --copy_files spiece.model \
+      --force
+  # SpmTokenizer expects source.spm / target.spm; MADLAD uses one shared model
+  cp "${MADLAD_DIR}/spiece.model" "${MADLAD_DIR}/source.spm"
+  cp "${MADLAD_DIR}/spiece.model" "${MADLAD_DIR}/target.spm"
+  echo "OK    madlad400-3b-mt"
+else
+  echo "SKIP  madlad400-3b-mt  (already exists)"
+fi
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Results: ${#PASS[@]} converted, ${#SKIP[@]} skipped, ${#FAIL[@]} failed"

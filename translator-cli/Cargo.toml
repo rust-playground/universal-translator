@@ -8,6 +8,9 @@ license.workspace = true
 name = "ut"
 path = "src/main.rs"
 
+[features]
+cuda = ["translator-core/cuda"]
+
 [dependencies]
 translator-core    = { workspace = true }
 dirs               = { workspace = true }

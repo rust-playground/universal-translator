@@ -2,9 +2,37 @@ use std::path::Path;
 
 use ct2rs::sys::Translator as SysTranslator;
 use ct2rs::tokenizers::sentencepiece::Tokenizer as SpmTokenizer;
-use ct2rs::{BatchType, ComputeType, Config, Tokenizer, TranslationOptions};
+use ct2rs::{BatchType, ComputeType, Config, Device, Tokenizer, TranslationOptions};
 
 use crate::error::TranslatorError;
+
+/// Select the inference device and compute type.
+///
+/// When the `cuda` feature is compiled in and a CUDA device is present at runtime,
+/// uses CUDA with FLOAT16 (the standard high-performance CUDA compute type).
+/// Falls back to the best CPU compute type for the current architecture.
+fn select_device_and_compute() -> (Device, ComputeType) {
+    #[cfg(feature = "cuda")]
+    if ct2rs::sys::get_device_count(Device::CUDA) > 0 {
+        return (Device::CUDA, ComputeType::FLOAT16);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    return (Device::CPU, ComputeType::FLOAT32); // ARM NEON: FLOAT32 > INT8 for small-batch inference
+
+    #[cfg(target_arch = "x86_64")]
+    return (
+        Device::CPU,
+        if std::is_x86_feature_detected!("avx2") {
+            ComputeType::INT8 // AVX2 VNNI makes INT8 2-3× faster; CTranslate2 quantizes at load time
+        } else {
+            ComputeType::FLOAT32
+        },
+    );
+
+    #[allow(unreachable_code)]
+    (Device::CPU, ComputeType::FLOAT32) // safe default for other arches
+}
 
 /// A loaded CTranslate2 model with its SentencePiece tokenizer.
 /// The tokenizer auto-loads `source.spm` and `target.spm` from `model_dir`.
@@ -18,21 +46,10 @@ impl LoadedModel {
     pub fn load(model_dir: &Path, num_threads: usize) -> Result<Self, TranslatorError> {
         let tokenizer = SpmTokenizer::new(model_dir)
             .map_err(|e| TranslatorError::Ct2(e.to_string()))?;
-        #[cfg(target_arch = "aarch64")]
-        let compute_type = ComputeType::FLOAT32; // ARM NEON FLOAT32 > INT8 for small-batch inference
-
-        #[cfg(target_arch = "x86_64")]
-        let compute_type = if std::is_x86_feature_detected!("avx2") {
-            ComputeType::INT8 // AVX2 VNNI makes INT8 2-3× faster; CTranslate2 quantizes at load time
-        } else {
-            ComputeType::FLOAT32
-        };
-
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let compute_type = ComputeType::FLOAT32; // safe default for other arches
-
+        let (device, compute_type) = select_device_and_compute();
         let config = Config {
             compute_type,
+            device,
             num_threads_per_replica: num_threads,
             ..Config::default()
         };
@@ -49,8 +66,8 @@ impl LoadedModel {
             beam_size: 4,
             no_repeat_ngram_size: 3,
             replace_unknowns: true,
-            max_input_length: 512,
-            max_decoding_length: 512,
+            max_input_length: 1024,   // MADLAD-400 supports 1024; was 512 for opus-mt
+            max_decoding_length: 1024, // match input — MADLAD supports 1024 on both sides
             max_batch_size: 4096,
             batch_type: BatchType::Tokens,
             ..Default::default()
@@ -84,45 +101,4 @@ impl LoadedModel {
         self.run_batch(tokenized)
     }
 
-    /// Translate a batch where each text has its own prefix token.
-    /// Used by the engine to combine all en-mul target languages into one inference call.
-    pub fn translate_batch_with_per_text_prefix(
-        &self,
-        texts: &[String],
-        prefixes: &[&str],
-    ) -> Result<Vec<String>, TranslatorError> {
-        debug_assert_eq!(texts.len(), prefixes.len());
-        let tokenized = texts.iter().zip(prefixes)
-            .map(|(t, &prefix)| {
-                self.tokenizer.encode(t)
-                    .map_err(|e| TranslatorError::Ct2(e.to_string()))
-                    .map(|mut tokens| { tokens.insert(0, prefix.to_string()); tokens })
-            })
-            .collect::<Result<Vec<_>, TranslatorError>>()?;
-        self.run_batch(tokenized)
-    }
-
-    /// Translate using a source-side language prefix token (e.g. `">>jpn<<"` for Japanese).
-    /// Helsinki-NLP opus-mt multilingual models expect the token prepended to the encoder input,
-    /// not used as a decoder target prefix. The prefix is inserted directly as a token piece
-    /// (bypassing re-tokenization) so SentencePiece's character-level fallback cannot split it.
-    pub fn translate_batch_with_prefix(
-        &self,
-        texts: &[String],
-        prefix_token: &str,
-    ) -> Result<Vec<String>, TranslatorError> {
-        let tokenized = texts
-            .iter()
-            .map(|t| {
-                self.tokenizer
-                    .encode(t)
-                    .map_err(|e| TranslatorError::Ct2(e.to_string()))
-                    .map(|mut tokens| {
-                        tokens.insert(0, prefix_token.to_string());
-                        tokens
-                    })
-            })
-            .collect::<Result<Vec<_>, TranslatorError>>()?;
-        self.run_batch(tokenized)
-    }
 }
