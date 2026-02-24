@@ -9,7 +9,9 @@ name = "translator-api"
 path = "src/main.rs"
 
 [features]
-cuda = ["translator-core/cuda"]
+default = []
+metal   = ["translator-core/metal"]
+cuda    = ["translator-core/cuda"]
 
 [dependencies]
 translator-core    = { workspace = true }

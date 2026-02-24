@@ -5,12 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-cuda = ["ct2rs/cuda-dynamic-loading"]
+default = []
+metal   = ["candle-core/metal", "candle-transformers/metal", "candle-nn/metal"]
+cuda    = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda"]
 
 [dependencies]
-ct2rs     = { workspace = true }
-lingua    = { workspace = true }
-tokio     = { workspace = true, features = ["rt"] }
-thiserror = { workspace = true }
-serde     = { workspace = true }
-tracing   = { workspace = true }
+candle-core         = { workspace = true }
+candle-transformers = { workspace = true }
+candle-nn           = { workspace = true }
+tokenizers          = { workspace = true }
+serde_json          = { workspace = true }
+lingua              = { workspace = true }
+tokio               = { workspace = true, features = ["rt"] }
+thiserror           = { workspace = true }
+serde               = { workspace = true }
+tracing             = { workspace = true }

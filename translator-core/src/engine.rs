@@ -29,7 +29,7 @@ fn fix_icelandic_chars(s: &str) -> String {
         .collect()
 }
 
-/// Map ISO 639-1 code → MADLAD-400 language token.
+    /// Map ISO 639-1 code → MADLAD-400 language token.
 /// Format: `<2{iso639-1}>` prepended to the source text before tokenization.
 /// MADLAD's spiece.model vocabulary uses 2-letter ISO 639-1 codes only.
 fn madlad_lang_token(lang: &str) -> Option<&'static str> {
@@ -242,15 +242,19 @@ impl TranslationEngine {
         // before SentencePiece tokenization — inserting it post-tokenization maps to <unk>.
         let mut work_texts: Vec<String> = vec![];
         let mut work_indices: Vec<(usize, String)> = vec![];
+        // chunk_boundaries[k]..chunk_boundaries[k+1] = work items for source text k.
+        // All items in a chunk share the same source text, so their tokenized lengths
+        // are identical — enabling true batched inference without padding.
+        let mut chunk_boundaries: Vec<usize> = vec![0];
 
-        for target_lang in &batch.target_languages {
-            // Normalise regional variants (e.g. zh-cn → zh) for language token lookup.
-            // We keep `target_lang` as the key in the result maps so callers see their
-            // original code back; only the token lookup uses `norm_lang`.
-            let norm_lang = normalize_lang_code(target_lang);
+        for i in 0..n {
+            let src = source_langs[i].as_str();
+            for target_lang in &batch.target_languages {
+                // Normalise regional variants (e.g. zh-cn → zh) for language token lookup.
+                // We keep `target_lang` as the key in the result maps so callers see their
+                // original code back; only the token lookup uses `norm_lang`.
+                let norm_lang = normalize_lang_code(target_lang);
 
-            for i in 0..n {
-                let src = source_langs[i].as_str();
                 if norm_lang == src || target_lang.as_str() == src {
                     // Same language (or regional variant of source) — return original text unchanged.
                     all_translations[i].insert(target_lang.clone(), batch.texts[i].clone());
@@ -270,15 +274,25 @@ impl TranslationEngine {
                     }
                 }
             }
+            chunk_boundaries.push(work_texts.len());
         }
 
-        // Phase 3 — load the MADLAD model (cached after first call) and translate all work items
-        // in a single batched inference call. First call takes ~5–10 s to load the 3 GB model;
-        // subsequent calls within the same process are fast.
+        // Phase 3 — load the MADLAD model (cached after first call) and translate all work items.
+        // Each source text's chunk is processed as a single batched inference call: the encoder
+        // runs once on [B, seq_len] and the decoder loop runs on [B, 1] per step.
+        // First call takes ~5–10 s to load the 3 GB model; subsequent calls are fast.
         if !work_texts.is_empty() {
             let model = self.get_or_load_model().await?;
             let translated = task::spawn_blocking(move || {
-                model.translate_batch(&work_texts)
+                let mut out = Vec::with_capacity(work_texts.len());
+                for window in chunk_boundaries.windows(2) {
+                    let chunk = &work_texts[window[0]..window[1]];
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    out.extend(model.translate_batch(chunk)?);
+                }
+                Ok::<_, TranslatorError>(out)
             })
             .await
             .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;

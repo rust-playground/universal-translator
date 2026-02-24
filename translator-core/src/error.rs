@@ -17,6 +17,6 @@ pub enum TranslatorError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("CTranslate2 error: {0}")]
-    Ct2(String),
+    #[error("Model error: {0}")]
+    Model(String),
 }
