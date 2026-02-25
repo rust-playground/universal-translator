@@ -123,8 +123,9 @@ impl LoadedModel {
 
     /// Batched greedy decode using true `[B, seq_len]` encoder input and `[B, 1]` decoder steps.
     ///
-    /// All `texts` must be the same tokenized length (guaranteed when called per-chunk
-    /// from engine.rs, where every item is `"<2xx> <same_source_text>"`).
+    /// Inputs may have different tokenized lengths (e.g. cross-request batching). Sequences
+    /// shorter than `seq_len` are right-padded with token ID 0 (T5 pad token). Same-length
+    /// inputs incur zero padding overhead (preserves existing intra-request chunk behavior).
     fn translate_batch_greedy(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
         let b = texts.len();
 
@@ -139,14 +140,22 @@ impl LoadedModel {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let seq_len = encodings[0].get_ids().len().min(MAX_INPUT_TOKENS);
+        let seq_len = encodings.iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0)
+            .min(MAX_INPUT_TOKENS);
         if seq_len == 0 {
             return Ok(vec![String::new(); b]);
         }
 
         let all_ids: Vec<u32> = encodings
             .iter()
-            .flat_map(|e| e.get_ids().iter().take(MAX_INPUT_TOKENS).copied())
+            .flat_map(|e| {
+                let ids: Vec<u32> = e.get_ids().iter().take(seq_len).copied().collect();
+                let pad = seq_len - ids.len();
+                ids.into_iter().chain(std::iter::repeat(0u32).take(pad))
+            })
             .collect();
 
         let input_tensor = Tensor::from_vec(all_ids, (b, seq_len), &self.device)
