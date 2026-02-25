@@ -9,6 +9,8 @@ use crate::error::TranslatorError;
 
 const MAX_INPUT_TOKENS: usize = 1024;
 const MAX_NEW_TOKENS: usize = 1024;
+/// Standard T5 length-normalization exponent for beam scoring.
+const BEAM_LENGTH_PENALTY: f32 = 0.6;
 
 /// Select the best available inference device in priority order:
 ///   CUDA (if compiled in and device present) → Metal (macOS) → CPU
@@ -102,23 +104,32 @@ impl LoadedModel {
         })
     }
 
-    /// Translate a batch of strings using true batched inference. Synchronous — always call from `spawn_blocking`.
+    /// Translate a batch of strings. Synchronous — always call from `spawn_blocking`.
     ///
-    /// All `texts` must be the same tokenized length (guaranteed when called per-chunk
-    /// from engine.rs, where every item is `"<2xx> <same_source_text>"`).
-    ///
-    /// Clones the model template cheaply (Arc refcount increments on shared weights)
-    /// to obtain an independent instance with a fresh KV cache.
-    pub fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
-        let b = texts.len();
-        if b == 0 {
+    /// Dispatches to:
+    ///   - Batched greedy  (beam_width ≤ 1): `[B, seq_len]` encode + `[B, 1]` decode loop
+    ///   - Beam search     (beam_width ≥ 2, all devices): per-text with independent KV caches
+    pub fn translate_batch(&self, texts: &[String], beam_width: u8) -> Result<Vec<String>, TranslatorError> {
+        if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        // Cheap clone: ~100 Arc refcount increments; all weight tensors are shared.
+        if beam_width <= 1 {
+            self.translate_batch_greedy(texts)
+        } else {
+            texts.iter().map(|t| self.translate_beam(t, beam_width as usize)).collect()
+        }
+    }
+
+    /// Batched greedy decode using true `[B, seq_len]` encoder input and `[B, 1]` decoder steps.
+    ///
+    /// All `texts` must be the same tokenized length (guaranteed when called per-chunk
+    /// from engine.rs, where every item is `"<2xx> <same_source_text>"`).
+    fn translate_batch_greedy(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
+        let b = texts.len();
+
         let mut model = self.model_template.clone();
 
-        // Tokenize all inputs, truncating to MAX_INPUT_TOKENS each.
         let encodings: Vec<_> = texts
             .iter()
             .map(|text| {
@@ -128,15 +139,11 @@ impl LoadedModel {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // All items in a chunk share the same source text — identical length.
-        // Use the first encoding's length, capped at MAX_INPUT_TOKENS.
         let seq_len = encodings[0].get_ids().len().min(MAX_INPUT_TOKENS);
-
         if seq_len == 0 {
             return Ok(vec![String::new(); b]);
         }
 
-        // Build [B, seq_len] input tensor by interleaving all token ID rows.
         let all_ids: Vec<u32> = encodings
             .iter()
             .flat_map(|e| e.get_ids().iter().take(MAX_INPUT_TOKENS).copied())
@@ -146,15 +153,11 @@ impl LoadedModel {
             .map_err(|e| TranslatorError::Model(e.to_string()))?;
 
         model.clear_kv_cache();
-
-        // Encode the full [B, seq_len] source batch once.
         let encoder_output = model
             .encode(&input_tensor)
             .map_err(|e| TranslatorError::Model(e.to_string()))?;
 
-        // Greedy decode: one [B, 1] step at a time; each call returns [B, vocab_size].
         let step_limit = MAX_NEW_TOKENS.min(seq_len * 3 + 32);
-
         let mut current_tokens = vec![self.decoder_start_token_id; b];
         let mut output_ids: Vec<Vec<u32>> = vec![vec![]; b];
         let mut finished = vec![false; b];
@@ -164,16 +167,12 @@ impl LoadedModel {
                 break;
             }
 
-            // Shape [B, 1] — one token per sequence for this decode step.
             let dec = Tensor::from_vec(current_tokens.clone(), (b, 1), &self.device)
                 .map_err(|e| TranslatorError::Model(e.to_string()))?;
-
-            // decode() returns [B, vocab_size] — last position already selected.
+            // decode() returns [B, vocab_size]
             let logits = model
                 .decode(&dec, &encoder_output)
                 .map_err(|e| TranslatorError::Model(e.to_string()))?;
-
-            // [B, vocab_size] → [B] next token ids.
             let next: Vec<u32> = logits
                 .argmax(D::Minus1)
                 .map_err(|e| TranslatorError::Model(e.to_string()))?
@@ -200,5 +199,150 @@ impl LoadedModel {
                     .map_err(|e| TranslatorError::Model(format!("decode: {e}")))
             })
             .collect()
+    }
+
+    /// Beam search decode for a single text. Each beam maintains an independent KV cache
+    /// (model clone). Arc-backed weights are shared across all clones for free.
+    fn translate_beam(&self, text: &str, beam_width: usize) -> Result<String, TranslatorError> {
+        let input_ids: Vec<u32> = self.tokenizer
+            .encode(text, true)
+            .map_err(|e| TranslatorError::Model(format!("tokenize: {e}")))?
+            .get_ids()
+            .iter()
+            .take(MAX_INPUT_TOKENS)
+            .copied()
+            .collect();
+        if input_ids.is_empty() {
+            return Ok(String::new());
+        }
+
+        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(|e| TranslatorError::Model(e.to_string()))?;
+
+        // Encode once; all beams share the same [1, seq_len, d_model] encoder output.
+        let mut seed_model = self.model_template.clone();
+        seed_model.clear_kv_cache();
+        let encoder_output = seed_model
+            .encode(&input_tensor)
+            .map_err(|e| TranslatorError::Model(e.to_string()))?;
+
+        struct Beam {
+            model: qt5::T5ForConditionalGeneration,
+            tokens: Vec<u32>,
+            score: f32,
+            current_token: u32,
+            finished: bool,
+        }
+
+        let mut beams: Vec<Beam> = (0..beam_width)
+            .map(|_| Beam {
+                model: seed_model.clone(),
+                tokens: vec![],
+                score: 0.0,
+                current_token: self.decoder_start_token_id,
+                finished: false,
+            })
+            .collect();
+
+        let mut completed: Vec<(f32, Vec<u32>)> = vec![];
+
+        for _ in 0..MAX_NEW_TOKENS {
+            if beams.iter().all(|b| b.finished) {
+                break;
+            }
+
+            // Each active beam produces beam_width candidates; keep the best beam_width overall.
+            let mut candidates: Vec<(f32, u32, usize)> = vec![]; // (score, token, parent_beam_idx)
+
+            for (bi, beam) in beams.iter_mut().enumerate() {
+                if beam.finished {
+                    continue;
+                }
+
+                let dec = Tensor::new(&[beam.current_token], &self.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                // decode() returns [1, vocab_size]
+                let logits = beam
+                    .model
+                    .decode(&dec, &encoder_output)
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?;
+
+                // Bring logits to CPU then compute numerically stable log_softmax in Rust.
+                // Avoids reliance on a GPU log_softmax op (not available in candle 0.8).
+                let raw: Vec<f32> = logits
+                    .squeeze(0)
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?
+                    .to_vec1::<f32>()
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                let max_l = raw.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let log_sum_exp = max_l + raw.iter().map(|&x| (x - max_l).exp()).sum::<f32>().ln();
+                let log_probs: Vec<f32> = raw.iter().map(|&x| x - log_sum_exp).collect();
+
+                // Partial sort: collect top-beam_width tokens from this beam's distribution.
+                let mut indexed: Vec<(usize, f32)> = log_probs.into_iter().enumerate().collect();
+                indexed.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for (token_id, log_p) in indexed.into_iter().take(beam_width) {
+                    candidates.push((beam.score + log_p, token_id as u32, bi));
+                }
+            }
+
+            // Globally select top-beam_width candidates.
+            candidates.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.truncate(beam_width);
+
+            // Snapshot parent model states (with their accumulated KV caches) before rebuild.
+            // Future decode calls on the clones extend independent KV caches via `cat`.
+            let parent_models: Vec<qt5::T5ForConditionalGeneration> =
+                candidates.iter().map(|(_, _, p)| beams[*p].model.clone()).collect();
+            let parent_tokens: Vec<Vec<u32>> =
+                candidates.iter().map(|(_, _, p)| beams[*p].tokens.clone()).collect();
+
+            beams = candidates
+                .into_iter()
+                .zip(parent_models)
+                .zip(parent_tokens)
+                .map(|(((score, token, _), model), mut tokens)| {
+                    let finished = token == self.eos_token_id;
+                    if !finished {
+                        tokens.push(token);
+                    }
+                    Beam { model, tokens, score, current_token: token, finished }
+                })
+                .collect();
+
+            for beam in &beams {
+                if beam.finished {
+                    completed.push((beam.score, beam.tokens.clone()));
+                }
+            }
+        }
+
+        // Add unfinished beams as fallback (truncated at max steps).
+        for beam in &beams {
+            if !beam.finished && !beam.tokens.is_empty() {
+                completed.push((beam.score, beam.tokens.clone()));
+            }
+        }
+
+        // Pick best hypothesis by length-normalized score.
+        let best_tokens = completed
+            .into_iter()
+            .max_by(|(s_a, t_a), (s_b, t_b)| {
+                let norm_a = s_a / (t_a.len().max(1) as f32).powf(BEAM_LENGTH_PENALTY);
+                let norm_b = s_b / (t_b.len().max(1) as f32).powf(BEAM_LENGTH_PENALTY);
+                norm_a.partial_cmp(&norm_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(_, tokens)| tokens)
+            .unwrap_or_default();
+
+        self.tokenizer
+            .decode(&best_tokens, true)
+            .map_err(|e| TranslatorError::Model(format!("decode: {e}")))
     }
 }

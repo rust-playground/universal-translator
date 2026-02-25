@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use tokio::sync::Semaphore;
 use tokio::task;
 
 use crate::detector::Detector;
@@ -175,14 +176,23 @@ pub struct TranslationEngine {
     /// Single MADLAD-400-3B-MT model shared across all language pairs.
     model_cache: Arc<OnceLock<Arc<LoadedModel>>>,
     detector: Arc<Detector>,
+    /// Beam width used for every translation call on this engine instance.
+    /// 0 or 1 = greedy (fastest), ≥2 = beam search (better quality).
+    beam_width: u8,
+    /// Ensures only one GPU task runs at a time. Metal's command buffer is shared across all
+    /// T5 model clones (via Arc<RwLock<Commands>>); concurrent encode calls crash with
+    /// "A command encoder is already encoding to this command buffer".
+    gpu_semaphore: Arc<Semaphore>,
 }
 
 impl TranslationEngine {
-    pub fn new(models_dir: impl AsRef<Path>) -> Self {
+    pub fn new(models_dir: impl AsRef<Path>, beam_width: u8) -> Self {
         Self {
             models_dir: models_dir.as_ref().to_path_buf(),
             model_cache: Arc::new(OnceLock::new()),
             detector: Arc::new(Detector::new()),
+            beam_width,
+            gpu_semaphore: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -278,19 +288,22 @@ impl TranslationEngine {
         }
 
         // Phase 3 — load the MADLAD model (cached after first call) and translate all work items.
-        // Each source text's chunk is processed as a single batched inference call: the encoder
-        // runs once on [B, seq_len] and the decoder loop runs on [B, 1] per step.
+        // Each source text's chunk is processed sequentially (Metal/CPU) or batched (CUDA).
         // First call takes ~5–10 s to load the 3 GB model; subsequent calls are fast.
         if !work_texts.is_empty() {
             let model = self.get_or_load_model().await?;
+            let beam_width = self.beam_width;
+            let permit = self.gpu_semaphore.clone().acquire_owned().await
+                .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))?;
             let translated = task::spawn_blocking(move || {
+                let _permit = permit; // held for the full duration; dropped when closure returns
                 let mut out = Vec::with_capacity(work_texts.len());
                 for window in chunk_boundaries.windows(2) {
                     let chunk = &work_texts[window[0]..window[1]];
                     if chunk.is_empty() {
                         continue;
                     }
-                    out.extend(model.translate_batch(chunk)?);
+                    out.extend(model.translate_batch(chunk, beam_width)?);
                 }
                 Ok::<_, TranslatorError>(out)
             })

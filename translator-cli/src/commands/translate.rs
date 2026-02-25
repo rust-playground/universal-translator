@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use clap::{Args, ValueEnum};
 use translator_core::{engine::TranslationEngine, types::TranslationBatch};
@@ -23,12 +25,17 @@ pub struct TranslateArgs {
     #[arg(short = 's', long = "source")]
     pub source_language: Option<String>,
 
+    /// Beam width for decoding. 0 or 1 = greedy (fastest). 2–4 = beam search (better quality).
+    #[arg(long = "beam", default_value_t = 4)]
+    pub beam_width: u8,
+
     #[arg(long, value_enum, default_value = "pretty")]
     pub output: OutputFormat,
 }
 
 impl TranslateArgs {
-    pub async fn run(self, engine: TranslationEngine) -> Result<()> {
+    pub async fn run(self, models_dir: &Path) -> Result<()> {
+        let engine = TranslationEngine::new(models_dir, self.beam_width);
         let batch = TranslationBatch {
             texts: self.texts,
             target_languages: self.languages,

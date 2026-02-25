@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use translator_core::engine::TranslationEngine;
 
 mod commands;
 
@@ -33,6 +32,5 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let models_dir = cli.models_dir.unwrap_or_else(default_models_dir);
-    let engine = TranslationEngine::new(&models_dir);
-    cli.command.run(engine).await
+    cli.command.run(&models_dir).await
 }

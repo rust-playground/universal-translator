@@ -2,9 +2,10 @@ pub mod detect;
 pub mod languages;
 pub mod translate;
 
+use std::path::Path;
+
 use anyhow::Result;
 use clap::Subcommand;
-use translator_core::engine::TranslationEngine;
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -14,10 +15,10 @@ pub enum Commands {
 }
 
 impl Commands {
-    pub async fn run(self, engine: TranslationEngine) -> Result<()> {
+    pub async fn run(self, models_dir: &Path) -> Result<()> {
         match self {
-            Commands::Translate(args) => args.run(engine).await,
-            Commands::Detect(args) => args.run(engine).await,
+            Commands::Translate(args) => args.run(models_dir).await,
+            Commands::Detect(args) => args.run(models_dir).await,
             Commands::Languages(args) => args.run(),
         }
     }

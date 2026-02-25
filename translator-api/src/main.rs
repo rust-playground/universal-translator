@@ -29,9 +29,13 @@ async fn main() {
                 .unwrap_or_else(|| PathBuf::from(".cache"))
                 .join("ut/models")
         });
-    tracing::info!(?models_dir, "Loading translation engine");
+    let beam_width: u8 = env::var("BEAM_WIDTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    tracing::info!(?models_dir, beam_width, "Loading translation engine");
 
-    let engine = TranslationEngine::new(&models_dir);
+    let engine = TranslationEngine::new(&models_dir, beam_width);
     let state = AppState { engine };
 
     let app = Router::new()

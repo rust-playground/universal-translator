@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use clap::{Args, ValueEnum};
 use translator_core::engine::TranslationEngine;
@@ -18,7 +20,8 @@ pub struct DetectArgs {
 }
 
 impl DetectArgs {
-    pub async fn run(self, engine: TranslationEngine) -> Result<()> {
+    pub async fn run(self, models_dir: &Path) -> Result<()> {
+        let engine = TranslationEngine::new(models_dir, 1);
         let detected = engine.detect_language(&self.text).await?;
 
         match self.output {
