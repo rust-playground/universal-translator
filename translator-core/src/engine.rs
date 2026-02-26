@@ -379,9 +379,9 @@ async fn run_translation_worker(
             None => break, // all Senders dropped → clean shutdown
         };
 
-        // Non-blocking drain: coalesce requests that queued while the last batch ran.
+        // Non-blocking drain: coalesce requests already queued while the last batch ran.
         // MAX_BATCH_TEXTS caps memory pressure and ensures latency fairness.
-        const MAX_BATCH_TEXTS: usize = 256;
+        const MAX_BATCH_TEXTS: usize = 64;
         let mut requests = vec![first];
         let mut total_texts = requests[0].texts.len();
         while total_texts < MAX_BATCH_TEXTS {

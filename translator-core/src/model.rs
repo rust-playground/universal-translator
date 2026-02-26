@@ -154,7 +154,7 @@ impl LoadedModel {
             .flat_map(|e| {
                 let ids: Vec<u32> = e.get_ids().iter().take(seq_len).copied().collect();
                 let pad = seq_len - ids.len();
-                ids.into_iter().chain(std::iter::repeat(0u32).take(pad))
+                ids.into_iter().chain(std::iter::repeat_n(0u32, pad))
             })
             .collect();
 
@@ -197,7 +197,14 @@ impl LoadedModel {
                     }
                 }
             }
-            current_tokens = next;
+            // Force finished sequences to feed EOS as their next decoder input rather than
+            // whatever token the model happened to produce. Prevents garbage tokens from
+            // propagating through the decoder KV cache for already-completed sequences.
+            current_tokens = next
+                .into_iter()
+                .enumerate()
+                .map(|(i, tok)| if finished[i] { self.eos_token_id } else { tok })
+                .collect();
         }
 
         output_ids
