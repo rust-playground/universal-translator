@@ -21,7 +21,7 @@ pub struct DetectArgs {
 
 impl DetectArgs {
     pub async fn run(self, models_dir: &Path) -> Result<()> {
-        let engine = TranslationEngine::new(models_dir, 1);
+        let engine = TranslationEngine::new(models_dir, None);
         let detected = engine.detect_language(&self.text).await?;
 
         match self.output {

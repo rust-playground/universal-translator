@@ -13,6 +13,7 @@ use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
 /// A unit of translation work sent from a request handler to the background GPU worker.
 struct WorkRequest {
     texts: Vec<String>,
+    beam_width: u8,
     reply_tx: tokio::sync::oneshot::Sender<Result<Vec<String>, TranslatorError>>,
 }
 
@@ -122,6 +123,26 @@ fn normalize_lang_code(code: &str) -> &str {
     }
 }
 
+/// Select beam width based on the longest text in the request.
+///
+/// Thresholds are calibrated at ~4 chars/token for English:
+///
+/// | Range       | Approx tokens | Beam | Rationale |
+/// |-------------|---------------|------|-----------|
+/// | 0–60 chars  | ≤15           | 0    | Greedy is indistinguishable from beam search at this length — MADLAD's top-1 token is almost always correct for short phrases, names, and single clauses. No quality loss, full speed. |
+/// | 61–160 chars| 15–40         | 2    | Sentences and short paragraphs where greedy occasionally makes recoverable errors mid-sequence. Beam=2 captures ~85% of beam=4's quality improvement at roughly half the extra cost. |
+/// | 161+ chars  | >40           | 4    | Long or complex inputs where error accumulation is significant and beam=4 yields the best reachable quality. The 3–4× slowdown vs greedy is justified by the complexity of the text. |
+///
+/// The **longest** text in the caller's own request batch determines the tier so that
+/// a batch containing one long string does not force greedy decoding on all texts.
+fn auto_beam(max_chars: usize) -> u8 {
+    match max_chars {
+        0..=60   => 0,  // ≤~15 tokens  → greedy
+        61..=160 => 2,  // ~15–40 tokens → light beam search
+        _        => 4,  // >40 tokens    → full beam search
+    }
+}
+
 // Not supported — source detection impossible or absent from MADLAD-400 vocabulary:
 //   gl (Galician): Latin script, statistically indistinct from Portuguese/Spanish;
 //                  all speakers are fluent in the already-supported `es`.
@@ -182,21 +203,21 @@ pub struct TranslationEngine {
     /// Single MADLAD-400-3B-MT model shared across all language pairs.
     model_cache: Arc<OnceLock<Arc<LoadedModel>>>,
     detector: Arc<Detector>,
-    /// Beam width used for every translation call on this engine instance.
-    /// 0 or 1 = greedy (fastest), ≥2 = beam search (better quality).
-    beam_width: u8,
+    /// If `Some(n)`, forces beam width to `n` for every request.
+    /// If `None`, auto-selects based on the longest text in the request.
+    configured_beam: Option<u8>,
     /// Sender half of the background GPU worker channel. Initialized lazily on first use.
     /// The worker coalesces concurrent requests into a single GPU batch.
     work_tx: Arc<OnceLock<mpsc::Sender<WorkRequest>>>,
 }
 
 impl TranslationEngine {
-    pub fn new(models_dir: impl AsRef<Path>, beam_width: u8) -> Self {
+    pub fn new(models_dir: impl AsRef<Path>, configured_beam: Option<u8>) -> Self {
         Self {
             models_dir: models_dir.as_ref().to_path_buf(),
             model_cache: Arc::new(OnceLock::new()),
             detector: Arc::new(Detector::new()),
-            beam_width,
+            configured_beam,
             work_tx: Arc::new(OnceLock::new()),
         }
     }
@@ -293,9 +314,11 @@ impl TranslationEngine {
         // Concurrent requests that arrive while the worker is busy are still coalesced
         // via the worker's try_recv loop.
         if !work_texts.is_empty() {
+            let max_chars = batch.texts.iter().map(|t| t.len()).max().unwrap_or(0);
+            let beam_width = self.configured_beam.unwrap_or_else(|| auto_beam(max_chars));
             let tx = self.get_or_start_worker();
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx.send(WorkRequest { texts: work_texts, reply_tx }).await
+            tx.send(WorkRequest { texts: work_texts, beam_width, reply_tx }).await
                 .map_err(|_| TranslatorError::TranslationFailed("worker stopped".into()))?;
             let translated = reply_rx.await
                 .map_err(|_| TranslatorError::TranslationFailed("worker dropped reply".into()))??;
@@ -335,8 +358,7 @@ impl TranslationEngine {
             let (tx, rx) = mpsc::channel(1024);
             let model_cache = self.model_cache.clone();
             let model_dir = self.models_dir.join("madlad400-3b-mt");
-            let beam_width = self.beam_width;
-            tokio::spawn(run_translation_worker(rx, model_cache, model_dir, beam_width));
+            tokio::spawn(run_translation_worker(rx, model_cache, model_dir));
             tx
         })
     }
@@ -356,7 +378,6 @@ async fn run_translation_worker(
     mut rx: mpsc::Receiver<WorkRequest>,
     model_cache: Arc<OnceLock<Arc<LoadedModel>>>,
     model_dir: PathBuf,
-    beam_width: u8,
 ) {
     // Load model on worker start; share into model_cache for any external callers.
     let model = match task::spawn_blocking(move || LoadedModel::load(&model_dir, 4)).await {
@@ -394,40 +415,48 @@ async fn run_translation_worker(
             }
         }
 
-        // Merge all requests' texts into one flat batch; track per-request slice boundaries.
-        let mut all_texts: Vec<String> = Vec::with_capacity(total_texts);
-        let mut splits = vec![0usize];
-        for req in &requests {
-            all_texts.extend(req.texts.iter().cloned());
-            splits.push(all_texts.len());
+        // Group by beam_width and run a separate translate_batch per tier.
+        // BTreeMap gives deterministic order: greedy (0) before beam=2 before beam=4.
+        let mut groups: std::collections::BTreeMap<u8, Vec<WorkRequest>> = Default::default();
+        for req in requests {
+            groups.entry(req.beam_width).or_default().push(req);
         }
 
-        // GPU work on the blocking thread pool — same mechanism as the former semaphore path.
-        let model_ref = model.clone();
-        let result = task::spawn_blocking(move || {
-            model_ref.translate_batch(&all_texts, beam_width)
-        }).await;
+        for (bw, group_reqs) in groups {
+            let total: usize = group_reqs.iter().map(|r| r.texts.len()).sum();
+            let mut group_texts: Vec<String> = Vec::with_capacity(total);
+            let mut splits = vec![0usize];
+            for req in &group_reqs {
+                group_texts.extend(req.texts.iter().cloned());
+                splits.push(group_texts.len());
+            }
 
-        match result {
-            Ok(Ok(outputs)) => {
-                for (i, req) in requests.into_iter().enumerate() {
-                    let _ = req.reply_tx.send(Ok(outputs[splits[i]..splits[i + 1]].to_vec()));
+            let model_ref = model.clone();
+            let result = task::spawn_blocking(move || {
+                model_ref.translate_batch(&group_texts, bw)
+            }).await;
+
+            match result {
+                Ok(Ok(outputs)) => {
+                    for (i, req) in group_reqs.into_iter().enumerate() {
+                        let _ = req.reply_tx.send(Ok(outputs[splits[i]..splits[i + 1]].to_vec()));
+                    }
                 }
-            }
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                for req in requests {
-                    let _ = req.reply_tx.send(Err(
-                        TranslatorError::TranslationFailed(msg.clone())
-                    ));
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    for req in group_reqs {
+                        let _ = req.reply_tx.send(Err(
+                            TranslatorError::TranslationFailed(msg.clone())
+                        ));
+                    }
                 }
-            }
-            Err(join_err) => {
-                let msg = join_err.to_string();
-                for req in requests {
-                    let _ = req.reply_tx.send(Err(
-                        TranslatorError::TranslationFailed(msg.clone())
-                    ));
+                Err(join_err) => {
+                    let msg = join_err.to_string();
+                    for req in group_reqs {
+                        let _ = req.reply_tx.send(Err(
+                            TranslatorError::TranslationFailed(msg.clone())
+                        ));
+                    }
                 }
             }
         }

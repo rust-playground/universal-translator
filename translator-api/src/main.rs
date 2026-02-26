@@ -30,8 +30,9 @@ struct Args {
     models_dir: Option<PathBuf>,
 
     /// Beam width for decoding. 0 or 1 = greedy (fastest). 2–4 = beam search.
-    #[arg(long = "beam", env = "BEAM_WIDTH", default_value_t = 0)]
-    beam_width: u8,
+    /// Omit to use auto-selection based on input length.
+    #[arg(long = "beam", env = "BEAM_WIDTH")]
+    beam_width: Option<u8>,
 
     /// TCP port to listen on.
     #[arg(long, default_value_t = 3000)]
@@ -47,12 +48,14 @@ async fn main() {
 
     let args = Args::parse();
     let models_dir = args.models_dir.unwrap_or_else(default_models_dir);
-    let beam_width = args.beam_width;
+    let configured_beam = args.beam_width;
     let addr = format!("0.0.0.0:{}", args.port);
 
-    tracing::info!(?models_dir, beam_width, "Loading translation engine");
+    let beam_label = configured_beam
+        .map_or_else(|| "auto".to_string(), |n| n.to_string());
+    tracing::info!(?models_dir, beam = %beam_label, "Loading translation engine");
 
-    let engine = TranslationEngine::new(&models_dir, beam_width);
+    let engine = TranslationEngine::new(&models_dir, configured_beam);
     let state = AppState { engine };
 
     let app = Router::new()

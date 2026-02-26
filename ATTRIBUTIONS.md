@@ -1,70 +1,55 @@
 # Third-Party Model Attributions
 
-This project uses pre-trained machine translation models at runtime. The models
-themselves are not distributed with this source code — they are downloaded
+This project uses pre-trained machine translation models and libraries at runtime.
+The model weights are not distributed with this source code — they are downloaded
 separately via `models/download.sh`. Licenses and attribution requirements for
-each model family are listed below.
+each component are listed below.
 
 ---
 
-## Helsinki-NLP OPUS-MT (standard models)
+## google/madlad400-3b-mt
 
 **License:** Apache 2.0
-**Source:** https://huggingface.co/Helsinki-NLP
-**Used for:** Most language pairs (af, ar, bg, ca, cs, cy, da, de, el, eo, es,
-et, eu, fi, fr, gl, he, hi, hu, hy, id, is, it, lt, mk, ml, mr, mt, nl, pt,
-ro, ru, sk, sq, sv, sw, tl, tr, uk, ur, vi, zh, and corresponding X→en models)
+**Source:** https://huggingface.co/google/madlad400-3b-mt
+**Used for:** All translation inference — the underlying model weights
 
-> Tiedemann, J., & Thottingal, S. (2020). OPUS-MT — Building open translation
-> services for the World. In *Proceedings of the 22nd Annual Conference of the
-> European Association for Machine Translation*, pp. 479–480.
+> Kudugunta, S. et al. (2024). MADLAD-400: A Multilingual And Document-Level Large
+> Audited Dataset. *Advances in Neural Information Processing Systems 36*.
 
 ---
 
-## Helsinki-NLP OPUS-MT TC-Big models
+## jbochi/madlad400-3b-mt (GGUF conversion)
 
-**License:** CC-BY 4.0
-**Source:** https://huggingface.co/Helsinki-NLP
-**Used for:** en-ko (Korean), en-lt (Lithuanian), en-lv (Latvian),
-en-pt (Portuguese), en-tr (Turkish)
-
-> Tiedemann, J. (2020). The Tatoeba Translation Challenge — Realistic Data Sets
-> for Low Resource and Multilingual MT. In *Proceedings of the Fifth Conference
-> on Machine Translation (WMT20)*.
-
-Attribution is required under CC-BY 4.0. Credit: Language Technology Research
-Group at the University of Helsinki.
+**License:** Apache 2.0 (inherits from source)
+**Source:** https://huggingface.co/jbochi/madlad400-3b-mt
+**Used for:** The `model-q4k.gguf` file downloaded at runtime — community int4
+quantisation of the above model in GGUF format, enabling Candle inference without
+Python tooling.
 
 ---
 
-## gsarti/opus-mt-tc-base-en-ja
+## Candle (inference framework)
 
-**License:** CC-BY 4.0
-**Source:** https://huggingface.co/gsarti/opus-mt-tc-base-en-ja
-**Used for:** en-ja (Japanese)
-**Original model:** Helsinki-NLP MarianMT tc-base, converted by Gabriele Sarti
+**License:** MIT OR Apache-2.0
+**Source:** https://github.com/huggingface/candle
+**Used for:** All model inference at runtime (candle-core, candle-transformers,
+candle-nn crates)
 
-> Tiedemann, J. (2020). The Tatoeba Translation Challenge — Realistic Data Sets
-> for Low Resource and Multilingual MT. In *Proceedings of the Fifth Conference
-> on Machine Translation (WMT20)*.
-
-Attribution is required under CC-BY 4.0. Credit: Language Technology Research
-Group at the University of Helsinki; conversion by Gabriele Sarti.
+No additional attribution action is required by the MIT/Apache-2.0 licenses.
 
 ---
 
-## Helsinki-NLP/opus-mt-swc-en
+## HuggingFace Tokenizers
 
 **License:** Apache 2.0
-**Source:** https://huggingface.co/Helsinki-NLP/opus-mt-swc-en
-**Used for:** sw-en (Swahili → English pivot)
+**Source:** https://github.com/huggingface/tokenizers
+**Used for:** Fast tokenisation via the `tokenizers` Rust crate and `tokenizer.json`
 
 ---
 
-## CTranslate2 (runtime inference engine)
+## Lingua
 
-**License:** MIT
-**Source:** https://github.com/OpenNMT/CTranslate2
-**Used for:** All model inference at runtime via the `ct2rs` Rust bindings
-
-No additional attribution action is required by the MIT license.
+**License:** Apache 2.0
+**Source:** https://github.com/pemistahl/lingua-rs
+**Used for:** Automatic source-language detection, covering 75+ languages entirely
+offline

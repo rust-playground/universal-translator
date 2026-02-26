@@ -22,7 +22,7 @@ python3 tests/integration.py --binary ./target/debug/ut
 Run once before using the CLI or API:
 
 ```bash
-bash models/download.sh   # requires Python + pip packages: ctranslate2 transformers sentencepiece torch
+bash models/download.sh   # requires: pip install huggingface_hub[cli]
 ```
 
 Downloads and converts MADLAD-400-3B-MT. Required files in `${MODELS_DIR}/madlad400-3b-mt/`:
@@ -43,8 +43,8 @@ cargo run -p translator-cli -- detect -t "Bonjour"
 cargo run -p translator-api
 ```
 
-Key CLI flags: `--beam N` (default 4; 0/1 = greedy), `--models-dir`, `--output json`.
-Key API env vars: `MODELS_DIR`, `BEAM_WIDTH` (default 0 = greedy), `RUST_LOG`.
+Key CLI flags: `--beam N` (omit for auto-selection; 0/1 = greedy, 2/4 = beam search), `--models-dir`, `--output json`.
+Key API env vars: `MODELS_DIR`, `BEAM_WIDTH` (omit for auto-selection; 0/1 = greedy), `RUST_LOG`.
 
 ## Architecture
 
@@ -75,7 +75,7 @@ Key API env vars: `MODELS_DIR`, `BEAM_WIDTH` (default 0 = greedy), `RUST_LOG`.
 - `OnceLock<Arc<LoadedModel>>` — single model instance, lock-free read path after init
 - Token limits: 512 tokens input (silently truncated); 1 024 tokens max output
 - Same-language shortcut: returns original text without inference
-- `beam_width` is startup config only — not part of the JSON request body
+- `beam_width` is startup config only — not part of the JSON request body; omit for auto-selection (tiers: greedy ≤15 tokens, beam=2 15–40 tokens, beam=4 >40 tokens)
 
 ## CI
 

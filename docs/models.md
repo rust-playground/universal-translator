@@ -1,6 +1,7 @@
 # Model Management
 
-This guide explains how to convert and install Helsinki-NLP OPUS-MT models for use with universal-translator.
+This guide explains how to download and manage the MADLAD-400-3B-MT model for use
+with universal-translator.
 
 ---
 
@@ -11,131 +12,119 @@ This guide explains how to convert and install Helsinki-NLP OPUS-MT models for u
 | Linux    | `~/.cache/ut/models` (respects `$XDG_CACHE_HOME`) |
 | macOS    | `~/Library/Caches/ut/models` |
 
-You can override the default by setting the `MODELS_DIR` environment variable (for the API server)
-or passing `--models-dir` to the CLI.
+Override the default by setting the `MODELS_DIR` environment variable or passing
+`--models-dir` to the CLI or API server.
 
 ---
 
 ## Prerequisites
 
-- Python 3.x
-- cmake (required to build CTranslate2 native extensions)
-- Rust toolchain (already needed to build the project)
+```bash
+pip install huggingface_hub[cli]
+```
 
-## Install conversion tooling
+This installs `huggingface-cli`, used by `download.sh` to fetch model files.
+`curl` is used as a fallback if `huggingface-cli` is unavailable.
+
+---
+
+## Download
 
 ```bash
-pip install ctranslate2 transformers sentencepiece torch
+bash models/download.sh
 ```
 
-## Convert a model
+The script downloads the following files from
+[`jbochi/madlad400-3b-mt`](https://huggingface.co/jbochi/madlad400-3b-mt) on
+Hugging Face into `${MODELS_DIR}/madlad400-3b-mt/`:
 
-Use the `ct2-transformers-converter` command-line tool that ships with the `ctranslate2` Python package.
+| File | Size | Description |
+|------|------|-------------|
+| `model-q4k.gguf` | ~1.65 GB | int4 quantised GGUF weights |
+| `config.json` | <1 MB | Model configuration |
+| `tokenizer.json` | <1 MB | HuggingFace fast tokenizer |
+| `tokenizer_config.json` | <1 MB | Tokenizer metadata |
 
-Example: English to French
+---
 
-```bash
-ct2-transformers-converter \
-  --model Helsinki-NLP/opus-mt-en-fr \
-  --output_dir $MODELS_DIR/en-fr \
-  --quantization float32 \
-  --copy_files source.spm target.spm \
-  --force
-```
+## Expected directory layout
 
-Where `$MODELS_DIR` is `~/.cache/ut/models` on Linux or `~/Library/Caches/ut/models` on macOS.
-
-### Flag reference
-
-| Flag | Purpose |
-|------|---------|
-| `--model` | HuggingFace model ID to download and convert |
-| `--output_dir` | Directory to write the converted model into |
-| `--quantization int8` | Quantize weights to 8-bit integers, roughly halving model size with minimal quality loss |
-| `--copy_files source.spm target.spm` | Copy the SentencePiece tokenizer files into the output directory — the converter does not do this automatically |
-| `--force` | Overwrite the output directory if it already exists |
-
-## Verify the output
-
-After conversion, `$MODELS_DIR/en-fr/` should contain:
+After running `download.sh`, the model directory should look like this:
 
 ```
-~/.cache/ut/models/en-fr/
-├── model.bin              # Converted CTranslate2 weights (~77 MB with int8)
-├── source.spm             # Source-language SentencePiece model
-├── target.spm             # Target-language SentencePiece model
-├── config.json            # Model configuration
-└── shared_vocabulary.json # Vocabulary used by source and target tokenizers
+${MODELS_DIR}/madlad400-3b-mt/
+├── model-q4k.gguf          # ~1.65 GB — int4 quantised GGUF weights
+├── config.json
+├── tokenizer.json
+└── tokenizer_config.json
 ```
 
 If any of these files are missing the engine will fail to load the model at startup.
 
-## Available OPUS-MT pairs
+---
 
-The table below lists common Helsinki-NLP model pairs. Any pair available on HuggingFace under the `Helsinki-NLP` organisation can be converted with the same command — just substitute the model name and output directory.
+## Build targets
 
-| Language Pair | HuggingFace Model | Output Dir |
-|---------------|-------------------|------------|
-| English -> French | `Helsinki-NLP/opus-mt-en-fr` | `$MODELS_DIR/en-fr` |
-| English -> German | `Helsinki-NLP/opus-mt-en-de` | `$MODELS_DIR/en-de` |
-| English -> Spanish | `Helsinki-NLP/opus-mt-en-es` | `$MODELS_DIR/en-es` |
-| English -> Italian | `Helsinki-NLP/opus-mt-en-it` | `$MODELS_DIR/en-it` |
-| English -> Portuguese | `Helsinki-NLP/opus-mt-en-pt` | `$MODELS_DIR/en-pt` |
-| English -> Chinese | `Helsinki-NLP/opus-mt-en-zh` | `$MODELS_DIR/en-zh` |
-| French -> English | `Helsinki-NLP/opus-mt-fr-en` | `$MODELS_DIR/fr-en` |
-| German -> English | `Helsinki-NLP/opus-mt-de-en` | `$MODELS_DIR/de-en` |
-| Spanish -> English | `Helsinki-NLP/opus-mt-es-en` | `$MODELS_DIR/es-en` |
+```bash
+cargo build                   # CPU (default)
+cargo build --features metal  # macOS GPU (Metal)
+cargo build --features cuda   # Linux GPU (CUDA/NVIDIA)
+```
 
-The engine scans the default model directory (see above) at startup and loads every valid model it finds. Adding a new language pair requires no Rust code changes — drop the converted directory in and restart.
+---
 
-## Hosting pre-converted models
+## Hosting the model files
 
-The converted model directories (model.bin + tokenizer files) are too large to
-check into git (~50–200 MB each, ~4 GB total). Three options for distributing
-them to teammates or CI:
+The GGUF weights (~1.65 GB) are too large to check into git. Three options for
+distributing them to teammates or CI:
 
 ### Option A — Hugging Face Hub (recommended)
 
-Create a private HuggingFace repository of type **model** and push the
-converted directories there with `huggingface-cli upload`. Anyone with access
-can then pull them with `huggingface-cli download` and no Python conversion
-tooling is needed on their machine. This also keeps the models discoverable and
-versioned alongside the rest of the ML ecosystem.
+Create a private HuggingFace repository of type **model** and push the model
+directory there. Anyone with access can pull it with `huggingface-cli download` and
+no conversion tooling is needed on their machine.
 
 ```bash
 # Upload (once, after running download.sh)
-huggingface-cli upload your-org/universal-translator-models ~/.cache/ut/models/ --repo-type model
+huggingface-cli upload your-org/universal-translator-models \
+  ${MODELS_DIR}/madlad400-3b-mt/ \
+  --repo-type model
 
 # Download (on a new machine)
-huggingface-cli download your-org/universal-translator-models --local-dir ~/.cache/ut/models/ --repo-type model
+huggingface-cli download your-org/universal-translator-models \
+  --local-dir ${MODELS_DIR}/madlad400-3b-mt/ \
+  --repo-type model
 ```
 
 ### Option B — GitHub Releases
 
-Zip the model directory and attach it as a release asset. Useful if you
-want the models version-locked to a specific code release. Free up to 2 GB per
-release asset; for the full set you would need to split into multiple archives.
+Zip the model directory and attach it as a release asset. Useful if you want the
+model version-locked to a specific code release. The single directory (~1.65 GB)
+fits within GitHub's 2 GB release asset limit.
 
 ### Option C — Cloud object storage (S3 / GCS / R2)
 
-Upload the model directory to a bucket and sync it down in CI. Cloudflare
-R2 has no egress fees, which makes it cost-effective for frequent downloads.
+Upload the model directory to a bucket and sync it down in CI. Cloudflare R2 has
+no egress fees, which makes it cost-effective for frequent downloads.
 
 ```bash
 # Upload
-aws s3 sync ~/.cache/ut/models/ s3://your-bucket/models/
+aws s3 sync ${MODELS_DIR}/madlad400-3b-mt/ s3://your-bucket/madlad400-3b-mt/
 
 # Download (e.g. in CI)
-aws s3 sync s3://your-bucket/models/ ~/.cache/ut/models/
+aws s3 sync s3://your-bucket/madlad400-3b-mt/ ${MODELS_DIR}/madlad400-3b-mt/
 ```
 
 ---
 
 ## Lingua: fully local language detection
 
-universal-translator uses [Lingua](https://github.com/pemistahl/lingua-rs) to automatically detect the source language of incoming text. Lingua is entirely self-contained:
+universal-translator uses [Lingua](https://github.com/pemistahl/lingua-rs) to
+automatically detect the source language of incoming text. Lingua is entirely
+self-contained:
 
-- All language model data is compiled directly into the binary as Rust crates — there are no external data files to manage.
+- All language model data is compiled directly into the binary as Rust crates —
+  there are no external data files to manage.
 - Detection covers 75+ languages.
 - Zero network calls are made at runtime. Lingua works completely offline.
 

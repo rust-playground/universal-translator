@@ -26,8 +26,9 @@ pub struct TranslateArgs {
     pub source_language: Option<String>,
 
     /// Beam width for decoding. 0 or 1 = greedy (fastest). 2–4 = beam search (better quality).
-    #[arg(long = "beam", default_value_t = 4)]
-    pub beam_width: u8,
+    /// Omit to use auto-selection based on input length.
+    #[arg(long = "beam", env = "BEAM_WIDTH")]
+    pub beam_width: Option<u8>,
 
     #[arg(long, value_enum, default_value = "pretty")]
     pub output: OutputFormat,
