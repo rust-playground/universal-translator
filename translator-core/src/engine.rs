@@ -175,14 +175,17 @@ pub struct TranslationEngine {
     /// Single MADLAD-400-3B-MT model shared across all language pairs.
     model_cache: Arc<OnceLock<Arc<LoadedModel>>>,
     detector: Arc<Detector>,
+    beam_width: u8,
 }
 
 impl TranslationEngine {
-    pub fn new(models_dir: impl AsRef<Path>) -> Self {
+    /// Create a new engine. `beam_width` controls decoding: 0 = greedy (beam=1), otherwise the value is used directly.
+    pub fn new(models_dir: impl AsRef<Path>, beam_width: u8) -> Self {
         Self {
             models_dir: models_dir.as_ref().to_path_buf(),
             model_cache: Arc::new(OnceLock::new()),
             detector: Arc::new(Detector::new()),
+            beam_width,
         }
     }
 
@@ -277,8 +280,9 @@ impl TranslationEngine {
         // subsequent calls within the same process are fast.
         if !work_texts.is_empty() {
             let model = self.get_or_load_model().await?;
+            let beam_size = if self.beam_width == 0 { 1 } else { self.beam_width as usize };
             let translated = task::spawn_blocking(move || {
-                model.translate_batch(&work_texts)
+                model.translate_batch(&work_texts, beam_size)
             })
             .await
             .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;

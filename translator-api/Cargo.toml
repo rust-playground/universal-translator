@@ -13,6 +13,7 @@ cuda = ["translator-core/cuda"]
 
 [dependencies]
 translator-core    = { workspace = true }
+clap               = { workspace = true }
 dirs               = { workspace = true }
 axum               = { workspace = true }
 serde              = { workspace = true }

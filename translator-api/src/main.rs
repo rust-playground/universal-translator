@@ -1,10 +1,10 @@
-use std::env;
 use std::path::PathBuf;
 
 use axum::{
     routing::{get, post},
     Router,
 };
+use clap::Parser;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use translator_core::engine::TranslationEngine;
@@ -15,6 +15,25 @@ mod state;
 
 use state::AppState;
 
+fn default_models_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("ut/models")
+}
+
+#[derive(Parser)]
+#[command(name = "translator-api")]
+struct Args {
+    /// Directory containing model files.
+    /// [default: ~/.cache/ut/models  (macOS: ~/Library/Caches/ut/models)]
+    #[arg(long, env = "MODELS_DIR")]
+    models_dir: Option<PathBuf>,
+
+    /// Beam width for decoding. 0 = greedy, default 4.
+    #[arg(long, default_value = "4", env = "BEAM_WIDTH")]
+    beam: u8,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
@@ -22,16 +41,11 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let models_dir = env::var("MODELS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::cache_dir()
-                .unwrap_or_else(|| PathBuf::from(".cache"))
-                .join("ut/models")
-        });
-    tracing::info!(?models_dir, "Loading translation engine");
+    let args = Args::parse();
+    let models_dir = args.models_dir.unwrap_or_else(default_models_dir);
+    tracing::info!(?models_dir, beam = args.beam, "Loading translation engine");
 
-    let engine = TranslationEngine::new(&models_dir);
+    let engine = TranslationEngine::new(&models_dir, args.beam);
     let state = AppState { engine };
 
     let app = Router::new()

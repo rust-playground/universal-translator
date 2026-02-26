@@ -61,9 +61,9 @@ impl LoadedModel {
         })
     }
 
-    fn run_batch(&self, tokenized: Vec<Vec<String>>) -> Result<Vec<String>, TranslatorError> {
+    fn run_batch(&self, tokenized: Vec<Vec<String>>, beam_size: usize) -> Result<Vec<String>, TranslatorError> {
         let options = TranslationOptions::<String, String> {
-            beam_size: 4,
+            beam_size,
             no_repeat_ngram_size: 3,
             replace_unknowns: true,
             max_input_length: 1024,   // MADLAD-400 supports 1024; was 512 for opus-mt
@@ -92,13 +92,13 @@ impl LoadedModel {
     }
 
     /// Translate a batch of strings. Synchronous — always call from `spawn_blocking`.
-    pub fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
+    pub fn translate_batch(&self, texts: &[String], beam_size: usize) -> Result<Vec<String>, TranslatorError> {
         let tokenized = texts
             .iter()
             .map(|t| self.tokenizer.encode(t))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| TranslatorError::Ct2(e.to_string()))?;
-        self.run_batch(tokenized)
+        self.run_batch(tokenized, beam_size)
     }
 
 }
