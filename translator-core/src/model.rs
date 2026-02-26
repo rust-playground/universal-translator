@@ -106,9 +106,23 @@ impl LoadedModel {
 
     /// Translate a batch of strings. Synchronous — always call from `spawn_blocking`.
     ///
-    /// Dispatches to:
-    ///   - Batched greedy  (beam_width ≤ 1): `[B, seq_len]` encode + `[B, 1]` decode loop
-    ///   - Beam search     (beam_width ≥ 2, all devices): per-text with independent KV caches
+    /// Dispatches greedy decoding (beam_width ≤ 1) based on the active inference device:
+    ///
+    ///   Metal / CPU → per-sequence: each item encodes and decodes independently with its
+    ///     own KV cache. Faster on Metal because T5's cross-attention KV (encoder outputs
+    ///     kept in GPU memory for every decode step) scales with batch size B. At B=64,
+    ///     the cross-attention KV alone is ~15 MB, which saturates Metal's L2 cache and
+    ///     causes cache misses on every decode step. Sequential [1, seq_len] encode +
+    ///     [1, 1] decode keeps the cache footprint at ~240 KB per sequence.
+    ///
+    ///   CUDA → batched [B, seq_len]: a single model clone encodes all B inputs together
+    ///     and decodes with [B, 1] steps. CUDA's higher memory bandwidth (5–10× Metal)
+    ///     and larger L2 cache (40–80 MB on A100/H100) absorb the cross-attention KV at
+    ///     the batch sizes the engine produces (up to MAX_BATCH_TEXTS=64). Amortizing
+    ///     kernel launch overhead across B sequences gives significant throughput gains.
+    ///
+    /// Beam search (beam_width ≥ 2) always uses per-text independent KV caches regardless
+    /// of device (beams for one input share an encoder output, but inputs don't share).
     pub fn translate_batch(&self, texts: &[String], beam_width: u8) -> Result<Vec<String>, TranslatorError> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -121,15 +135,25 @@ impl LoadedModel {
         }
     }
 
-    /// Batched greedy decode using true `[B, seq_len]` encoder input and `[B, 1]` decoder steps.
+    /// Dispatch greedy decoding to the optimal strategy for the active device.
     ///
-    /// Inputs may have different tokenized lengths (e.g. cross-request batching). Sequences
-    /// shorter than `seq_len` are right-padded with token ID 0 (T5 pad token). Same-length
-    /// inputs incur zero padding overhead (preserves existing intra-request chunk behavior).
+    /// CUDA → `translate_greedy_batched`; Metal / CPU → `translate_greedy_per_seq`.
     fn translate_batch_greedy(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
-        let b = texts.len();
+        match &self.device {
+            Device::Cuda(_) => self.translate_greedy_batched(texts),
+            _ => self.translate_greedy_per_seq(texts),
+        }
+    }
 
-        let mut model = self.model_template.clone();
+    /// Batched greedy decode for CUDA: single `[B, seq_len]` encode + `[B, 1]` decode per step.
+    ///
+    /// All B inputs are right-padded to the same length and encoded in one forward pass, then
+    /// decoded together with [B, 1] tensors at each step. CUDA's higher memory bandwidth
+    /// (5–10× Metal) and larger L2 cache (40–80 MB) absorb the cross-attention KV at batch
+    /// sizes up to 64. Finished sequences feed `eos_token_id` as their next input to prevent
+    /// garbage propagating through the KV cache.
+    fn translate_greedy_batched(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
+        let b = texts.len();
 
         let encodings: Vec<_> = texts
             .iter()
@@ -140,7 +164,8 @@ impl LoadedModel {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let seq_len = encodings.iter()
+        let seq_len = encodings
+            .iter()
             .map(|e| e.get_ids().len())
             .max()
             .unwrap_or(0)
@@ -149,6 +174,7 @@ impl LoadedModel {
             return Ok(vec![String::new(); b]);
         }
 
+        // Build [B, seq_len] tensor; right-pad shorter sequences with token 0 (T5 pad).
         let all_ids: Vec<u32> = encodings
             .iter()
             .flat_map(|e| {
@@ -161,6 +187,7 @@ impl LoadedModel {
         let input_tensor = Tensor::from_vec(all_ids, (b, seq_len), &self.device)
             .map_err(|e| TranslatorError::Model(e.to_string()))?;
 
+        let mut model = self.model_template.clone();
         model.clear_kv_cache();
         let encoder_output = model
             .encode(&input_tensor)
@@ -175,7 +202,6 @@ impl LoadedModel {
             if finished.iter().all(|&f| f) {
                 break;
             }
-
             let dec = Tensor::from_vec(current_tokens.clone(), (b, 1), &self.device)
                 .map_err(|e| TranslatorError::Model(e.to_string()))?;
             // decode() returns [B, vocab_size]
@@ -185,7 +211,7 @@ impl LoadedModel {
             let next: Vec<u32> = logits
                 .argmax(D::Minus1)
                 .map_err(|e| TranslatorError::Model(e.to_string()))?
-                .to_vec1()
+                .to_vec1::<u32>()
                 .map_err(|e| TranslatorError::Model(e.to_string()))?;
 
             for (i, &tok) in next.iter().enumerate() {
@@ -197,9 +223,7 @@ impl LoadedModel {
                     }
                 }
             }
-            // Force finished sequences to feed EOS as their next decoder input rather than
-            // whatever token the model happened to produce. Prevents garbage tokens from
-            // propagating through the decoder KV cache for already-completed sequences.
+            // Feed EOS as next input for finished sequences to prevent garbage KV cache propagation.
             current_tokens = next
                 .into_iter()
                 .enumerate()
@@ -212,6 +236,111 @@ impl LoadedModel {
             .map(|ids| {
                 self.tokenizer
                     .decode(ids, true)
+                    .map_err(|e| TranslatorError::Model(format!("decode: {e}")))
+            })
+            .collect()
+    }
+
+    /// Per-sequence greedy decode: each text gets its own model clone and independent KV cache.
+    ///
+    /// Targets Metal and CPU. No cross-sequence padding — each text is encoded at its natural
+    /// length. Sequences finish independently at their own step counts. Avoids Metal's L2
+    /// thrashing at large batch sizes caused by T5's cross-attention KV scaling with B.
+    fn translate_greedy_per_seq(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
+        let b = texts.len();
+
+        let encodings: Vec<_> = texts
+            .iter()
+            .map(|text| {
+                self.tokenizer
+                    .encode(text.as_str(), true)
+                    .map_err(|e| TranslatorError::Model(format!("tokenize: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        struct Seq {
+            model: qt5::T5ForConditionalGeneration,
+            encoder_output: Option<Tensor>,
+            step_limit: usize,
+            current_token: u32,
+            output_ids: Vec<u32>,
+            finished: bool,
+        }
+
+        let mut seqs: Vec<Seq> = Vec::with_capacity(b);
+        for encoding in &encodings {
+            let ids: Vec<u32> = encoding
+                .get_ids()
+                .iter()
+                .take(MAX_INPUT_TOKENS)
+                .copied()
+                .collect();
+            if ids.is_empty() {
+                seqs.push(Seq {
+                    model: self.model_template.clone(),
+                    encoder_output: None,
+                    step_limit: 0,
+                    current_token: self.decoder_start_token_id,
+                    output_ids: vec![],
+                    finished: true,
+                });
+                continue;
+            }
+            let seq_len = ids.len();
+            let input_tensor = Tensor::from_vec(ids, (1, seq_len), &self.device)
+                .map_err(|e| TranslatorError::Model(e.to_string()))?;
+            let mut seq_model = self.model_template.clone();
+            seq_model.clear_kv_cache();
+            let encoder_output = seq_model
+                .encode(&input_tensor)
+                .map_err(|e| TranslatorError::Model(e.to_string()))?;
+            seqs.push(Seq {
+                model: seq_model,
+                encoder_output: Some(encoder_output),
+                step_limit: MAX_NEW_TOKENS.min(seq_len * 3 + 32),
+                current_token: self.decoder_start_token_id,
+                output_ids: vec![],
+                finished: false,
+            });
+        }
+
+        let global_max = seqs.iter().map(|s| s.step_limit).max().unwrap_or(0);
+        for step in 0..global_max {
+            if seqs.iter().all(|s| s.finished) {
+                break;
+            }
+            for seq in seqs.iter_mut() {
+                if seq.finished || step >= seq.step_limit {
+                    seq.finished = true;
+                    continue;
+                }
+                let enc_out = seq.encoder_output.as_ref().unwrap(); // safe: !finished → Some
+                let dec =
+                    Tensor::from_vec(vec![seq.current_token], (1usize, 1usize), &self.device)
+                        .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                // decode() returns [1, vocab_size]
+                let logits = seq
+                    .model
+                    .decode(&dec, enc_out)
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                let next_token: u32 = logits
+                    .argmax(D::Minus1)
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?
+                    .to_vec1::<u32>()
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?[0];
+                if next_token == self.eos_token_id {
+                    seq.finished = true;
+                } else {
+                    seq.output_ids.push(next_token);
+                    seq.current_token = next_token;
+                }
+            }
+        }
+
+        seqs.iter()
+            .map(|seq| {
+                self.tokenizer
+                    .decode(&seq.output_ids, true)
                     .map_err(|e| TranslatorError::Model(format!("decode: {e}")))
             })
             .collect()
