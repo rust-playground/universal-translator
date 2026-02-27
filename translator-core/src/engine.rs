@@ -8,7 +8,6 @@ use crate::model::LoadedModel;
 use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
 use tokio::sync::mpsc;
 use tokio::task;
-use tracing::info;
 
 /// A unit of translation work sent from a request handler to the background GPU worker.
 struct WorkRequest {
@@ -436,6 +435,9 @@ async fn run_translation_worker(
             groups.entry(req.beam_width).or_default().push(req);
         }
 
+        // Only one `spawn_blocking` runs at a time (awaited before the next loop iteration),
+        // which preserves the Metal single-command-buffer constraint without a semaphore
+        // and avoids cache/memory-bandwidth thrashing on CPU (model weights are ~1.65 GB).
         for (bw, group_reqs) in groups {
             let total: usize = group_reqs.iter().map(|r| r.texts.len()).sum();
             let mut group_texts: Vec<String> = Vec::with_capacity(total);
@@ -452,9 +454,7 @@ async fn run_translation_worker(
             match result {
                 Ok(Ok(outputs)) => {
                     for (i, req) in group_reqs.into_iter().enumerate() {
-                        let _ = req
-                            .reply_tx
-                            .send(Ok(outputs[splits[i]..splits[i + 1]].to_vec()));
+                        let _ = req.reply_tx.send(Ok(outputs[splits[i]..splits[i + 1]].to_vec()));
                     }
                 }
                 Ok(Err(e)) => {
