@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use tokio::sync::mpsc;
-use tokio::task;
-
 use crate::detector::Detector;
 use crate::error::TranslatorError;
 use crate::model::LoadedModel;
 use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
+use tokio::sync::mpsc;
+use tokio::task;
+use tracing::info;
 
 /// A unit of translation work sent from a request handler to the background GPU worker.
 struct WorkRequest {
@@ -29,15 +29,18 @@ struct WorkRequest {
 fn fix_icelandic_chars(s: &str) -> String {
     s.chars()
         .map(|c| match c {
-            'ķ' => 'ó', 'Ķ' => 'Ó',
-            'đ' => 'ð', 'Đ' => 'Ð',
-            'ū' => 'þ', 'Ū' => 'Þ',
+            'ķ' => 'ó',
+            'Ķ' => 'Ó',
+            'đ' => 'ð',
+            'Đ' => 'Ð',
+            'ū' => 'þ',
+            'Ū' => 'Þ',
             _ => c,
         })
         .collect()
 }
 
-    /// Map ISO 639-1 code → MADLAD-400 language token.
+/// Map ISO 639-1 code → MADLAD-400 language token.
 /// Format: `<2{iso639-1}>` prepended to the source text before tokenization.
 /// MADLAD's spiece.model vocabulary uses 2-letter ISO 639-1 codes only.
 fn madlad_lang_token(lang: &str) -> Option<&'static str> {
@@ -137,9 +140,9 @@ fn normalize_lang_code(code: &str) -> &str {
 /// a batch containing one long string does not force greedy decoding on all texts.
 fn auto_beam(max_chars: usize) -> u8 {
     match max_chars {
-        0..=60   => 0,  // ≤~15 tokens  → greedy
-        61..=160 => 2,  // ~15–40 tokens → light beam search
-        _        => 4,  // >40 tokens    → full beam search
+        0..=60 => 0,   // ≤~15 tokens  → greedy
+        61..=160 => 2, // ~15–40 tokens → light beam search
+        _ => 4,        // >40 tokens    → full beam search
     }
 }
 
@@ -169,13 +172,11 @@ fn auto_beam(max_chars: usize) -> u8 {
 /// Only languages verified to produce correct output via smoke testing.
 pub fn supported_target_languages() -> &'static [&'static str] {
     &[
-        "af", "ar", "az", "be", "bg", "bn", "ca", "cs", "cy", "da",
-        "de", "el", "en", "es", "et", "eu", "fa", "fi", "fr", "gu",
-        "he", "hi", "hr", "hu", "hy", "id", "is", "it", "ja",
-        "kk", "ko", "lt", "lv", "mk", "ml", "mn", "mr", "ms", "nl",
-        "no", "pa", "pl", "pt", "ro", "ru", "sk", "sl", "so",
-        "sq", "sr", "sv", "sw", "ta", "te", "th", "tr", "uk",
-        "ur", "vi", "xh", "yo", "zh",
+        "af", "ar", "az", "be", "bg", "bn", "ca", "cs", "cy", "da", "de", "el", "en", "es", "et",
+        "eu", "fa", "fi", "fr", "gu", "he", "hi", "hr", "hu", "hy", "id", "is", "it", "ja", "kk",
+        "ko", "lt", "lv", "mk", "ml", "mn", "mr", "ms", "nl", "no", "pa", "pl", "pt", "ro", "ru",
+        "sk", "sl", "so", "sq", "sr", "sv", "sw", "ta", "te", "th", "tr", "uk", "ur", "vi", "xh",
+        "yo", "zh",
     ]
 }
 
@@ -253,7 +254,9 @@ impl TranslationEngine {
             let normalized = normalize_lang_code(src).to_string();
             vec![normalized; n]
         } else {
-            let detect_handles: Vec<_> = batch.texts.iter()
+            let detect_handles: Vec<_> = batch
+                .texts
+                .iter()
                 .map(|text| {
                     let engine = self.clone();
                     let text = text.clone();
@@ -263,13 +266,16 @@ impl TranslationEngine {
             let mut langs = Vec::with_capacity(n);
             for handle in detect_handles {
                 langs.push(
-                    handle.await.map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??
+                    handle
+                        .await
+                        .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??,
                 );
             }
             langs
         };
 
-        let mut all_translations: Vec<HashMap<String, String>> = (0..n).map(|_| HashMap::new()).collect();
+        let mut all_translations: Vec<HashMap<String, String>> =
+            (0..n).map(|_| HashMap::new()).collect();
         let mut all_errors: Vec<HashMap<String, String>> = (0..n).map(|_| HashMap::new()).collect();
 
         // Phase 2 — build a flat list of work items for all texts × target languages.
@@ -318,9 +324,15 @@ impl TranslationEngine {
             let beam_width = self.configured_beam.unwrap_or_else(|| auto_beam(max_chars));
             let tx = self.get_or_start_worker();
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx.send(WorkRequest { texts: work_texts, beam_width, reply_tx }).await
-                .map_err(|_| TranslatorError::TranslationFailed("worker stopped".into()))?;
-            let translated = reply_rx.await
+            tx.send(WorkRequest {
+                texts: work_texts,
+                beam_width,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| TranslatorError::TranslationFailed("worker stopped".into()))?;
+            let translated = reply_rx
+                .await
                 .map_err(|_| TranslatorError::TranslationFailed("worker dropped reply".into()))??;
 
             for ((text_idx, target_lang), result) in work_indices.iter().zip(translated) {
@@ -340,7 +352,9 @@ impl TranslationEngine {
             .map(|i| {
                 let mut translations = std::mem::take(&mut all_translations[i]);
                 // Always include the detected source language for caller convenience.
-                translations.entry(source_langs[i].clone()).or_insert_with(|| batch.texts[i].clone());
+                translations
+                    .entry(source_langs[i].clone())
+                    .or_insert_with(|| batch.texts[i].clone());
                 TranslationResult {
                     source_text: batch.texts[i].clone(),
                     detected_language: source_langs[i].clone(),
@@ -432,30 +446,31 @@ async fn run_translation_worker(
             }
 
             let model_ref = model.clone();
-            let result = task::spawn_blocking(move || {
-                model_ref.translate_batch(&group_texts, bw)
-            }).await;
+            let result =
+                task::spawn_blocking(move || model_ref.translate_batch(&group_texts, bw)).await;
 
             match result {
                 Ok(Ok(outputs)) => {
                     for (i, req) in group_reqs.into_iter().enumerate() {
-                        let _ = req.reply_tx.send(Ok(outputs[splits[i]..splits[i + 1]].to_vec()));
+                        let _ = req
+                            .reply_tx
+                            .send(Ok(outputs[splits[i]..splits[i + 1]].to_vec()));
                     }
                 }
                 Ok(Err(e)) => {
                     let msg = e.to_string();
                     for req in group_reqs {
-                        let _ = req.reply_tx.send(Err(
-                            TranslatorError::TranslationFailed(msg.clone())
-                        ));
+                        let _ = req
+                            .reply_tx
+                            .send(Err(TranslatorError::TranslationFailed(msg.clone())));
                     }
                 }
                 Err(join_err) => {
                     let msg = join_err.to_string();
                     for req in group_reqs {
-                        let _ = req.reply_tx.send(Err(
-                            TranslatorError::TranslationFailed(msg.clone())
-                        ));
+                        let _ = req
+                            .reply_tx
+                            .send(Err(TranslatorError::TranslationFailed(msg.clone())));
                     }
                 }
             }
