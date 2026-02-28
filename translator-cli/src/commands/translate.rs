@@ -2,12 +2,32 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
-use translator_core::{engine::TranslationEngine, types::TranslationBatch};
+use translator_core::{
+    engine::{DecodeMode, TranslationEngine},
+    types::TranslationBatch,
+};
 
 #[derive(Clone, ValueEnum)]
 pub enum OutputFormat {
     Pretty,
     Json,
+}
+
+#[derive(Clone, ValueEnum)]
+enum DecodeModeArg {
+    /// Greedy decoding — maximum throughput.
+    Greedy,
+    /// Beam search with width 2 (reserved for Phase 2 custom decoder).
+    Beam2,
+}
+
+impl From<DecodeModeArg> for DecodeMode {
+    fn from(m: DecodeModeArg) -> Self {
+        match m {
+            DecodeModeArg::Greedy => DecodeMode::Greedy,
+            DecodeModeArg::Beam2 => DecodeMode::Beam2,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -25,10 +45,9 @@ pub struct TranslateArgs {
     #[arg(short = 's', long = "source")]
     pub source_language: Option<String>,
 
-    /// Beam width for decoding. 0 or 1 = greedy (fastest). 2–4 = beam search (better quality).
-    /// Omit to use auto-selection based on input length.
-    #[arg(long = "beam", env = "BEAM_WIDTH")]
-    pub beam_width: Option<u8>,
+    /// Decode strategy: greedy (fastest) or beam2 (width-2 beam search, reserved for Phase 2).
+    #[arg(long = "decode-mode", env = "DECODE_MODE", default_value = "greedy")]
+    decode_mode: DecodeModeArg,
 
     #[arg(long, value_enum, default_value = "pretty")]
     pub output: OutputFormat,
@@ -36,7 +55,7 @@ pub struct TranslateArgs {
 
 impl TranslateArgs {
     pub async fn run(self, models_dir: &Path) -> Result<()> {
-        let engine = TranslationEngine::new(models_dir, self.beam_width);
+        let engine = TranslationEngine::new(models_dir, self.decode_mode.into());
         let batch = TranslationBatch {
             texts: self.texts,
             target_languages: self.languages,
