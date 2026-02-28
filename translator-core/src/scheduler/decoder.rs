@@ -115,18 +115,23 @@ fn t5_rms_norm(xs: &Tensor, weight: &Tensor, eps: f64) -> candle_core::Result<Te
 
 // ── KV cache ──────────────────────────────────────────────────────────────────
 
-/// Per-batch decode-state KV cache.
+/// Per-slot decode-state KV cache (Phase 2b: pre-allocated).
 ///
-/// * `self_k[i]` / `self_v[i]` — accumulated self-attention K/V for layer `i`;
-///   shape `[B, n_heads, t, d_kv]`, grows by 1 each [`CustomT5Decoder::decode_step`].
+/// * `self_k[i]` / `self_v[i]` — pre-allocated self-attention K/V for layer `i`;
+///   shape `[B, n_heads, capacity, d_kv]`, written in-place at position `step`
+///   each [`CustomT5Decoder::decode_step`] via `scatter_set`.
 /// * `cross_k[i]` / `cross_v[i]` — cross-attention K/V (encoder-derived, constant);
 ///   shape `[B, n_heads, enc_seq, d_kv]`, populated once by
 ///   [`CustomT5Decoder::compute_cross_kv`].
+/// * `step` — decode cursor; number of tokens decoded so far.
+/// * `capacity` — max number of decode steps this cache can hold.
 pub struct DecoderKvCache {
     pub self_k: Vec<Tensor>,
     pub self_v: Vec<Tensor>,
     pub cross_k: Vec<Tensor>,
     pub cross_v: Vec<Tensor>,
+    pub step: usize,
+    pub capacity: usize,
 }
 
 // ── Per-layer weight bundle ───────────────────────────────────────────────────
@@ -312,18 +317,23 @@ impl CustomT5Decoder {
 
     // ── KV cache helpers ──────────────────────────────────────────────────────
 
-    /// Create an empty [`DecoderKvCache`] for `batch_size` sequences.
+    /// Create a pre-allocated [`DecoderKvCache`] for `batch_size` sequences.
     ///
-    /// `self_k[i]` / `self_v[i]` start as `[B, n_heads, 0, d_kv]` and grow by
-    /// 1 each [`decode_step`].  `cross_k` / `cross_v` are left empty until
-    /// [`compute_cross_kv`] is called.
-    pub fn new_kv_cache(&self, batch_size: usize) -> Result<DecoderKvCache, TranslatorError> {
+    /// `self_k[i]` / `self_v[i]` are pre-allocated as `[B, n_heads, capacity, d_kv]`
+    /// (zeros).  Each [`decode_step`] writes at position `step` in-place via
+    /// `scatter_set` and reads back via `narrow`.  `cross_k` / `cross_v` are
+    /// left empty until [`compute_cross_kv`] is called.
+    pub fn new_kv_cache(
+        &self,
+        batch_size: usize,
+        capacity: usize,
+    ) -> Result<DecoderKvCache, TranslatorError> {
         let nl = self.layers.len();
-        let empty = || -> candle_core::Result<Vec<Tensor>> {
+        let alloc = || -> candle_core::Result<Vec<Tensor>> {
             (0..nl)
                 .map(|_| {
                     Tensor::zeros(
-                        (batch_size, self.n_heads, 0usize, self.d_kv),
+                        (batch_size, self.n_heads, capacity, self.d_kv),
                         DType::F32,
                         &self.device,
                     )
@@ -331,10 +341,12 @@ impl CustomT5Decoder {
                 .collect()
         };
         Ok(DecoderKvCache {
-            self_k: empty().map_err(cerr)?,
-            self_v: empty().map_err(cerr)?,
+            self_k: alloc().map_err(cerr)?,
+            self_v: alloc().map_err(cerr)?,
             cross_k: vec![],
             cross_v: vec![],
+            step: 0,
+            capacity,
         })
     }
 
@@ -388,7 +400,8 @@ impl CustomT5Decoder {
     /// Run one greedy decode step for a batch.
     ///
     /// `input_ids` — `[B, 1]`, the current token for each sequence.
-    /// Extends `cache.self_k[i]` / `cache.self_v[i]` in place.
+    /// Writes new K/V into pre-allocated `cache.self_k[i]` / `cache.self_v[i]`
+    /// at position `cache.step` via `scatter_set` (zero-allocation cache update).
     /// Returns logits `[B, vocab_size]`.
     ///
     /// Numerical output is identical to `T5ForConditionalGeneration::decode`
@@ -410,12 +423,17 @@ impl CustomT5Decoder {
             .map_err(cerr)?;
 
         // Query position index = tokens already in cache (before this step).
-        let step = cache.self_k[0].dim(2).map_err(cerr)? as u32;
+        let step = cache.step as u32;
         let new_kv_len = step + 1;
 
         // T5 relative position bias: [1, n_heads, 1, new_kv_len].
         // Matches T5Attention::forward use_cache=true branch: q_start=step, q_end=step+1.
         let pos_bias = self.relative_position_bias(step, new_kv_len)?;
+
+        // Pre-build the scatter index tensor (shape [B, n_heads, 1, d_kv], all = step).
+        // Reused across all layers to avoid per-layer allocation.
+        let kv_new_shape = (b, self.n_heads, 1usize, self.d_kv);
+        let step_idx = Tensor::full(step, kv_new_shape, &self.device).map_err(cerr)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
             // ── Self-attention (pre-norm + residual) ──────────────────────────
@@ -433,6 +451,7 @@ impl CustomT5Decoder {
                 .contiguous()
                 .map_err(cerr)?; // [B, n_heads, 1, d_kv]
 
+            // k_new / v_new must be contiguous for scatter_set on Metal.
             let k_new = layer
                 .sa_k
                 .forward(&normed)
@@ -440,6 +459,8 @@ impl CustomT5Decoder {
                 .reshape((b, 1, self.n_heads, self.d_kv))
                 .map_err(cerr)?
                 .transpose(1, 2)
+                .map_err(cerr)?
+                .contiguous()
                 .map_err(cerr)?; // [B, n_heads, 1, d_kv]
 
             let v_new = layer
@@ -449,19 +470,31 @@ impl CustomT5Decoder {
                 .reshape((b, 1, self.n_heads, self.d_kv))
                 .map_err(cerr)?
                 .transpose(1, 2)
+                .map_err(cerr)?
+                .contiguous()
                 .map_err(cerr)?; // [B, n_heads, 1, d_kv]
 
-            // Grow KV cache: [B, n_heads, t, d_kv] → [B, n_heads, t+1, d_kv]
-            let k = Tensor::cat(&[&cache.self_k[i], &k_new], 2)
+            // Write new K/V into the pre-allocated buffer at position `step`.
+            // scatter_set is in-place (no allocation); step_idx shape matches k_new.
+            cache.self_k[i]
+                .scatter_set(&step_idx, &k_new, 2)
+                .map_err(cerr)?;
+            cache.self_v[i]
+                .scatter_set(&step_idx, &v_new, 2)
+                .map_err(cerr)?;
+
+            // Narrow to valid prefix and make contiguous for matmul.
+            // narrow returns a zero-copy view; contiguous copies the valid slice.
+            let k = cache.self_k[i]
+                .narrow(2, 0, new_kv_len as usize)
                 .map_err(cerr)?
                 .contiguous()
                 .map_err(cerr)?;
-            let v = Tensor::cat(&[&cache.self_v[i], &v_new], 2)
+            let v = cache.self_v[i]
+                .narrow(2, 0, new_kv_len as usize)
                 .map_err(cerr)?
                 .contiguous()
                 .map_err(cerr)?;
-            cache.self_k[i] = k.clone();
-            cache.self_v[i] = v.clone();
 
             // Q @ K^T: [B, n_heads, 1, new_kv_len] + position bias → softmax → @ V
             let scores = q
@@ -553,6 +586,9 @@ impl CustomT5Decoder {
         } else {
             self.lm_head.as_ref().unwrap().forward(&hidden).map_err(cerr)?
         };
+
+        // Advance step cursor for the next call.
+        cache.step += 1;
 
         Ok(logits)
     }

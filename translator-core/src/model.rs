@@ -10,7 +10,7 @@ use crate::error::TranslatorError;
 use crate::scheduler::decoder::CustomT5Decoder;
 
 const MAX_INPUT_TOKENS: usize = 1024;
-const MAX_NEW_TOKENS: usize = 1024;
+pub(crate) const MAX_NEW_TOKENS: usize = 1024;
 
 /// Select the best available inference device in priority order:
 ///   CUDA (if compiled in and device present) → Metal (macOS) → CPU
@@ -109,6 +109,31 @@ impl LoadedModel {
         })
     }
 
+    // ── Public accessors (used by ContinuousScheduler) ───────────────────────
+
+    pub fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
+    pub fn decoder_start_token_id(&self) -> u32 {
+        self.decoder_start_token_id
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn custom_decoder(&self) -> &Arc<crate::scheduler::decoder::CustomT5Decoder> {
+        &self.custom_decoder
+    }
+
+    /// Decode a sequence of token ids to a UTF-8 string.
+    pub fn decode_output_ids(&self, ids: &[u32]) -> Result<String, TranslatorError> {
+        self.tokenizer
+            .decode(ids, true)
+            .map_err(|e| TranslatorError::Model(format!("decode: {e}")))
+    }
+
     /// Translate a batch of strings using greedy decoding. Synchronous — always call from `spawn_blocking`.
     pub fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
         if texts.is_empty() {
@@ -117,13 +142,10 @@ impl LoadedModel {
         self.translate_with_custom_decoder(texts)
     }
 
-    /// Batched greedy decode for CUDA: single `[B, seq_len]` encode + `[B, 1]` decode per step.
+    /// Batched greedy decode (legacy reference path, kept for benchmarking).
     ///
-    /// All B inputs are right-padded to the same length and encoded in one forward pass, then
-    /// decoded together with [B, 1] tensors at each step. CUDA's higher memory bandwidth
-    /// (5–10× Metal) and larger L2 cache (40–80 MB) absorb the cross-attention KV at batch
-    /// sizes up to 64. Finished sequences feed `eos_token_id` as their next input to prevent
-    /// garbage propagating through the KV cache.
+    /// Phase 2c replaced this with `translate_with_custom_decoder` (per-slot).
+    #[allow(dead_code)]
     fn translate_greedy_batched(&self, texts: &[String]) -> Result<Vec<String>, TranslatorError> {
         let b = texts.len();
 
@@ -264,10 +286,11 @@ impl LoadedModel {
         Ok((encoder_output, seq_len))
     }
 
-    /// Translate a batch using the custom decoder (Phase 2a validation).
+    /// Translate a batch using the custom decoder (Phase 2c: per-slot caches + early retirement).
     ///
-    /// Produces byte-identical output to `translate_greedy_batched` while
-    /// exercising the externalized KV-cache path used by the continuous scheduler.
+    /// Each input text gets its own `DecoderKvCache` (B=1).  Slots that emit
+    /// EOS are retired immediately — no wasted decoder compute on finished
+    /// sequences.  The live-index set shrinks as sequences complete.
     pub fn translate_with_custom_decoder(
         &self,
         texts: &[String],
@@ -314,42 +337,78 @@ impl LoadedModel {
             .encode(&input_tensor)
             .map_err(|e| TranslatorError::Model(e.to_string()))?;
 
-        let mut cache = self.custom_decoder.new_kv_cache(b)?;
-        self.custom_decoder
-            .compute_cross_kv(&encoder_output, &mut cache)?;
+        let step_limit = MAX_NEW_TOKENS.min((seq_len as f32 * 1.40 + 10.0) as usize);
 
-        let step_limit = MAX_NEW_TOKENS.min(seq_len * 3 + 32);
-        let mut current_tokens = vec![self.decoder_start_token_id; b];
+        // Phase 2c: per-slot caches (B=1 each) — avoids running the decoder
+        // on finished sequences by tracking a shrinking live-index set.
+        let mut caches: Vec<_> = (0..b)
+            .map(|i| -> Result<_, TranslatorError> {
+                let enc_i = encoder_output
+                    .narrow(0, i, 1)
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                let mut cache = self.custom_decoder.new_kv_cache(1, step_limit)?;
+                self.custom_decoder.compute_cross_kv(&enc_i, &mut cache)?;
+                Ok(cache)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut current_tokens: Vec<u32> = vec![self.decoder_start_token_id; b];
         let mut output_ids: Vec<Vec<u32>> = vec![vec![]; b];
-        let mut finished = vec![false; b];
+        // Track which slots are still running.
+        let mut live: Vec<usize> = (0..b).collect();
 
         for _ in 0..step_limit {
-            if finished.iter().all(|&f| f) {
+            if live.is_empty() {
                 break;
             }
-            let dec = Tensor::from_vec(current_tokens.clone(), (b, 1), &self.device)
-                .map_err(|e| TranslatorError::Model(e.to_string()))?;
-            let logits = self.custom_decoder.decode_step(&dec, &mut cache)?;
-            let next: Vec<u32> = logits
-                .argmax(D::Minus1)
-                .map_err(|e| TranslatorError::Model(e.to_string()))?
-                .to_vec1::<u32>()
-                .map_err(|e| TranslatorError::Model(e.to_string()))?;
 
-            for (i, &tok) in next.iter().enumerate() {
-                if !finished[i] {
-                    if tok == self.eos_token_id {
-                        finished[i] = true;
-                    } else {
-                        output_ids[i].push(tok);
-                    }
+            let mut newly_done: Vec<usize> = vec![];
+
+            for &idx in &live {
+                let dec =
+                    Tensor::from_vec(vec![current_tokens[idx]], (1usize, 1usize), &self.device)
+                        .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                let logits_t = self.custom_decoder.decode_step(&dec, &mut caches[idx])?;
+                let vocab_size = logits_t
+                    .dim(1)
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                let mut lv: Vec<f32> = logits_t
+                    .flatten_all()
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                crate::scheduler::sampling::apply_decoding_filters(&mut lv, &output_ids[idx]);
+                crate::scheduler::sampling::apply_length_bias(
+                    &mut lv,
+                    self.eos_token_id,
+                    output_ids[idx].len(),
+                    step_limit,
+                );
+                crate::scheduler::sampling::force_eos_on_tail_repeat(
+                    &mut lv,
+                    self.eos_token_id,
+                    &output_ids[idx],
+                );
+                let filtered =
+                    Tensor::from_vec(lv, (1usize, vocab_size), &self.device)
+                        .map_err(|e| TranslatorError::Model(e.to_string()))?;
+                let tok = filtered
+                    .argmax(D::Minus1)
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?
+                    .to_vec1::<u32>()
+                    .map_err(|e| TranslatorError::Model(e.to_string()))?[0];
+
+                if tok == self.eos_token_id {
+                    newly_done.push(idx);
+                } else {
+                    output_ids[idx].push(tok);
+                    current_tokens[idx] = tok;
                 }
             }
-            current_tokens = next
-                .into_iter()
-                .enumerate()
-                .map(|(i, tok)| if finished[i] { self.eos_token_id } else { tok })
-                .collect();
+
+            // Retire finished slots immediately.
+            if !newly_done.is_empty() {
+                live.retain(|idx| !newly_done.contains(idx));
+            }
         }
 
         output_ids

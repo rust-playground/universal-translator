@@ -5,8 +5,8 @@ use std::sync::{Arc, OnceLock};
 use crate::detector::Detector;
 use crate::error::TranslatorError;
 use crate::model::LoadedModel;
+use crate::scheduler::{ContinuousScheduler, InferRequest};
 use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
-use tokio::sync::mpsc;
 use tokio::task;
 
 /// Decode strategy for the translation engine.
@@ -19,11 +19,6 @@ pub enum DecodeMode {
     Beam2,
 }
 
-/// A unit of translation work sent from a request handler to the background GPU worker.
-struct WorkRequest {
-    texts: Vec<String>,
-    reply_tx: tokio::sync::oneshot::Sender<Result<Vec<String>, TranslatorError>>,
-}
 
 /// Fix character-encoding corruption produced by the MADLAD-400 model for Icelandic.
 ///
@@ -192,10 +187,11 @@ pub struct TranslationEngine {
     /// Single MADLAD-400-3B-MT model shared across all language pairs.
     model_cache: Arc<OnceLock<Arc<LoadedModel>>>,
     detector: Arc<Detector>,
-    decode_mode: DecodeMode,
-    /// Sender half of the background GPU worker channel. Initialized lazily on first use.
-    /// The worker coalesces concurrent requests into a single GPU batch.
-    work_tx: Arc<OnceLock<mpsc::Sender<WorkRequest>>>,
+    /// Stored for potential future beam-search path selection; currently unused
+    /// because the ContinuousScheduler always uses the custom greedy decoder.
+    _decode_mode: DecodeMode,
+    /// Sender half of the continuous-batching scheduler channel. Initialized lazily.
+    work_tx: Arc<OnceLock<std::sync::mpsc::Sender<InferRequest>>>,
 }
 
 impl TranslationEngine {
@@ -204,7 +200,7 @@ impl TranslationEngine {
             models_dir: models_dir.as_ref().to_path_buf(),
             model_cache: Arc::new(OnceLock::new()),
             detector: Arc::new(Detector::new()),
-            decode_mode,
+            _decode_mode: decode_mode,
             work_tx: Arc::new(OnceLock::new()),
         }
     }
@@ -300,24 +296,29 @@ impl TranslationEngine {
             }
         }
 
-        // Phase 3 — send all work as a single WorkRequest to the background GPU worker.
-        // One WorkRequest = one spawn_blocking = one Metal command buffer — eliminates
-        // the per-chunk scheduling race that was adding ~45ms overhead on Apple Silicon.
-        // Concurrent requests that arrive while the worker is busy are still coalesced
-        // via the worker's try_recv loop.
+        // Phase 3 — dispatch each work item individually to the continuous scheduler.
+        // The scheduler maintains a slot pool and processes items concurrently; callers
+        // wait only for their own items, not for an entire batch to complete.
         if !work_texts.is_empty() {
             let tx = self.get_or_start_worker();
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx.send(WorkRequest {
-                texts: work_texts,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| TranslatorError::TranslationFailed("worker stopped".into()))?;
-            let translated = reply_rx
-                .await
-                .map_err(|_| TranslatorError::TranslationFailed("worker dropped reply".into()))??;
-
+            let mut reply_rxs = Vec::with_capacity(work_texts.len());
+            for text in work_texts {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.send(InferRequest { text, reply_tx })
+                    .map_err(|_| {
+                        TranslatorError::TranslationFailed("scheduler stopped".into())
+                    })?;
+                reply_rxs.push(reply_rx);
+            }
+            let mut translated = Vec::with_capacity(reply_rxs.len());
+            for rx in reply_rxs {
+                translated.push(
+                    rx.await
+                        .map_err(|_| {
+                            TranslatorError::TranslationFailed("scheduler dropped reply".into())
+                        })??,
+                );
+            }
             for ((text_idx, target_lang), result) in work_indices.iter().zip(translated) {
                 all_translations[*text_idx].insert(target_lang.clone(), result);
             }
@@ -349,107 +350,33 @@ impl TranslationEngine {
         Ok(TranslationResultSet { results })
     }
 
-    /// Returns the worker channel sender, starting the background worker on first call.
-    fn get_or_start_worker(&self) -> &mpsc::Sender<WorkRequest> {
+    /// Returns the scheduler channel sender, starting it on first call.
+    ///
+    /// Loads the model (blocking), then hands it to `ContinuousScheduler::run`
+    /// which drives the slot pool for the lifetime of the process.
+    fn get_or_start_worker(&self) -> &std::sync::mpsc::Sender<InferRequest> {
         self.work_tx.get_or_init(|| {
-            let (tx, rx) = mpsc::channel(1024);
+            let (tx, rx) = std::sync::mpsc::channel();
             let model_cache = self.model_cache.clone();
             let model_dir = self.models_dir.join("madlad400-3b-mt");
-            let decode_mode = self.decode_mode;
-            tokio::spawn(run_translation_worker(rx, model_cache, model_dir, decode_mode));
+            tokio::spawn(async move {
+                tracing::info!("Continuous scheduler starting, loading model…");
+                let model =
+                    match task::spawn_blocking(move || LoadedModel::load(&model_dir, 4)).await {
+                        Ok(Ok(m)) => Arc::new(m),
+                        Ok(Err(e)) => {
+                            tracing::error!("Scheduler failed to load model: {e}");
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::error!("Scheduler model-load panicked: {e}");
+                            return;
+                        }
+                    };
+                let _ = model_cache.set(model.clone());
+                ContinuousScheduler::new(model, rx).run().await;
+            });
             tx
         })
-    }
-}
-
-/// Background worker that coalesces translation requests into GPU batches.
-///
-/// Runs as a long-lived tokio green thread. The worker:
-///   1. Yields (`recv().await`) until at least one request arrives — zero CPU spin.
-///   2. Non-blocking drains any additional queued requests (`try_recv`) to form a merged batch.
-///   3. Dispatches the merged batch to the blocking thread pool (`spawn_blocking`) for GPU work.
-///   4. Routes results back to each request's oneshot reply channel.
-///
-/// Only one `spawn_blocking` runs at a time (awaited before the next loop iteration),
-/// which preserves the Metal single-command-buffer constraint without a semaphore.
-async fn run_translation_worker(
-    mut rx: mpsc::Receiver<WorkRequest>,
-    model_cache: Arc<OnceLock<Arc<LoadedModel>>>,
-    model_dir: PathBuf,
-    decode_mode: DecodeMode,
-) {
-    tracing::info!(?decode_mode, "Translation worker starting");
-    // Load model on worker start; share into model_cache for any external callers.
-    let model = match task::spawn_blocking(move || LoadedModel::load(&model_dir, 4)).await {
-        Ok(Ok(m)) => Arc::new(m),
-        Ok(Err(e)) => {
-            tracing::error!("Worker failed to load model: {e}");
-            return;
-        }
-        Err(e) => {
-            tracing::error!("Worker spawn_blocking panicked: {e}");
-            return;
-        }
-    };
-    let _ = model_cache.set(model.clone());
-
-    loop {
-        // Yield until at least one request arrives.
-        let first = match rx.recv().await {
-            Some(r) => r,
-            None => break, // all Senders dropped → clean shutdown
-        };
-
-        // Non-blocking drain: coalesce requests already queued while the last batch ran.
-        // MAX_BATCH_TEXTS caps memory pressure and ensures latency fairness.
-        const MAX_BATCH_TEXTS: usize = 64;
-        let mut requests = vec![first];
-        let mut total_texts = requests[0].texts.len();
-        while total_texts < MAX_BATCH_TEXTS {
-            match rx.try_recv() {
-                Ok(r) => {
-                    total_texts += r.texts.len();
-                    requests.push(r);
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Flatten all requests into a single batch; track split boundaries to route results back.
-        // One spawn_blocking = one Metal command buffer, preserving the single-queue constraint.
-        let total: usize = requests.iter().map(|r| r.texts.len()).sum();
-        let mut batch_texts: Vec<String> = Vec::with_capacity(total);
-        let mut splits = vec![0usize];
-        for req in &requests {
-            batch_texts.extend(req.texts.iter().cloned());
-            splits.push(batch_texts.len());
-        }
-
-        let model_ref = model.clone();
-        let result = task::spawn_blocking(move || model_ref.translate_batch(&batch_texts)).await;
-
-        match result {
-            Ok(Ok(outputs)) => {
-                for (i, req) in requests.into_iter().enumerate() {
-                    let _ = req.reply_tx.send(Ok(outputs[splits[i]..splits[i + 1]].to_vec()));
-                }
-            }
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                for req in requests {
-                    let _ = req
-                        .reply_tx
-                        .send(Err(TranslatorError::TranslationFailed(msg.clone())));
-                }
-            }
-            Err(join_err) => {
-                let msg = join_err.to_string();
-                for req in requests {
-                    let _ = req
-                        .reply_tx
-                        .send(Err(TranslatorError::TranslationFailed(msg.clone())));
-                }
-            }
-        }
     }
 }
