@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use candle_core::{Device, Tensor, D};
+use candle_core::{D, Device, Tensor};
 use candle_transformers::models::quantized_t5 as qt5;
 use candle_transformers::quantized_var_builder::VarBuilder as QVarBuilder;
 use tokenizers::Tokenizer;
@@ -70,8 +70,8 @@ impl LoadedModel {
     pub fn load(model_dir: &Path, _num_threads: usize) -> Result<Self, TranslatorError> {
         let device = select_device()?;
 
-        let config_str = std::fs::read_to_string(model_dir.join("config.json"))
-            .map_err(TranslatorError::Io)?;
+        let config_str =
+            std::fs::read_to_string(model_dir.join("config.json")).map_err(TranslatorError::Io)?;
         let config: qt5::Config = serde_json::from_str(&config_str)
             .map_err(|e| TranslatorError::Model(format!("config parse: {e}")))?;
 
@@ -114,9 +114,8 @@ impl LoadedModel {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        self.translate_greedy_batched(texts)
+        self.translate_with_custom_decoder(texts)
     }
-
 
     /// Batched greedy decode for CUDA: single `[B, seq_len]` encode + `[B, 1]` decode per step.
     ///
@@ -316,7 +315,8 @@ impl LoadedModel {
             .map_err(|e| TranslatorError::Model(e.to_string()))?;
 
         let mut cache = self.custom_decoder.new_kv_cache(b)?;
-        self.custom_decoder.compute_cross_kv(&encoder_output, &mut cache)?;
+        self.custom_decoder
+            .compute_cross_kv(&encoder_output, &mut cache)?;
 
         let step_limit = MAX_NEW_TOKENS.min(seq_len * 3 + 32);
         let mut current_tokens = vec![self.decoder_start_token_id; b];
