@@ -1,658 +1,95 @@
-//! Custom T5 decoder with externalized KV cache.
+//! Per-slot Gemma decoder.
 //!
-//! Replicates `candle_transformers::quantized_t5`'s decoder stack but exposes
-//! the KV state in [`DecoderKvCache`] so a scheduler can manage it per-slot
-//! without cloning the whole model. The encoder remains in
-//! `LoadedModel::model_template` and is not reproduced here.
+//! [`GemmaSlotDecoder`] wraps a per-slot clone of the Gemma model weights.
+//! Because all weight tensors inside `quantized_gemma3::ModelWeights` are
+//! Arc-backed (via QMatMul/QTensor), cloning is cheap — only KV-cache tensors
+//! are unique to each slot and grow incrementally during generation.
 //!
-//! **Phase 2a** — validates numerical equivalence with `translate_greedy_batched`:
-//! `translate_with_custom_decoder` must produce byte-identical output.
+//! Usage:
+//! 1. Call `prefill(token_ids)` to process the full prompt.  The model
+//!    populates its per-layer KV cache and returns logits at the last position.
+//! 2. Call `decode_step(token_id)` for each subsequent token.  `index_pos`
+//!    is tracked internally and incremented after every call.
 
-use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::Activation;
-use candle_transformers::models::with_tracing::QMatMul;
-use candle_transformers::quantized_var_builder::VarBuilder as QVarBuilder;
+use candle_core::{DType, Device, Tensor};
+use candle_transformers::models::quantized_gemma3;
 
 use crate::error::TranslatorError;
 
-// ── Config parsing ─────────────────────────────────────────────────────────────
-// qt5::Config fields are private, so we parse config.json ourselves.
-
-struct ParsedConfig {
-    d_model: usize,
-    d_kv: usize,
-    d_ff: usize,
-    n_heads: usize,
-    num_decoder_layers: usize,
-    vocab_size: usize,
-    num_buckets: u32,
-    max_distance: u32,
-    tie_word_embeddings: bool,
-    layer_norm_eps: f64,
-    ff_gated: bool,
-    ff_act: Activation,
-}
-
-fn parse_config(config_str: &str) -> Result<ParsedConfig, TranslatorError> {
-    let v: serde_json::Value = serde_json::from_str(config_str)
-        .map_err(|e| TranslatorError::Model(format!("config parse: {e}")))?;
-
-    let get_usize = |key: &str| -> Result<usize, TranslatorError> {
-        v[key]
-            .as_u64()
-            .map(|n| n as usize)
-            .ok_or_else(|| TranslatorError::Model(format!("config missing '{key}'")))
-    };
-
-    let d_model = get_usize("d_model")?;
-    let d_kv = get_usize("d_kv")?;
-    let d_ff = get_usize("d_ff")?;
-    let n_heads = get_usize("num_heads")?;
-    let num_layers = get_usize("num_layers")?;
-    let num_decoder_layers = v["num_decoder_layers"]
-        .as_u64()
-        .map(|n| n as usize)
-        .unwrap_or(num_layers);
-    let vocab_size = get_usize("vocab_size")?;
-    let num_buckets = v["relative_attention_num_buckets"]
-        .as_u64()
-        .unwrap_or(32) as u32;
-    let max_distance = v["relative_attention_max_distance"]
-        .as_u64()
-        .unwrap_or(128) as u32;
-    let tie_word_embeddings = v["tie_word_embeddings"].as_bool().unwrap_or(false);
-    let layer_norm_eps = v["layer_norm_epsilon"]
-        .as_f64()
-        .or_else(|| v["layer_norm_eps"].as_f64())
-        .unwrap_or(1e-6);
-
-    let ff_proj = v["feed_forward_proj"].as_str().unwrap_or("relu");
-    let ff_gated = ff_proj.starts_with("gated-");
-    let ff_act = if ff_proj.contains("gelu") {
-        Activation::NewGelu
-    } else {
-        Activation::Relu
-    };
-
-    Ok(ParsedConfig {
-        d_model,
-        d_kv,
-        d_ff,
-        n_heads,
-        num_decoder_layers,
-        vocab_size,
-        num_buckets,
-        max_distance,
-        tie_word_embeddings,
-        layer_norm_eps,
-        ff_gated,
-        ff_act,
-    })
-}
-
-// ── Safety ────────────────────────────────────────────────────────────────────
-// All weight tensors (Tensor, QMatMul) are Arc-backed; CustomT5Decoder is a
-// read-only template after load — mutations occur only in the caller's
-// DecoderKvCache.  Same reasoning as LoadedModel's unsafe impls.
-unsafe impl Send for CustomT5Decoder {}
-unsafe impl Sync for CustomT5Decoder {}
-
 // ── Error helper ──────────────────────────────────────────────────────────────
+
 fn cerr(e: candle_core::Error) -> TranslatorError {
     TranslatorError::Model(e.to_string())
 }
 
-// ── T5 RMS layer-norm ─────────────────────────────────────────────────────────
-/// Matches `T5LayerNorm::forward` exactly: variance is computed in f32 for
-/// numerical stability; division uses the original-dtype tensor; output is cast
-/// back and scaled by the learned weight.
-fn t5_rms_norm(xs: &Tensor, weight: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
-    let dtype = xs.dtype();
-    let variance = xs.to_dtype(DType::F32)?.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-    let xs = xs.broadcast_div(&(variance + eps)?.sqrt()?)?;
-    xs.to_dtype(dtype)?.broadcast_mul(weight)
-}
+// ── GemmaSlotDecoder ──────────────────────────────────────────────────────────
 
-// ── KV cache ──────────────────────────────────────────────────────────────────
-
-/// Per-slot decode-state KV cache (Phase 2b: pre-allocated).
+/// A per-slot inference state wrapping one clone of the Gemma model weights.
 ///
-/// * `self_k[i]` / `self_v[i]` — pre-allocated self-attention K/V for layer `i`;
-///   shape `[B, n_heads, capacity, d_kv]`, written in-place at position `step`
-///   each [`CustomT5Decoder::decode_step`] via `scatter_set`.
-/// * `cross_k[i]` / `cross_v[i]` — cross-attention K/V (encoder-derived, constant);
-///   shape `[B, n_heads, enc_seq, d_kv]`, populated once by
-///   [`CustomT5Decoder::compute_cross_kv`].
-/// * `step` — decode cursor; number of tokens decoded so far.
-/// * `capacity` — max number of decode steps this cache can hold.
-pub struct DecoderKvCache {
-    pub self_k: Vec<Tensor>,
-    pub self_v: Vec<Tensor>,
-    pub cross_k: Vec<Tensor>,
-    pub cross_v: Vec<Tensor>,
-    pub step: usize,
-    pub capacity: usize,
-}
-
-// ── Per-layer weight bundle ───────────────────────────────────────────────────
-
-struct LayerWeights {
-    // Self-attention
-    sa_q: QMatMul,
-    sa_k: QMatMul,
-    sa_v: QMatMul,
-    sa_o: QMatMul,
-    sa_norm: Tensor, // [d_model] dequantized
-
-    // Cross-attention
-    ca_q: QMatMul,
-    ca_k: QMatMul,
-    ca_v: QMatMul,
-    ca_o: QMatMul,
-    ca_norm: Tensor, // [d_model] dequantized
-
-    // Feed-forward
-    ff_wi_0: Option<QMatMul>, // gated T5v1.1: gate branch (wi_0)
-    ff_wi_1: Option<QMatMul>, // gated T5v1.1: linear branch (wi_1)
-    ff_wi:   Option<QMatMul>, // non-gated T5v1.0
-    ff_wo:   QMatMul,
-    ff_norm: Tensor, // [d_model] dequantized
-    ff_gated: bool,
-    ff_act:   Activation,
-}
-
-// ── CustomT5Decoder ───────────────────────────────────────────────────────────
-
-/// Custom T5 decoder with externalized KV cache.
-///
-/// Weight tensors share the underlying `Arc<QTensor>` storage with
-/// `model_template` — loading adds only reference-count increments, no extra
-/// VRAM/RAM.
-pub struct CustomT5Decoder {
-    layers: Vec<LayerWeights>,
-    final_layer_norm: Tensor,  // [d_model] dequantized
-    embed_tokens: Tensor,      // [vocab_size, d_model] dequantized
-    lm_head: Option<QMatMul>,  // None when tie_word_embeddings = true
-    /// [num_buckets, n_heads] — from decoder layer 0; reused across all layers.
-    rel_attn_bias: Tensor,
-    n_heads: usize,
-    d_kv: usize,
-    d_model: usize,
-    inner_dim: usize, // n_heads * d_kv
-    tie_word_embeddings: bool,
-    relative_attention_num_buckets: u32,
-    relative_attention_max_distance: u32,
-    layer_norm_eps: f64,
+/// The `model` field accumulates KV cache in-place as tokens are processed.
+/// Create via [`LoadedGemmaModel::new_slot_decoder`]; drop when the slot retires.
+pub struct GemmaSlotDecoder {
+    model: quantized_gemma3::ModelWeights,
+    /// Number of tokens processed so far (= index_pos for the next forward call).
+    step: usize,
     device: Device,
 }
 
-impl CustomT5Decoder {
-    // ── Construction ──────────────────────────────────────────────────────────
+// SAFETY: ModelWeights is Arc-backed; per-slot KV caches are owned by this
+// decoder and not shared across threads.
+unsafe impl Send for GemmaSlotDecoder {}
 
-    /// Load decoder weights from the same `VarBuilder` used by `LoadedModel`.
+impl GemmaSlotDecoder {
+    pub fn new(model: quantized_gemma3::ModelWeights, device: Device) -> Self {
+        Self { model, step: 0, device }
+    }
+
+    /// Process the full prompt in one forward pass.
     ///
-    /// `VarBuilder` is `Clone`-cheap (Arc-backed), so pass a clone of the vb
-    /// used for `T5ForConditionalGeneration::load`.
+    /// Populates the KV cache for all `token_ids.len()` prompt tokens and
+    /// returns logits `[vocab_size]` at the last prompt position (used to
+    /// sample the first output token).
     ///
-    /// `config_str` — raw contents of `config.json` from the model directory.
-    /// We parse required fields ourselves because `qt5::Config` fields are private.
-    pub fn load(vb: QVarBuilder, config_str: &str) -> Result<Self, TranslatorError> {
-        let cfg = parse_config(config_str)?;
-        let inner_dim = cfg.n_heads * cfg.d_kv;
-        let device = vb.device().clone();
-
-        // Shared input/output embeddings (dequantized to f32).
-        // Mirror T5ForConditionalGeneration::load's shared_vb logic.
-        let shared_vb = if vb.contains_key("shared.weight") {
-            vb.pp("shared")
-        } else {
-            vb.pp("decoder").pp("embed_tokens")
-        };
-        let embed_tokens = shared_vb
-            .get((cfg.vocab_size, cfg.d_model), "weight")
-            .and_then(|t| t.dequantize(&device))
-            .map_err(|e| TranslatorError::Model(format!("embed_tokens: {e}")))?;
-
-        // Helpers
-        let qmm = |vb: QVarBuilder, out: usize, inp: usize| {
-            QMatMul::new(out, inp, vb).map_err(|e| TranslatorError::Model(e.to_string()))
-        };
-        let norm_w = |vb: QVarBuilder, dim: usize| {
-            vb.get(dim, "weight")
-                .and_then(|t| t.dequantize(&device))
-                .map_err(|e: candle_core::Error| TranslatorError::Model(e.to_string()))
-        };
-
-        let dec_vb = vb.pp("decoder");
-        let mut layers = Vec::with_capacity(cfg.num_decoder_layers);
-        let mut rel_attn_bias_opt: Option<Tensor> = None;
-
-        for i in 0..cfg.num_decoder_layers {
-            // T5Block::load uses vb.pp("block.{i}").pp("layer") then "0", "1", "2"
-            let block = dec_vb.pp(format!("block.{i}")).pp("layer");
-
-            // ── Layer 0: self-attention ────────────────────────────────────────
-            let sa0 = block.pp("0");
-            let sa_attn = sa0.pp("SelfAttention");
-            let sa_q = qmm(sa_attn.pp("q"), cfg.d_model, inner_dim)?;
-            let sa_k = qmm(sa_attn.pp("k"), cfg.d_model, inner_dim)?;
-            let sa_v = qmm(sa_attn.pp("v"), cfg.d_model, inner_dim)?;
-            let sa_o = qmm(sa_attn.pp("o"), inner_dim, cfg.d_model)?;
-            let sa_norm = norm_w(sa0.pp("layer_norm"), cfg.d_model)?;
-
-            // Relative position bias lives only in layer 0; reused for all layers.
-            if i == 0 {
-                let bias = sa_attn
-                    .pp("relative_attention_bias")
-                    .get((cfg.num_buckets as usize, cfg.n_heads), "weight")
-                    .and_then(|t| t.dequantize(&device))
-                    .map_err(|e: candle_core::Error| TranslatorError::Model(e.to_string()))?;
-                rel_attn_bias_opt = Some(bias);
-            }
-
-            // ── Layer 1: cross-attention ───────────────────────────────────────
-            let ca1 = block.pp("1");
-            let ca_attn = ca1.pp("EncDecAttention");
-            let ca_q = qmm(ca_attn.pp("q"), cfg.d_model, inner_dim)?;
-            let ca_k = qmm(ca_attn.pp("k"), cfg.d_model, inner_dim)?;
-            let ca_v = qmm(ca_attn.pp("v"), cfg.d_model, inner_dim)?;
-            let ca_o = qmm(ca_attn.pp("o"), inner_dim, cfg.d_model)?;
-            let ca_norm = norm_w(ca1.pp("layer_norm"), cfg.d_model)?;
-
-            // ── Layer 2: feed-forward ──────────────────────────────────────────
-            let ff2 = block.pp("2");
-            let ff_dense = ff2.pp("DenseReluDense");
-            let ff_norm = norm_w(ff2.pp("layer_norm"), cfg.d_model)?;
-            let (ff_wi_0, ff_wi_1, ff_wi) = if cfg.ff_gated {
-                (
-                    Some(qmm(ff_dense.pp("wi_0"), cfg.d_model, cfg.d_ff)?),
-                    Some(qmm(ff_dense.pp("wi_1"), cfg.d_model, cfg.d_ff)?),
-                    None,
-                )
-            } else {
-                (None, None, Some(qmm(ff_dense.pp("wi"), cfg.d_model, cfg.d_ff)?))
-            };
-            let ff_wo = qmm(ff_dense.pp("wo"), cfg.d_ff, cfg.d_model)?;
-
-            layers.push(LayerWeights {
-                sa_q, sa_k, sa_v, sa_o, sa_norm,
-                ca_q, ca_k, ca_v, ca_o, ca_norm,
-                ff_wi_0, ff_wi_1, ff_wi, ff_wo, ff_norm,
-                ff_gated: cfg.ff_gated,
-                ff_act: cfg.ff_act,
-            });
+    /// After this call `self.step == token_ids.len()`.
+    pub fn prefill(&mut self, token_ids: &[u32]) -> Result<Vec<f32>, TranslatorError> {
+        if token_ids.is_empty() {
+            return Err(TranslatorError::Model("prefill: empty token_ids".into()));
         }
+        let seq_len = token_ids.len();
+        let input = Tensor::from_slice(token_ids, (1, seq_len), &self.device).map_err(cerr)?;
 
-        let rel_attn_bias = rel_attn_bias_opt
-            .expect("decoder must have at least one layer");
+        // index_pos = 0: this is the start of the sequence.
+        let logits = self.model.forward(&input, 0).map_err(cerr)?;
 
-        let final_layer_norm = norm_w(dec_vb.pp("final_layer_norm"), cfg.d_model)?;
-
-        let lm_head = if cfg.tie_word_embeddings {
-            None
-        } else {
-            Some(
-                QMatMul::new(cfg.d_model, cfg.vocab_size, vb.pp("lm_head"))
-                    .map_err(|e| TranslatorError::Model(e.to_string()))?,
-            )
-        };
-
-        Ok(Self {
-            layers,
-            final_layer_norm,
-            embed_tokens,
-            lm_head,
-            rel_attn_bias,
-            n_heads: cfg.n_heads,
-            d_kv: cfg.d_kv,
-            d_model: cfg.d_model,
-            inner_dim,
-            tie_word_embeddings: cfg.tie_word_embeddings,
-            relative_attention_num_buckets: cfg.num_buckets,
-            relative_attention_max_distance: cfg.max_distance,
-            layer_norm_eps: cfg.layer_norm_eps,
-            device,
-        })
+        self.step = seq_len;
+        extract_last_logits(logits)
     }
 
-    // ── KV cache helpers ──────────────────────────────────────────────────────
-
-    /// Create a pre-allocated [`DecoderKvCache`] for `batch_size` sequences.
+    /// Process a single token and return logits `[vocab_size]` for the next position.
     ///
-    /// `self_k[i]` / `self_v[i]` are pre-allocated as `[B, n_heads, capacity, d_kv]`
-    /// (zeros).  Each [`decode_step`] writes at position `step` in-place via
-    /// `scatter_set` and reads back via `narrow`.  `cross_k` / `cross_v` are
-    /// left empty until [`compute_cross_kv`] is called.
-    pub fn new_kv_cache(
-        &self,
-        batch_size: usize,
-        capacity: usize,
-    ) -> Result<DecoderKvCache, TranslatorError> {
-        let nl = self.layers.len();
-        let alloc = || -> candle_core::Result<Vec<Tensor>> {
-            (0..nl)
-                .map(|_| {
-                    Tensor::zeros(
-                        (batch_size, self.n_heads, capacity, self.d_kv),
-                        DType::F32,
-                        &self.device,
-                    )
-                })
-                .collect()
-        };
-        Ok(DecoderKvCache {
-            self_k: alloc().map_err(cerr)?,
-            self_v: alloc().map_err(cerr)?,
-            cross_k: vec![],
-            cross_v: vec![],
-            step: 0,
-            capacity,
-        })
-    }
-
-    /// Pre-compute and store cross-attention K/V from encoder hidden states.
-    ///
-    /// `encoder_hidden` — `[B, enc_seq, d_model]`.  Call once per batch after
-    /// encoding; the resulting tensors are reused unchanged across all decode
-    /// steps (the built-in decoder recomputes them per step — precomputing is
-    /// numerically identical and avoids the redundant work).
-    pub fn compute_cross_kv(
-        &self,
-        encoder_hidden: &Tensor,
-        cache: &mut DecoderKvCache,
-    ) -> Result<(), TranslatorError> {
-        let (b, enc_seq, _) = encoder_hidden.dims3().map_err(cerr)?;
-        let mut cross_k = Vec::with_capacity(self.layers.len());
-        let mut cross_v = Vec::with_capacity(self.layers.len());
-
-        for layer in &self.layers {
-            let k = layer
-                .ca_k
-                .forward(encoder_hidden)
-                .map_err(cerr)?
-                .reshape((b, enc_seq, self.n_heads, self.d_kv))
-                .map_err(cerr)?
-                .transpose(1, 2)
-                .map_err(cerr)?
-                .contiguous()
-                .map_err(cerr)?;
-            let v = layer
-                .ca_v
-                .forward(encoder_hidden)
-                .map_err(cerr)?
-                .reshape((b, enc_seq, self.n_heads, self.d_kv))
-                .map_err(cerr)?
-                .transpose(1, 2)
-                .map_err(cerr)?
-                .contiguous()
-                .map_err(cerr)?;
-            cross_k.push(k);
-            cross_v.push(v);
-        }
-
-        cache.cross_k = cross_k;
-        cache.cross_v = cross_v;
-        Ok(())
-    }
-
-    // ── Decode step ───────────────────────────────────────────────────────────
-
-    /// Run one greedy decode step for a batch.
-    ///
-    /// `input_ids` — `[B, 1]`, the current token for each sequence.
-    /// Writes new K/V into pre-allocated `cache.self_k[i]` / `cache.self_v[i]`
-    /// at position `cache.step` via `scatter_set` (zero-allocation cache update).
-    /// Returns logits `[B, vocab_size]`.
-    ///
-    /// Numerical output is identical to `T5ForConditionalGeneration::decode`
-    /// for the same step (verified in Phase 2a).
-    pub fn decode_step(
-        &self,
-        input_ids: &Tensor,      // [B, 1]
-        cache: &mut DecoderKvCache,
-    ) -> Result<Tensor, TranslatorError> {
-        let (b, _q_len) = input_ids.dims2().map_err(cerr)?;
-
-        // Embed current tokens: [B, d_model] → [B, 1, d_model]
-        let flat = input_ids.flatten_all().map_err(cerr)?;
-        let mut hidden = self
-            .embed_tokens
-            .index_select(&flat, 0)
-            .map_err(cerr)?
-            .unsqueeze(1)
+    /// `token_id` is the token that was just sampled (will be placed at
+    /// position `self.step`).  `self.step` is incremented after the call.
+    pub fn decode_step(&mut self, token_id: u32) -> Result<Vec<f32>, TranslatorError> {
+        let input = Tensor::from_slice(&[token_id], (1usize, 1usize), &self.device)
             .map_err(cerr)?;
 
-        // Query position index = tokens already in cache (before this step).
-        let step = cache.step as u32;
-        let new_kv_len = step + 1;
+        let logits = self.model.forward(&input, self.step).map_err(cerr)?;
 
-        // T5 relative position bias: [1, n_heads, 1, new_kv_len].
-        // Matches T5Attention::forward use_cache=true branch: q_start=step, q_end=step+1.
-        let pos_bias = self.relative_position_bias(step, new_kv_len)?;
-
-        // Pre-build the scatter index tensor (shape [B, n_heads, 1, d_kv], all = step).
-        // Reused across all layers to avoid per-layer allocation.
-        let kv_new_shape = (b, self.n_heads, 1usize, self.d_kv);
-        let step_idx = Tensor::full(step, kv_new_shape, &self.device).map_err(cerr)?;
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            // ── Self-attention (pre-norm + residual) ──────────────────────────
-            let normed = t5_rms_norm(&hidden, &layer.sa_norm, self.layer_norm_eps)
-                .map_err(cerr)?;
-
-            let q = layer
-                .sa_q
-                .forward(&normed)
-                .map_err(cerr)?
-                .reshape((b, 1, self.n_heads, self.d_kv))
-                .map_err(cerr)?
-                .transpose(1, 2)
-                .map_err(cerr)?
-                .contiguous()
-                .map_err(cerr)?; // [B, n_heads, 1, d_kv]
-
-            // k_new / v_new must be contiguous for scatter_set on Metal.
-            let k_new = layer
-                .sa_k
-                .forward(&normed)
-                .map_err(cerr)?
-                .reshape((b, 1, self.n_heads, self.d_kv))
-                .map_err(cerr)?
-                .transpose(1, 2)
-                .map_err(cerr)?
-                .contiguous()
-                .map_err(cerr)?; // [B, n_heads, 1, d_kv]
-
-            let v_new = layer
-                .sa_v
-                .forward(&normed)
-                .map_err(cerr)?
-                .reshape((b, 1, self.n_heads, self.d_kv))
-                .map_err(cerr)?
-                .transpose(1, 2)
-                .map_err(cerr)?
-                .contiguous()
-                .map_err(cerr)?; // [B, n_heads, 1, d_kv]
-
-            // Write new K/V into the pre-allocated buffer at position `step`.
-            // scatter_set is in-place (no allocation); step_idx shape matches k_new.
-            cache.self_k[i]
-                .scatter_set(&step_idx, &k_new, 2)
-                .map_err(cerr)?;
-            cache.self_v[i]
-                .scatter_set(&step_idx, &v_new, 2)
-                .map_err(cerr)?;
-
-            // Narrow to valid prefix and make contiguous for matmul.
-            // narrow returns a zero-copy view; contiguous copies the valid slice.
-            let k = cache.self_k[i]
-                .narrow(2, 0, new_kv_len as usize)
-                .map_err(cerr)?
-                .contiguous()
-                .map_err(cerr)?;
-            let v = cache.self_v[i]
-                .narrow(2, 0, new_kv_len as usize)
-                .map_err(cerr)?
-                .contiguous()
-                .map_err(cerr)?;
-
-            // Q @ K^T: [B, n_heads, 1, new_kv_len] + position bias → softmax → @ V
-            let scores = q
-                .matmul(&k.t().map_err(cerr)?)
-                .map_err(cerr)?
-                .broadcast_add(&pos_bias)
-                .map_err(cerr)?;
-            let attn_w = candle_nn::ops::softmax_last_dim(&scores).map_err(cerr)?;
-            let sa_out = attn_w
-                .matmul(&v)
-                .map_err(cerr)? // [B, n_heads, 1, d_kv]
-                .transpose(1, 2)
-                .map_err(cerr)? // [B, 1, n_heads, d_kv]
-                .reshape((b, 1, self.inner_dim))
-                .map_err(cerr)?;
-            let sa_out = layer.sa_o.forward(&sa_out).map_err(cerr)?;
-            hidden = (hidden + sa_out).map_err(cerr)?;
-
-            // ── Cross-attention (precomputed K/V, pre-norm + residual) ─────────
-            let normed = t5_rms_norm(&hidden, &layer.ca_norm, self.layer_norm_eps)
-                .map_err(cerr)?;
-
-            let q = layer
-                .ca_q
-                .forward(&normed)
-                .map_err(cerr)?
-                .reshape((b, 1, self.n_heads, self.d_kv))
-                .map_err(cerr)?
-                .transpose(1, 2)
-                .map_err(cerr)?
-                .contiguous()
-                .map_err(cerr)?;
-
-            let scores = q
-                .matmul(&cache.cross_k[i].t().map_err(cerr)?)
-                .map_err(cerr)?;
-            let attn_w = candle_nn::ops::softmax_last_dim(&scores).map_err(cerr)?;
-            let ca_out = attn_w
-                .matmul(&cache.cross_v[i])
-                .map_err(cerr)?
-                .transpose(1, 2)
-                .map_err(cerr)?
-                .reshape((b, 1, self.inner_dim))
-                .map_err(cerr)?;
-            let ca_out = layer.ca_o.forward(&ca_out).map_err(cerr)?;
-            hidden = (hidden + ca_out).map_err(cerr)?;
-
-            // ── Feed-forward (pre-norm + residual) ───────────────────────────
-            let normed = t5_rms_norm(&hidden, &layer.ff_norm, self.layer_norm_eps)
-                .map_err(cerr)?;
-
-            let ff_out = if layer.ff_gated {
-                // T5v1.1 gated: act(wi_0(x)) * wi_1(x) → wo
-                let gate = layer
-                    .ff_act
-                    .forward(&layer.ff_wi_0.as_ref().unwrap().forward(&normed).map_err(cerr)?)
-                    .map_err(cerr)?;
-                let lin = layer
-                    .ff_wi_1
-                    .as_ref()
-                    .unwrap()
-                    .forward(&normed)
-                    .map_err(cerr)?;
-                layer.ff_wo.forward(&gate.broadcast_mul(&lin).map_err(cerr)?).map_err(cerr)?
-            } else {
-                // T5v1.0: act(wi(x)) → wo
-                let h = layer
-                    .ff_act
-                    .forward(&layer.ff_wi.as_ref().unwrap().forward(&normed).map_err(cerr)?)
-                    .map_err(cerr)?;
-                layer.ff_wo.forward(&h).map_err(cerr)?
-            };
-            hidden = (hidden + ff_out).map_err(cerr)?;
-        }
-
-        // Final layer norm → [B, d_model]
-        let hidden = t5_rms_norm(&hidden, &self.final_layer_norm, self.layer_norm_eps)
-            .map_err(cerr)?
-            .squeeze(1)
-            .map_err(cerr)?;
-
-        // LM head — with tied-embedding rescaling if applicable.
-        // Mirrors T5ForConditionalGeneration::decode's scaling_factor logic.
-        let logits = if self.tie_word_embeddings {
-            (hidden * (self.d_model as f64).sqrt())
-                .map_err(cerr)?
-                .matmul(&self.embed_tokens.t().map_err(cerr)?)
-                .map_err(cerr)?
-        } else {
-            self.lm_head.as_ref().unwrap().forward(&hidden).map_err(cerr)?
-        };
-
-        // Advance step cursor for the next call.
-        cache.step += 1;
-
-        Ok(logits)
+        self.step += 1;
+        extract_last_logits(logits)
     }
+}
 
-    // ── Position bias ─────────────────────────────────────────────────────────
-
-    /// T5 relative position bias for a single query at `q_pos` attending to
-    /// `kv_len` keys at positions `0..kv_len`.
-    ///
-    /// Mirrors `T5Attention::forward` with `use_cache=true`:
-    ///   `q_start = kv_len - 1 = q_pos`, `q_end = kv_len`.
-    /// Returns `[1, n_heads, 1, kv_len]`.
-    fn relative_position_bias(
-        &self,
-        q_pos: u32,
-        kv_len: u32,
-    ) -> Result<Tensor, TranslatorError> {
-        let num_buckets = self.relative_attention_num_buckets / 2; // 16 for 32-bucket config
-        let max_exact = num_buckets / 2;                           // 8
-        let max_dist  = self.relative_attention_max_distance;
-
-        // Compute the bucket index for each key position j ∈ 0..kv_len.
-        // Exactly matches the candle T5Attention bucket formula.
-        let buckets: Vec<u32> = (0..kv_len)
-            .map(|j| {
-                let i = q_pos;
-                if i < j {
-                    // Future key (decoder self-attn shouldn't see this, but keep formula intact)
-                    if j - i < max_exact {
-                        j - i + num_buckets
-                    } else {
-                        let b = f32::log(
-                            (j - i) as f32 / max_exact as f32,
-                            max_dist as f32 / max_exact as f32,
-                        ) * (num_buckets - max_exact) as f32;
-                        u32::min(
-                            max_exact + num_buckets + b as u32,
-                            self.relative_attention_num_buckets - 1,
-                        )
-                    }
-                } else if i - j < max_exact {
-                    i - j // [0, max_exact)
-                } else {
-                    let b = f32::log(
-                        (i - j) as f32 / max_exact as f32,
-                        max_dist as f32 / max_exact as f32,
-                    ) * (num_buckets - max_exact) as f32;
-                    max_exact + b as u32 // [max_exact, num_buckets]
-                }
-            })
-            .collect();
-
-        // index_select on rel_attn_bias [num_buckets, n_heads] with 1-D U32 idx [kv_len]
-        // → [kv_len, n_heads] → unsqueeze(0) → [1, kv_len, n_heads]
-        // → permute(2,0,1) → [n_heads, 1, kv_len] → unsqueeze(0) → [1, n_heads, 1, kv_len]
-        let idx = Tensor::new(buckets.as_slice(), &self.device).map_err(cerr)?;
-        self.rel_attn_bias
-            .index_select(&idx, 0)
-            .map_err(cerr)? // [kv_len, n_heads]
-            .unsqueeze(0)
-            .map_err(cerr)? // [1, kv_len, n_heads]
-            .permute((2, 0, 1))
-            .map_err(cerr)? // [n_heads, 1, kv_len]
-            .unsqueeze(0)
-            .map_err(cerr) // [1, n_heads, 1, kv_len]
-    }
+/// Extract the logit vector for the last (and only relevant) token position.
+///
+/// `model.forward` returns shape `[batch, 1, vocab_size]`.  For B=1 this is
+/// `[1, 1, vocab_size]`.  We flatten to `[vocab_size]` in f32.
+fn extract_last_logits(logits: Tensor) -> Result<Vec<f32>, TranslatorError> {
+    // [1, 1, vocab_size] → [vocab_size] in f32
+    logits
+        .squeeze(0)
+        .and_then(|t| t.squeeze(0))
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.to_vec1::<f32>())
+        .map_err(cerr)
 }

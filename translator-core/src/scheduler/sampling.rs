@@ -1,22 +1,23 @@
-//! Logit post-processing filters applied before argmax / sampling.
+//! Logit post-processing filters and temperature sampling.
 //!
-//! Two standard techniques prevent T5 autoregressive repetition loops:
+//! Applied in this order before committing each token:
 //!
-//! 1. **Repetition penalty** — tokens already in the output have their logit
-//!    divided (if positive) or multiplied (if negative) by `REPETITION_PENALTY`,
-//!    making them less likely to be chosen again.
-//!
-//! 2. **No-repeat n-gram** — if the last `N-1` tokens of the output already
-//!    appear as a prefix of some n-gram in the history, the completing token is
-//!    banned (logit set to −∞).
+//! 1. `apply_decoding_filters` — repetition penalty + no-repeat n-gram
+//! 2. `apply_length_bias`      — ramp EOS logit as output approaches expected length
+//! 3. `force_eos_on_tail_repeat` — catch repetition loops missed by n-gram filter
+//! 4. `sample_token`           — temperature / top-K / top-P sampling
+
+use rand::distributions::{Distribution, Standard};
+use rand::rngs::SmallRng;
+
+// ── Repetition / n-gram filters ───────────────────────────────────────────────
 
 /// Penalty applied to tokens already present in the output.
 /// A value of 1.0 disables the penalty; higher values suppress repetition more
-/// aggressively.  The recommended range for T5-family models is 1.12–1.18.
-pub const REPETITION_PENALTY: f32 = 1.15;
+/// aggressively.
+pub const REPETITION_PENALTY: f32 = 1.10;
 
 /// Minimum n-gram length for the no-repeat-n-gram filter.
-/// Setting this to 3 bans any 3-gram that already appears in the output.
 pub const NO_REPEAT_NGRAM_SIZE: usize = 3;
 
 /// Apply repetition penalty and no-repeat n-gram filtering to a flat logit vec.
@@ -24,7 +25,7 @@ pub const NO_REPEAT_NGRAM_SIZE: usize = 3;
 /// `logits` must have length `vocab_size` (raw f32 values from the model).
 /// `output_ids` contains all token ids produced so far for this sequence.
 ///
-/// Mutates `logits` in place; call before `argmax` / softmax.
+/// Mutates `logits` in place; call before sampling.
 pub fn apply_decoding_filters(logits: &mut [f32], output_ids: &[u32]) {
     // 1. Repetition penalty: penalise tokens already generated.
     for &tok in output_ids {
@@ -53,21 +54,20 @@ pub fn apply_decoding_filters(logits: &mut [f32], output_ids: &[u32]) {
     }
 }
 
-/// Fraction of the slot capacity at which the EOS logit bias begins ramping up.
-pub const LENGTH_PENALTY_START: f32 = 0.60;
+// ── Length bias ───────────────────────────────────────────────────────────────
+
+/// Fraction of the expected output length at which the EOS logit bias begins.
+pub const LENGTH_PENALTY_START: f32 = 0.65;
 
 /// Maximum additional logit added to the EOS token at the expected translation
-/// endpoint (linear ramp).  At LENGTH_PENALTY_START the bias is 0; at
-/// `expected_len` (and beyond) it saturates at EOS_LOGIT_BIAS.
+/// endpoint (linear ramp).
 pub const EOS_LOGIT_BIAS: f32 = 6.0;
 
 /// Linearly bias the EOS token logit upward as `step` approaches `expected_len`.
 ///
-/// No-op until `step / expected_len >= LENGTH_PENALTY_START`.  After that, adds
-/// a linearly increasing bonus that saturates at `EOS_LOGIT_BIAS` when
-/// `step >= expected_len`.  `expected_len` is the predicted natural translation
-/// endpoint (e.g. 1.35×seq_len + 10), decoupled from the KV-cache capacity
-/// ceiling so the bias peaks at the right time rather than at the hard limit.
+/// No-op until `step / expected_len >= LENGTH_PENALTY_START`.  After that,
+/// adds a linearly increasing bonus that saturates at `EOS_LOGIT_BIAS` when
+/// `step >= expected_len`.
 pub fn apply_length_bias(
     logits: &mut [f32],
     eos_token_id: u32,
@@ -86,6 +86,8 @@ pub fn apply_length_bias(
     }
 }
 
+// ── Tail-repeat EOS force ─────────────────────────────────────────────────────
+
 /// Number of recently generated tokens to scan for repeated n-grams.
 pub const TAIL_REPEAT_CHECK_LEN: usize = 16;
 
@@ -94,17 +96,11 @@ pub const TAIL_REPEAT_NGRAM: usize = 4;
 
 /// Force EOS if any n-gram in the recent tail appeared in earlier output.
 ///
-/// Scans the last `TAIL_REPEAT_CHECK_LEN` tokens for any n-gram of size
-/// `TAIL_REPEAT_NGRAM` that also exists in the preceding history.  When
-/// found, all non-EOS logits are set to −∞, forcing the next token to EOS.
-///
-/// This catches repeated content that slips past the no-repeat-n-gram filter
-/// due to BPE tokenization differences (e.g., "▁Hall" vs "▁Hal").
+/// Catches repeated content that slips past the no-repeat-n-gram filter.
 pub fn force_eos_on_tail_repeat(logits: &mut [f32], eos_token_id: u32, output_ids: &[u32]) {
     let n = TAIL_REPEAT_NGRAM;
     let tail_len = TAIL_REPEAT_CHECK_LEN;
 
-    // Need at least tail_len + n tokens before the check can be meaningful.
     if output_ids.len() < tail_len + n {
         return;
     }
@@ -124,6 +120,116 @@ pub fn force_eos_on_tail_repeat(logits: &mut [f32], eos_token_id: u32, output_id
         }
     }
 }
+
+// ── Temperature / top-K / top-P sampling ─────────────────────────────────────
+
+/// Sampling temperature — lower = more peaked distribution.
+pub const TEMPERATURE: f32 = 0.15;
+
+/// Top-K: only consider the K highest-logit tokens.
+pub const TOP_K: usize = 40;
+
+/// Top-P (nucleus): keep the smallest set of tokens whose cumulative
+/// probability reaches this threshold.
+pub const TOP_P: f32 = 0.90;
+
+/// Sample the next token from `logits` using temperature / top-K / top-P.
+///
+/// Mutates `logits` in place (applies temperature scaling, sets filtered
+/// positions to `−∞`).  Uses `rng` for the weighted random draw.
+///
+/// Call AFTER `apply_decoding_filters` and `apply_length_bias`.
+pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
+    let vocab = logits.len();
+
+    // 1. Temperature scaling.
+    for v in logits.iter_mut() {
+        *v /= TEMPERATURE;
+    }
+
+    // 2. Top-K: zero out all but the TOP_K highest logits.
+    if TOP_K < vocab {
+        // Find the K-th largest value.
+        let mut sorted: Vec<f32> = logits.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let threshold = sorted[TOP_K - 1];
+        for v in logits.iter_mut() {
+            if *v < threshold {
+                *v = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    // 3. Softmax over the surviving logits.
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = logits
+        .iter()
+        .map(|&x| if x.is_finite() { (x - max).exp() } else { 0.0 })
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    if sum > 0.0 {
+        for p in &mut probs {
+            *p /= sum;
+        }
+    }
+
+    // 4. Top-P (nucleus): discard tokens outside the nucleus.
+    {
+        let mut indexed: Vec<(usize, f32)> =
+            probs.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut cumsum = 0.0f32;
+        let mut cutoff = indexed.len();
+        for (rank, &(_, p)) in indexed.iter().enumerate() {
+            cumsum += p;
+            if cumsum >= TOP_P {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+
+        let keep: std::collections::HashSet<usize> =
+            indexed[..cutoff].iter().map(|(i, _)| *i).collect();
+        for (i, p) in probs.iter_mut().enumerate() {
+            if !keep.contains(&i) {
+                *p = 0.0;
+            }
+        }
+    }
+
+    // 5. Renormalise.
+    let sum: f32 = probs.iter().sum();
+    if sum > 0.0 {
+        for p in &mut probs {
+            *p /= sum;
+        }
+    }
+
+    // 6. Weighted random draw.
+    let threshold: f32 = Standard.sample(rng);
+    let mut cumsum = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        cumsum += p;
+        if cumsum >= threshold {
+            return i as u32;
+        }
+    }
+
+    // Fallback: return the argmax (should rarely trigger).
+    probs
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -171,25 +277,25 @@ mod tests {
 
     #[test]
     fn length_bias_below_threshold() {
-        // progress = 0.5 < LENGTH_PENALTY_START (0.70) — logits must be unchanged.
+        // progress = 0.5 < LENGTH_PENALTY_START — logits must be unchanged.
         let mut logits = vec![0.0f32; 5];
         let eos = 1u32;
-        apply_length_bias(&mut logits, eos, 5, 10); // step/capacity = 0.5
+        apply_length_bias(&mut logits, eos, 5, 10); // step/expected = 0.5
         assert!((logits[eos as usize]).abs() < 1e-6);
     }
 
     #[test]
-    fn length_bias_at_threshold() {
-        // progress == LENGTH_PENALTY_START exactly → fraction = 0 → bias = 0.
+    fn length_bias_below_start() {
+        // progress = 0.60 < LENGTH_PENALTY_START (0.65) → bias = 0.
         let mut logits = vec![0.0f32; 5];
         let eos = 2u32;
-        apply_length_bias(&mut logits, eos, 6, 10); // 6/10 = 0.60 exactly
+        apply_length_bias(&mut logits, eos, 6, 10); // 6/10 = 0.60
         assert!((logits[eos as usize]).abs() < 1e-6);
     }
 
     #[test]
     fn length_bias_at_capacity() {
-        // step == capacity → fraction = 1.0 → bias == EOS_LOGIT_BIAS.
+        // step == expected_len → fraction = 1.0 → bias == EOS_LOGIT_BIAS.
         let mut logits = vec![0.0f32; 5];
         let eos = 0u32;
         apply_length_bias(&mut logits, eos, 10, 10);
@@ -201,13 +307,11 @@ mod tests {
         // eos_token_id >= vocab_size — must not panic.
         let mut logits = vec![0.0f32; 5];
         apply_length_bias(&mut logits, 99, 10, 10);
-        // All logits unchanged.
         assert!(logits.iter().all(|&v| v.abs() < 1e-6));
     }
 
     #[test]
     fn tail_repeat_too_short() {
-        // Fewer than TAIL_REPEAT_CHECK_LEN + TAIL_REPEAT_NGRAM tokens — no-op.
         let mut logits = vec![1.0f32; 10];
         let eos = 0u32;
         let output_ids: Vec<u32> = (0..TAIL_REPEAT_CHECK_LEN as u32).collect();
@@ -217,17 +321,12 @@ mod tests {
 
     #[test]
     fn tail_repeat_fires_on_repeat_ngram() {
-        // Build history where the tail repeats a prior n-gram.
-        // history (tail_start): [1, 2, 3, 4] repeated at the end.
         let n = TAIL_REPEAT_NGRAM;
         let tail_len = TAIL_REPEAT_CHECK_LEN;
         let eos = 5u32;
 
-        // Prefix: enough history containing [1,2,3,4], then padding, then tail repeating it.
-        let mut output_ids: Vec<u32> = vec![10; tail_len]; // padding before tail
-        // Place [1,2,3,4] at start of padding (in history before tail).
+        let mut output_ids: Vec<u32> = vec![10; tail_len];
         output_ids[..n].copy_from_slice(&[1, 2, 3, 4]);
-        // Append tail of tail_len tokens that also contains [1,2,3,4].
         let mut tail: Vec<u32> = vec![20; tail_len];
         tail[..n].copy_from_slice(&[1, 2, 3, 4]);
         output_ids.extend_from_slice(&tail);
@@ -236,7 +335,6 @@ mod tests {
         logits[eos as usize] = 0.5;
         force_eos_on_tail_repeat(&mut logits, eos, &output_ids);
 
-        // All non-EOS logits must be -inf.
         for (j, &v) in logits.iter().enumerate() {
             if j == eos as usize {
                 assert!(v.is_finite(), "EOS logit must remain finite");
@@ -248,11 +346,9 @@ mod tests {
 
     #[test]
     fn tail_repeat_no_match() {
-        // Tail has unique n-grams not present in history — logits unchanged.
         let tail_len = TAIL_REPEAT_CHECK_LEN;
         let eos = 0u32;
 
-        // History: sequential tokens 0..tail_len, tail: unique tokens.
         let mut output_ids: Vec<u32> = (0..tail_len as u32).collect();
         let tail: Vec<u32> = (100..100 + tail_len as u32).collect();
         output_ids.extend_from_slice(&tail);
@@ -264,7 +360,6 @@ mod tests {
 
     #[test]
     fn tail_repeat_eos_token_preserved() {
-        // When the detector fires, the EOS logit must remain finite.
         let n = TAIL_REPEAT_NGRAM;
         let tail_len = TAIL_REPEAT_CHECK_LEN;
         let eos = 3u32;
@@ -281,5 +376,26 @@ mod tests {
 
         assert!(logits[eos as usize].is_finite(), "EOS logit must stay finite");
         assert_eq!(logits[eos as usize], 5.0, "EOS logit must be unchanged");
+    }
+
+    #[test]
+    fn sample_token_returns_valid_index() {
+        use rand::SeedableRng;
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mut logits = vec![1.0f32; 100];
+        logits[7] = 10.0; // heavily favour token 7
+        let tok = sample_token(&mut logits, &mut rng);
+        assert!((tok as usize) < 100);
+    }
+
+    #[test]
+    fn sample_token_forced_eos() {
+        use rand::SeedableRng;
+        let mut rng = SmallRng::seed_from_u64(0);
+        // Only EOS is non-neg-inf.
+        let mut logits = vec![f32::NEG_INFINITY; 100];
+        logits[1] = 0.0; // EOS = 1
+        let tok = sample_token(&mut logits, &mut rng);
+        assert_eq!(tok, 1);
     }
 }

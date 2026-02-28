@@ -7,7 +7,7 @@ use axum::{
 use clap::Parser;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use translator_core::engine::{DecodeMode, TranslationEngine};
+use translator_core::engine::TranslationEngine;
 
 mod error;
 mod routes;
@@ -21,23 +21,6 @@ fn default_models_dir() -> PathBuf {
         .join("ut/models")
 }
 
-#[derive(Clone, clap::ValueEnum)]
-enum DecodeModeArg {
-    /// Greedy decoding — maximum throughput.
-    Greedy,
-    /// Beam search with width 2 (reserved for Phase 2 custom decoder).
-    Beam2,
-}
-
-impl From<DecodeModeArg> for DecodeMode {
-    fn from(m: DecodeModeArg) -> Self {
-        match m {
-            DecodeModeArg::Greedy => DecodeMode::Greedy,
-            DecodeModeArg::Beam2 => DecodeMode::Beam2,
-        }
-    }
-}
-
 #[derive(Parser)]
 #[command(name = "translator-api", about = "Universal translation HTTP API")]
 struct Args {
@@ -45,10 +28,6 @@ struct Args {
     /// [default: platform cache dir / ut/models]
     #[arg(long, env = "MODELS_DIR")]
     models_dir: Option<PathBuf>,
-
-    /// Decode strategy: greedy (fastest) or beam2 (width-2 beam search, reserved for Phase 2).
-    #[arg(long = "decode-mode", env = "DECODE_MODE", default_value = "greedy")]
-    decode_mode: DecodeModeArg,
 
     /// TCP port to listen on.
     #[arg(long, default_value_t = 3000)]
@@ -64,12 +43,11 @@ async fn main() {
 
     let args = Args::parse();
     let models_dir = args.models_dir.unwrap_or_else(default_models_dir);
-    let decode_mode: DecodeMode = args.decode_mode.into();
     let addr = format!("0.0.0.0:{}", args.port);
 
-    tracing::info!(?models_dir, ?decode_mode, "Loading translation engine");
+    tracing::info!(?models_dir, "Loading translation engine");
 
-    let engine = TranslationEngine::new(&models_dir, decode_mode);
+    let engine = TranslationEngine::new(&models_dir);
     let state = AppState { engine };
 
     let app = Router::new()

@@ -20,3 +20,4 @@ tokio               = { workspace = true, features = ["rt", "sync"] }
 thiserror           = { workspace = true }
 serde               = { workspace = true }
 tracing             = { workspace = true }
+rand                = { version = "0.8", features = ["small_rng"] }
