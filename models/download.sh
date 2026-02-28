@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# Download MADLAD-400-3B-MT GGUF weights and tokenizer from HuggingFace.
+# Export MADLAD-400-3B-MT to ONNX format via HuggingFace Optimum.
 #
 # Usage:
 #   bash models/download.sh                        # → platform cache dir
 #   MODELS_DIR=/custom/path bash models/download.sh
 #
-# Prerequisites: huggingface-cli  (pip install huggingface_hub[cli])
-#   — or — curl (fallback, no auth / rate-limit handling)
+# Prerequisites:
+#   python3 (Python dependencies are installed automatically via models/requirements.txt)
+#   (huggingface-cli login  — only needed for gated models; madlad400 is public)
 #
-# License: jbochi/madlad400-3b-mt is a community GGUF conversion of
-#   google/madlad400-3b-mt.  Both repositories are Apache-2.0 licensed.
+# Output directory: ${MODELS_DIR}/madlad400-3b-mt-onnx/
+#   encoder_model.onnx              (~4 GB, fp32)
+#   decoder_model.onnx              (~4 GB, fp32)
+#   decoder_with_past_model.onnx    (~4 GB, fp32)
+#   config.json, tokenizer.json, ...
+#
+# Total disk: ~12 GB (fp32).  Add --quantize for int8 CPU-optimized export (~7 GB).
+# RAM required during export: ~8 GB.
+#
+# License: google/madlad400-3b-mt is Apache-2.0 licensed.
 #   Commercial use permitted.
-#
-# Download size: ~1.65 GB (model-q4k.gguf, Q4_K mixed-precision)
-# Disk after download: ~1.65 GB  (no conversion step needed)
 
 set -euo pipefail
+
+# Resolve the script's own directory so paths are repo-relative regardless
+# of where the caller invokes this script from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Resolve platform-appropriate cache dir (mirrors dirs::cache_dir() in Rust)
 case "$(uname -s)" in
@@ -24,56 +34,42 @@ case "$(uname -s)" in
 esac
 DEFAULT_MODELS_DIR="${_cache_base}/ut/models"
 MODELS_DIR="${MODELS_DIR:-${DEFAULT_MODELS_DIR}}"
-MADLAD_DIR="${MODELS_DIR}/madlad400-3b-mt"
+ONNX_DIR="${MODELS_DIR}/madlad400-3b-mt-onnx"
 
-mkdir -p "${MADLAD_DIR}"
-
-HF_REPO="jbochi/madlad400-3b-mt"
-FILES=(
-  "model-q4k.gguf"
-  "tokenizer.json"
-  "tokenizer_config.json"
-  "config.json"
-)
-
-echo "━━━  madlad400-3b-mt  (${HF_REPO})"
-echo "     Output: ${MADLAD_DIR}"
+echo "━━━  madlad400-3b-mt ONNX export"
+echo "     Output: ${ONNX_DIR}"
 echo ""
 
-# Check if already downloaded (key file present)
-if [[ -f "${MADLAD_DIR}/model-q4k.gguf" ]]; then
-  echo "SKIP  madlad400-3b-mt  (model-q4k.gguf already exists)"
+# ── Skip if already exported ──────────────────────────────────────────────
+if [[ -f "${ONNX_DIR}/encoder_model.onnx" ]] && \
+   [[ -f "${ONNX_DIR}/decoder_model.onnx" ]] && \
+   [[ -f "${ONNX_DIR}/decoder_with_past_model.onnx" ]]; then
+  echo "SKIP  madlad400-3b-mt-onnx  (all 3 ONNX files already exist)"
   exit 0
 fi
 
-# Prefer huggingface-cli; fall back to plain curl
-if command -v huggingface-cli &>/dev/null; then
-  echo "Downloading via huggingface-cli …"
-  huggingface-cli download "${HF_REPO}" \
-    "${FILES[@]}" \
-    --local-dir "${MADLAD_DIR}"
-else
-  echo "huggingface-cli not found — falling back to curl"
-  echo "(install with: pip install huggingface_hub[cli])"
-  echo ""
-  HF_BASE="https://huggingface.co/${HF_REPO}/resolve/main"
-  for file in "${FILES[@]}"; do
-    dest="${MADLAD_DIR}/${file}"
-    if [[ -f "${dest}" ]]; then
-      echo "SKIP  ${file}  (already exists)"
-      continue
-    fi
-    echo "GET   ${file}"
-    curl -L --progress-bar --output "${dest}" "${HF_BASE}/${file}"
-  done
+# ── Check Python ──────────────────────────────────────────────────────────
+if ! command -v python3 &>/dev/null; then
+  echo "ERROR: python3 not found." >&2
+  exit 1
 fi
 
+# ── Install Python dependencies ───────────────────────────────────────────
+echo "Checking Python dependencies..."
+if ! python3 -c "from optimum.exporters.onnx import main_export; import transformers, sentencepiece, onnxruntime" &>/dev/null 2>&1; then
+  echo "Installing Python dependencies (this may take a minute)..."
+  python3 -m pip install -r "${SCRIPT_DIR}/requirements.txt"
+fi
+
+# ── Run the export script ─────────────────────────────────────────────────
+python3 "${SCRIPT_DIR}/export_onnx.py" --output "${ONNX_DIR}"
+
 echo ""
-echo "OK    madlad400-3b-mt"
+echo "OK    madlad400-3b-mt ONNX export complete"
 echo ""
 echo "Build (CPU):"
 echo "  cargo build -r"
-echo "Build (Metal — macOS):"
-echo "  cargo build -r --features metal"
+echo "Build (CoreML — macOS):"
+echo "  cargo build -r --features coreml"
 echo "Build (CUDA — Linux NVIDIA):"
 echo "  cargo build -r --features cuda"

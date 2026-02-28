@@ -1,0 +1,5 @@
+optimum[exporters]>=1.19,<2.0
+transformers>=4.40
+sentencepiece
+onnxruntime
+accelerate

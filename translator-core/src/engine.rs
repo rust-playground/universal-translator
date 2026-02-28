@@ -313,11 +313,9 @@ impl TranslationEngine {
             }
         }
 
-        // Phase 3 — send all work as a single WorkRequest to the background GPU worker.
-        // One WorkRequest = one spawn_blocking = one Metal command buffer — eliminates
-        // the per-chunk scheduling race that was adding ~45ms overhead on Apple Silicon.
-        // Concurrent requests that arrive while the worker is busy are still coalesced
-        // via the worker's try_recv loop.
+        // Phase 3 — send all work as a single WorkRequest to the background inference worker.
+        // One WorkRequest = one spawn_blocking; concurrent requests that arrive while the
+        // worker is busy are coalesced via the worker's try_recv loop.
         if !work_texts.is_empty() {
             let max_chars = batch.texts.iter().map(|t| t.len()).max().unwrap_or(0);
             let beam_width = self.configured_beam.unwrap_or_else(|| auto_beam(max_chars));
@@ -370,23 +368,20 @@ impl TranslationEngine {
         self.work_tx.get_or_init(|| {
             let (tx, rx) = mpsc::channel(1024);
             let model_cache = self.model_cache.clone();
-            let model_dir = self.models_dir.join("madlad400-3b-mt");
+            let model_dir = self.models_dir.join("madlad400-3b-mt-onnx");
             tokio::spawn(run_translation_worker(rx, model_cache, model_dir));
             tx
         })
     }
 }
 
-/// Background worker that coalesces translation requests into GPU batches.
+/// Background worker that coalesces translation requests into batches.
 ///
 /// Runs as a long-lived tokio green thread. The worker:
 ///   1. Yields (`recv().await`) until at least one request arrives — zero CPU spin.
 ///   2. Non-blocking drains any additional queued requests (`try_recv`) to form a merged batch.
-///   3. Dispatches the merged batch to the blocking thread pool (`spawn_blocking`) for GPU work.
+///   3. Dispatches the merged batch to the blocking thread pool (`spawn_blocking`) for inference.
 ///   4. Routes results back to each request's oneshot reply channel.
-///
-/// Only one `spawn_blocking` runs at a time (awaited before the next loop iteration),
-/// which preserves the Metal single-command-buffer constraint without a semaphore.
 async fn run_translation_worker(
     mut rx: mpsc::Receiver<WorkRequest>,
     model_cache: Arc<OnceLock<Arc<LoadedModel>>>,
@@ -435,9 +430,8 @@ async fn run_translation_worker(
             groups.entry(req.beam_width).or_default().push(req);
         }
 
-        // Only one `spawn_blocking` runs at a time (awaited before the next loop iteration),
-        // which preserves the Metal single-command-buffer constraint without a semaphore
-        // and avoids cache/memory-bandwidth thrashing on CPU (model weights are ~1.65 GB).
+        // One `spawn_blocking` per beam-width group, awaited before the next group,
+        // to avoid ORT session contention and memory-bandwidth thrashing.
         for (bw, group_reqs) in groups {
             let total: usize = group_reqs.iter().map(|r| r.texts.len()).sum();
             let mut group_texts: Vec<String> = Vec::with_capacity(total);

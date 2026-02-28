@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-metal   = ["translator-core/metal"]
+coreml  = ["translator-core/coreml"]
 cuda    = ["translator-core/cuda"]
 
 [dependencies]

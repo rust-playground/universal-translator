@@ -6,17 +6,16 @@ license.workspace = true
 
 [features]
 default = []
-metal   = ["candle-core/metal", "candle-transformers/metal", "candle-nn/metal"]
-cuda    = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda"]
+coreml  = ["ort/coreml"]
+cuda    = ["ort/cuda", "ort/tensorrt"]
 
 [dependencies]
-candle-core         = { workspace = true }
-candle-transformers = { workspace = true }
-candle-nn           = { workspace = true }
-tokenizers          = { workspace = true }
-serde_json          = { workspace = true }
-lingua              = { workspace = true }
-tokio               = { workspace = true, features = ["rt", "sync"] }
-thiserror           = { workspace = true }
-serde               = { workspace = true }
-tracing             = { workspace = true }
+ort         = { workspace = true }
+ndarray     = { workspace = true }
+tokenizers  = { workspace = true }
+serde_json  = { workspace = true }
+lingua      = { workspace = true }
+tokio       = { workspace = true, features = ["rt", "sync"] }
+thiserror   = { workspace = true }
+serde       = { workspace = true }
+tracing     = { workspace = true }

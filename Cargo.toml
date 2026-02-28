@@ -6,9 +6,9 @@ resolver = "3"
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-description = "Fast, fully local text translation CLI and API using MADLAD-400 via Candle"
+description = "Fast, fully local text translation CLI and API using MADLAD-400 via ONNX Runtime"
 repository  = "https://github.com/rust-playground/universal-translator"
-keywords    = ["translation", "nlp", "madlad", "candle", "lingua"]
+keywords    = ["translation", "nlp", "madlad", "onnxruntime", "lingua"]
 
 [workspace.dependencies]
 translator-core     = { path = "./translator-core" }
@@ -20,9 +20,8 @@ serde               = { version = "1", features = ["derive"] }
 serde_json          = "1"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
-candle-core         = { version = "0.9" }
-candle-transformers = { version = "0.9" }
-candle-nn           = { version = "0.9" }
+ort                 = { version = "=2.0.0-rc.11" }
+ndarray             = "0.17"
 tokenizers          = { version = "0.22", default-features = false, features = ["onig"] }
 lingua              = "1"
 clap                = { version = "4", features = ["derive", "env"] }
