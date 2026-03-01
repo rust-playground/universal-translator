@@ -44,7 +44,7 @@ python3 tests/integration.py --binary ./target/debug/ut --seed
 python3 tests/integration.py --binary ./target/debug/ut --verbose
 ```
 
-Requires: `pip install huggingface_hub[cli]` and models downloaded via `bash models/download.sh`.
+Requires: models downloaded via `bash models/download.sh` (see docs/models.md).
 
 ## Load Tests (API throughput/latency)
 

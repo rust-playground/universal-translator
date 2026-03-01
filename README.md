@@ -1,11 +1,12 @@
 # universal-translator
 
-A universal text translator built in Rust. Uses [Candle](https://github.com/huggingface/candle) for fast, fully local inference of [MADLAD-400-3B-MT](https://huggingface.co/google/madlad400-3b-mt), a single seq2seq model covering 62 languages, and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection.
+A universal text translator built in Rust. Uses [Candle](https://github.com/huggingface/candle) for fast, fully local inference of [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) (Gemma 3 4B instruction-tuned), covering 55 languages, and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection.
 
 No API keys required. No network calls at runtime. Everything runs on your machine.
 
 **License:** MIT OR Apache-2.0 — see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
-**Model attributions:** see [ATTRIBUTIONS.md](ATTRIBUTIONS.md) — covers MADLAD-400-3B-MT and the runtime libraries used for inference.
+**Model attributions:** see [ATTRIBUTIONS.md](ATTRIBUTIONS.md) — covers TranslateGemma 4B and the runtime libraries used for inference.
+**Model license:** TranslateGemma 4B weights are subject to the [Gemma Terms of Use](https://ai.google.dev/gemma/terms) — see [LICENSE-GEMMA](LICENSE-GEMMA) and [NOTICE](NOTICE).
 
 [![CI](https://github.com/rust-playground/universal-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-playground/universal-translator/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
@@ -15,37 +16,33 @@ No API keys required. No network calls at runtime. Everything runs on your machi
 
 ## Supported languages
 
-62 supported languages:
+55 supported languages:
 
 | Code | Language | Code | Language | Code | Language |
 |------|----------|------|----------|------|----------|
-| af | Afrikaans | gu | Gujarati | pt | Portuguese |
-| ar | Arabic | he | Hebrew | ro | Romanian |
-| az | Azerbaijani | hi | Hindi | ru | Russian |
-| be | Belarusian | hr | Croatian | sk | Slovak |
-| bg | Bulgarian | hu | Hungarian | sl | Slovenian |
-| bn | Bengali | hy | Armenian | so | Somali |
-| ca | Catalan | id | Indonesian | sq | Albanian |
-| cs | Czech | is | Icelandic | sr | Serbian |
-| cy | Welsh | it | Italian | sv | Swedish |
-| da | Danish | ja | Japanese | sw | Swahili |
-| de | German | kk | Kazakh | ta | Tamil |
-| el | Greek | ko | Korean | te | Telugu |
-| **en** | **English** | lt | Lithuanian | th | Thai |
-| es | Spanish | lv | Latvian | tr | Turkish |
-| et | Estonian | mk | Macedonian | uk | Ukrainian |
-| eu | Basque | ml | Malayalam | ur | Urdu |
-| fa | Persian | mn | Mongolian | vi | Vietnamese |
-| fi | Finnish | mr | Marathi | xh | Xhosa |
-| fr | French | ms | Malay | yo | Yoruba |
-| | | nl | Dutch | zh | Chinese |
-| | | no | Norwegian | | |
-| | | pa | Punjabi | | |
-| | | pl | Polish | | |
+| af | Afrikaans | hr | Croatian | pt | Portuguese |
+| am | Amharic | hu | Hungarian | ro | Romanian |
+| ar | Arabic | id | Indonesian | ru | Russian |
+| bg | Bulgarian | it | Italian | si | Sinhala |
+| bn | Bengali | ja | Japanese | sk | Slovak |
+| ca | Catalan | kn | Kannada | sl | Slovenian |
+| cs | Czech | ko | Korean | sr | Serbian |
+| da | Danish | lt | Lithuanian | sv | Swedish |
+| de | German | lv | Latvian | sw | Swahili |
+| el | Greek | ml | Malayalam | ta | Tamil |
+| **en** | **English** | mr | Marathi | te | Telugu |
+| es | Spanish | ms | Malay | th | Thai |
+| et | Estonian | mt | Maltese | tr | Turkish |
+| fa | Persian | ne | Nepali | uk | Ukrainian |
+| fi | Finnish | nl | Dutch | ur | Urdu |
+| fr | French | no | Norwegian | vi | Vietnamese |
+| gu | Gujarati | pa | Punjabi | yi | Yiddish |
+| ha | Hausa | pl | Polish | zh | Chinese |
+| hi | Hindi | | | | |
 
 Source language is detected automatically — no configuration required. Use `-s` to
 supply a known source language and skip detection when it is already known.
-All 62 languages are auto-detectable as source. Lingua handles 75+ languages;
+All 55 languages are auto-detectable as source. Lingua handles 75+ languages;
 Malayalam (ml) uses Unicode script analysis (U+0D00–U+0D7F) as a fallback.
 
 ---
@@ -80,10 +77,13 @@ cargo build --release
 
 ```bash
 # Requires: pip install huggingface_hub[cli]
+# For the gated tokenizer repo: hf auth login
 bash models/download.sh
 ```
 
-This downloads MADLAD-400-3B-MT (~1.65 GB, GGUF int4 quantised) into the default model directory.
+This downloads TranslateGemma 4B (~2.6 GB, Q4_K_M quantised, gated — requires HF login and
+[Gemma license acceptance](https://huggingface.co/google/translategemma-4b-it)) into the
+default model directory.
 See [docs/models.md](docs/models.md) for details, directory layout, and alternative hosting options.
 
 ### Run the API server
@@ -113,41 +113,6 @@ cargo run -p translator-cli -- languages
 The `-l` flag accepts ISO 639-1 codes, and can be repeated (`-l fr -l de`) or
 comma-separated (`-l fr,de`). Use `-s` to supply a known source language and skip
 auto-detection.
-
-## Beam width: speed vs quality
-
-By default the engine **auto-selects beam width per request** based on the length of the
-longest input text, calibrated at ~4 chars/token for English:
-
-| Input length | Approx tokens | Beam | Notes |
-|---|---|---|---|
-| 0–60 chars | ≤15 | 0 (greedy) | Single clauses, names, short phrases — greedy is indistinguishable from beam search; no quality loss. |
-| 61–160 chars | 15–40 | 2 | Full sentences where greedy occasionally makes mid-sequence errors. Beam=2 captures ~85% of beam=4's quality gain at roughly half the extra cost. |
-| 161+ chars | >40 | 4 | Long or complex inputs where error accumulation matters most. |
-
-Greedy decoding is ~3–4× faster than beam=4. The auto tiers ensure short inputs always run
-at greedy speed while long inputs get the full quality treatment.
-
-**Override with `--beam N`** to lock all requests to a fixed width — useful when you need
-consistent latency or are benchmarking quality:
-
-```bash
-# CLI: force beam=4 for all inputs regardless of length
-ut translate --beam 4 -t "Hi" -l fr
-
-# API server: start with a fixed beam width
-translator-api --beam 4
-
-# API server: override via environment variable
-BEAM_WIDTH=4 translator-api
-```
-
-When `--beam` / `BEAM_WIDTH` is unset, auto-selection is used (default for both CLI and API).
-
-> **Concurrent API requests**: when multiple requests arrive simultaneously they are coalesced
-> into a single GPU batch. With auto-beam enabled, requests are additionally grouped by their
-> computed tier so a short request coalescing with a long one is never dragged up to beam=4
-> speed.
 
 ## Integration tests
 
@@ -191,15 +156,27 @@ prints warnings for any translation errors detected during generation.
 
 ## Language detection
 
-Lingua is fully local — no API keys, no network calls. Detection data ships as compiled-in Rust crates. All 62 supported languages are detectable as source. Malayalam (ml) is detected via Unicode script analysis (U+0D00–U+0D7F block) as a fallback when lingua returns no result.
+Lingua is fully local — no API keys, no network calls. Detection data ships as compiled-in Rust crates. All 55 supported languages are valid translation targets; most are also detectable as source via Lingua. Malayalam (ml) is detected via Unicode script analysis (U+0D00–U+0D7F block) as a fallback when lingua returns no result.
 
 ## Limits
 
-**Per-text token limit: 512 subword tokens** (HuggingFace fast tokenizer; roughly 300–500 words depending on language and script).
+**Output token limit: 4 096 tokens** (SLOT_CAPACITY). Generation stops at this limit; very
+long outputs will be truncated with no error returned.
 
-- **Input exceeds 512 tokens:** the input is silently truncated before inference. The
-  translation will correspond only to the truncated portion with no error returned.
-- **Output exceeds 1 024 tokens:** generation stops at 1 024 tokens. The translation will be
-  incomplete with no error returned.
+Split very long documents into paragraphs or sentences before translating and reassemble the
+results.
 
-Split long documents into paragraphs or sentences before translating and reassemble the results.
+## Licensing
+
+The source code in this repository is dual-licensed under the
+[Apache License, Version 2.0](LICENSE-APACHE) and the [MIT License](LICENSE-MIT).
+You may choose either license for your use of the source code.
+
+### Model license
+
+The **TranslateGemma** model weights and any model derivatives are **not** covered
+by the Apache or MIT licenses. They are subject to the
+[Gemma Terms of Use](https://ai.google.dev/gemma/terms) and
+[Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy).
+By downloading or using the model, you agree to abide by those terms.
+See [LICENSE-GEMMA](LICENSE-GEMMA) and [NOTICE](NOTICE).

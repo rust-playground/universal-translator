@@ -6,9 +6,9 @@ resolver = "3"
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-description = "Fast, fully local text translation CLI and API using MADLAD-400 via Candle"
+description = "Fast, fully local text translation CLI and API using TranslateGemma 4B via Candle"
 repository  = "https://github.com/rust-playground/universal-translator"
-keywords    = ["translation", "nlp", "madlad", "candle", "lingua"]
+keywords    = ["translation", "nlp", "gemma", "candle", "lingua"]
 
 [workspace.dependencies]
 translator-core     = { path = "./translator-core" }

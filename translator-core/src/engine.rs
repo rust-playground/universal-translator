@@ -16,43 +16,38 @@ use tokio::task;
 fn lang_full_name(code: &str) -> &str {
     match code {
         "af" => "Afrikaans",
+        "am" => "Amharic",
         "ar" => "Arabic",
-        "az" => "Azerbaijani",
-        "be" => "Belarusian",
         "bg" => "Bulgarian",
         "bn" => "Bengali",
         "ca" => "Catalan",
         "cs" => "Czech",
-        "cy" => "Welsh",
         "da" => "Danish",
         "de" => "German",
         "el" => "Greek",
         "en" => "English",
         "es" => "Spanish",
         "et" => "Estonian",
-        "eu" => "Basque",
         "fa" => "Persian",
         "fi" => "Finnish",
         "fr" => "French",
         "gu" => "Gujarati",
-        "he" => "Hebrew",
+        "ha" => "Hausa",
         "hi" => "Hindi",
         "hr" => "Croatian",
         "hu" => "Hungarian",
-        "hy" => "Armenian",
         "id" => "Indonesian",
-        "is" => "Icelandic",
         "it" => "Italian",
         "ja" => "Japanese",
-        "kk" => "Kazakh",
+        "kn" => "Kannada",
         "ko" => "Korean",
         "lt" => "Lithuanian",
         "lv" => "Latvian",
-        "mk" => "Macedonian",
         "ml" => "Malayalam",
-        "mn" => "Mongolian",
         "mr" => "Marathi",
         "ms" => "Malay",
+        "mt" => "Maltese",
+        "ne" => "Nepali",
         "nl" => "Dutch",
         "no" => "Norwegian",
         "pa" => "Punjabi",
@@ -60,10 +55,9 @@ fn lang_full_name(code: &str) -> &str {
         "pt" => "Portuguese",
         "ro" => "Romanian",
         "ru" => "Russian",
+        "si" => "Sinhala",
         "sk" => "Slovak",
         "sl" => "Slovenian",
-        "so" => "Somali",
-        "sq" => "Albanian",
         "sr" => "Serbian",
         "sv" => "Swedish",
         "sw" => "Swahili",
@@ -74,8 +68,7 @@ fn lang_full_name(code: &str) -> &str {
         "uk" => "Ukrainian",
         "ur" => "Urdu",
         "vi" => "Vietnamese",
-        "xh" => "Xhosa",
-        "yo" => "Yoruba",
+        "yi" => "Yiddish",
         "zh" => "Chinese",
         other => other, // unknown code — pass through as-is
     }
@@ -123,15 +116,13 @@ fn normalize_lang_code(code: &str) -> &str {
 }
 
 /// All target language codes supported by this engine.
-/// Same 62 languages as the previous MADLAD implementation; re-validated
-/// against TranslateGemma output quality is deferred to post-deployment.
+/// 55 languages officially supported by TranslateGemma 4B (https://huggingface.co/google/translategemma-4b-it).
 pub fn supported_target_languages() -> &'static [&'static str] {
     &[
-        "af", "ar", "az", "be", "bg", "bn", "ca", "cs", "cy", "da", "de", "el", "en", "es", "et",
-        "eu", "fa", "fi", "fr", "gu", "he", "hi", "hr", "hu", "hy", "id", "is", "it", "ja", "kk",
-        "ko", "lt", "lv", "mk", "ml", "mn", "mr", "ms", "nl", "no", "pa", "pl", "pt", "ro", "ru",
-        "sk", "sl", "so", "sq", "sr", "sv", "sw", "ta", "te", "th", "tr", "uk", "ur", "vi", "xh",
-        "yo", "zh",
+        "af", "am", "ar", "bg", "bn", "ca", "cs", "da", "de", "el", "en", "es", "et", "fa",
+        "fi", "fr", "gu", "ha", "hi", "hr", "hu", "id", "it", "ja", "kn", "ko", "lt", "lv",
+        "ml", "mr", "ms", "mt", "ne", "nl", "no", "pa", "pl", "pt", "ro", "ru", "si", "sk",
+        "sl", "sr", "sv", "sw", "ta", "te", "th", "tr", "uk", "ur", "vi", "yi", "zh",
     ]
 }
 

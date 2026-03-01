@@ -7,24 +7,24 @@ each component are listed below.
 
 ---
 
-## google/madlad400-3b-mt
+## google/translategemma-4b-it
 
-**License:** Apache 2.0
-**Source:** https://huggingface.co/google/madlad400-3b-mt
-**Used for:** All translation inference — the underlying model weights
+**License:** Gemma Terms of Use (not Apache/MIT)
+**Source:** https://huggingface.co/google/translategemma-4b-it
+**Used for:** Tokenizer configuration (tokenizer.json, config.json) — downloaded at
+model setup. The model is an instruction-tuned Gemma 3 4B fine-tuned for translation.
 
-> Kudugunta, S. et al. (2024). MADLAD-400: A Multilingual And Document-Level Large
-> Audited Dataset. *Advances in Neural Information Processing Systems 36*.
+> See [LICENSE-GEMMA](LICENSE-GEMMA) and [NOTICE](NOTICE) for the full terms.
+> You must accept the Gemma Terms of Use before downloading model files.
 
 ---
 
-## jbochi/madlad400-3b-mt (GGUF conversion)
+## mradermacher/translategemma-4b-it-GGUF
 
-**License:** Apache 2.0 (inherits from source)
-**Source:** https://huggingface.co/jbochi/madlad400-3b-mt
-**Used for:** The `model-q4k.gguf` file downloaded at runtime — community int4
-quantisation of the above model in GGUF format, enabling Candle inference without
-Python tooling.
+**License:** Gemma Terms of Use (inherited from source; GGUF conversion by mradermacher)
+**Source:** https://huggingface.co/mradermacher/translategemma-4b-it-GGUF
+**Used for:** The `model-q4k.gguf` file (~2.6 GB) downloaded at model setup —
+community Q4_K_M GGUF quantisation enabling Candle inference without Python tooling.
 
 ---
 

@@ -22,12 +22,12 @@ python3 tests/integration.py --binary ./target/debug/ut
 Run once before using the CLI or API:
 
 ```bash
-bash models/download.sh   # requires: pip install huggingface_hub[cli]
+bash models/download.sh   # requires: pip install huggingface_hub[cli] && hf auth login
 ```
 
-Downloads and converts MADLAD-400-3B-MT. Required files in `${MODELS_DIR}/madlad400-3b-mt/`:
-- `model-q4k.gguf` (~1.65 GB, GGUF int4 quantised weights)
-- `config.json`, `tokenizer.json`
+Downloads TranslateGemma 4B. Required files in `${MODELS_DIR}/translategemma-4b/`:
+- `model-q4k.gguf` (~2.6 GB, GGUF Q4_K_M quantised weights)
+- `config.json`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`
 
 Default `MODELS_DIR`: platform cache directory (via `dirs` crate). Override with `--models-dir` flag or `MODELS_DIR` env var.
 
@@ -43,8 +43,8 @@ cargo run -p translator-cli -- detect -t "Bonjour"
 cargo run -p translator-api
 ```
 
-Key CLI flags: `--beam N` (omit for auto-selection; 0/1 = greedy, 2/4 = beam search), `--models-dir`, `--output json`.
-Key API env vars: `MODELS_DIR`, `BEAM_WIDTH` (omit for auto-selection; 0/1 = greedy), `RUST_LOG`.
+Key CLI flags: `--models-dir`, `--output json`.
+Key API env vars: `MODELS_DIR`, `RUST_LOG`.
 
 ## Architecture
 
@@ -56,7 +56,7 @@ Key API env vars: `MODELS_DIR`, `BEAM_WIDTH` (omit for auto-selection; 0/1 = gre
 
 ### Inference stack
 
-- **Model**: MADLAD-400-3B-MT — single seq2seq model for all 62 languages
+- **Model**: TranslateGemma 4B — Gemma 3 4B instruction-tuned decoder-only model for all 55 languages
 - **Framework**: Candle (candle-core, candle-transformers, candle-nn)
 - **Tokenizer**: HuggingFace fast tokenizer (`tokenizers` crate, `tokenizer.json`)
 - **Language detection**: Lingua (75+ languages) with script-based fallback for Malayalam
@@ -64,18 +64,16 @@ Key API env vars: `MODELS_DIR`, `BEAM_WIDTH` (omit for auto-selection; 0/1 = gre
 ### Core data flow (`engine.rs`)
 
 1. **Detection** — parallel Lingua detection or normalise user-supplied source language
-2. **Work building** — flatten texts × target languages; prepend MADLAD control token `<2xx> ` to each input
+2. **Work building** — flatten texts × target languages; build Gemma instruct-format prompt with system turn and `Translate from X to Y:` user turn
 3. **Worker dispatch** — send to background Tokio task; concurrent requests are coalesced into a single batch
-4. **Inference** — `LoadedModel` runs greedy (beam ≤ 1) or beam search decoding in `model.rs`
-5. **Post-processing** — Icelandic character-corruption fix (ó→ķ, ð→đ, þ→ū mappings)
+4. **Inference** — `LoadedGemmaModel` + `ContinuousScheduler` runs batched decode with temperature/top-k/top-p sampling
 
 ### Key design decisions
 
 - `TranslationEngine` is `Clone`-cheap (Arc-backed internals)
-- `OnceLock<Arc<LoadedModel>>` — single model instance, lock-free read path after init
-- Token limits: 512 tokens input (silently truncated); 1 024 tokens max output
+- `OnceCell<Arc<LoadedGemmaModel>>` — single model instance, async initialisation, lock-free read path after init
+- Token limits: 4 096 tokens max output (SLOT_CAPACITY)
 - Same-language shortcut: returns original text without inference
-- `beam_width` is startup config only — not part of the JSON request body; omit for auto-selection (tiers: greedy ≤15 tokens, beam=2 15–40 tokens, beam=4 >40 tokens)
 
 ## CI
 

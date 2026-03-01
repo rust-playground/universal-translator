@@ -5,8 +5,8 @@
 #   bash models/download.sh                        # → platform cache dir
 #   MODELS_DIR=/custom/path bash models/download.sh
 #
-# Prerequisites: huggingface-cli  (pip install huggingface_hub[cli])
-#   huggingface-cli login  (required for the gated tokenizer repo)
+# Prerequisites: hf CLI  (pip install huggingface_hub[cli])
+#   hf auth login  (required for the gated tokenizer repo)
 #
 # Model: TranslateGemma 4B — instruction-tuned Gemma 3 4B for translation.
 #
@@ -43,8 +43,12 @@ if [[ -f "${GEMMA_DIR}/model-q4k.gguf" ]]; then
   exit 0
 fi
 
-if ! command -v huggingface-cli &>/dev/null; then
-  echo "ERROR: huggingface-cli not found."
+if command -v hf &>/dev/null; then
+  HF_CLI="hf"
+elif command -v huggingface-cli &>/dev/null; then
+  HF_CLI="huggingface-cli"
+else
+  echo "ERROR: hf CLI not found."
   echo "Install with: pip install huggingface_hub[cli]"
   exit 1
 fi
@@ -54,7 +58,7 @@ echo "Phase 1/2 — Downloading GGUF weights (public)…"
 GGUF_REPO="mradermacher/translategemma-4b-it-GGUF"
 GGUF_FILE="translategemma-4b-it.Q4_K_M.gguf"
 
-huggingface-cli download "${GGUF_REPO}" \
+${HF_CLI} download "${GGUF_REPO}" \
   "${GGUF_FILE}" \
   --local-dir "${GEMMA_DIR}"
 
@@ -64,13 +68,13 @@ echo ""
 
 # ── Phase 2: tokenizer + config (gated) ──────────────────────────────────────
 echo "Phase 2/2 — Downloading tokenizer + config (gated repo)…"
-echo "  Requires: huggingface-cli login AND license acceptance at"
+echo "  Requires: hf auth login AND license acceptance at"
 echo "  https://huggingface.co/google/translategemma-4b-it"
 echo ""
 
 GATED_REPO="google/translategemma-4b-it"
 
-if ! huggingface-cli download "${GATED_REPO}" \
+if ! ${HF_CLI} download "${GATED_REPO}" \
   tokenizer.json tokenizer_config.json config.json special_tokens_map.json \
   --local-dir "${GEMMA_DIR}"; then
   echo ""
@@ -78,7 +82,7 @@ if ! huggingface-cli download "${GATED_REPO}" \
   echo ""
   echo "This repo is gated. To fix:"
   echo "  1. Accept the license at https://huggingface.co/google/translategemma-4b-it"
-  echo "  2. Log in: huggingface-cli login"
+  echo "  2. Log in: hf auth login"
   echo "  3. Re-run: bash models/download.sh"
   exit 1
 fi
