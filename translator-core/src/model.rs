@@ -2,12 +2,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle_core::quantized::gguf_file;
-use candle_core::Device;
-use candle_transformers::models::quantized_gemma3;
+use candle_core::{Device, Tensor};
 use tokenizers::Tokenizer;
 
 use crate::error::TranslatorError;
+use crate::model_batched::{ModelWeights, SlotKvCache};
 use crate::scheduler::decoder::GemmaSlotDecoder;
+
+fn cerr(e: candle_core::Error) -> TranslatorError {
+    TranslatorError::Model(e.to_string())
+}
 
 /// Select the best available inference device in priority order:
 ///   CUDA (if compiled in and device present) → Metal (macOS) → CPU
@@ -40,20 +44,19 @@ fn select_device() -> Result<Device, TranslatorError> {
 ///   model-q4k.gguf   — quantized weights (Q4_K, ~2.5 GB)
 ///   tokenizer.json   — HuggingFace fast tokenizer
 ///
-/// The model template is Clone-cheap (Arc-backed weights). Each decode slot
-/// gets its own fresh clone via `new_slot_decoder()`.
+/// Weights are Arc-shared inside the local `ModelWeights` type.  KV cache is
+/// stored externally in per-slot [`SlotKvCache`] structs, so this struct is
+/// entirely read-only after loading and can be shared across threads.
 pub struct LoadedGemmaModel {
-    /// Template model — weights are Arc-shared. Never used for inference directly.
-    /// Each slot clones this to get its own KV-cache state.
-    model_template: quantized_gemma3::ModelWeights,
+    /// Stateless model weights — KV cache is external.
+    pub(crate) model_weights: ModelWeights,
     tokenizer: Arc<Tokenizer>,
     device: Device,
     pub(crate) eos_token_id: u32,
 }
 
-// SAFETY: Gemma weight tensors (QMatMul, RmsNorm, Embedding) are Arc-backed;
-// the model template is treated as read-only — KV cache mutations happen only on
-// per-slot clones. Same reasoning as the previous LoadedModel unsafe impls.
+// SAFETY: ModelWeights weights are Arc-backed; no mutable state lives here after
+// loading. KV mutations happen in per-slot SlotKvCache values owned by the caller.
 unsafe impl Send for LoadedGemmaModel {}
 unsafe impl Sync for LoadedGemmaModel {}
 
@@ -70,30 +73,26 @@ impl LoadedGemmaModel {
             )));
         }
 
-        // Load tokenizer first so we can look up EOS/BOS token IDs.
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| TranslatorError::Model(format!("tokenizer load: {e}")))?;
 
-        // Determine EOS token: prefer <end_of_turn> (Gemma instruct), fall back to <eos>.
         let eos_token_id = tokenizer
             .token_to_id("<end_of_turn>")
             .or_else(|| tokenizer.token_to_id("<eos>"))
             .unwrap_or(1);
         tracing::info!("eos_token_id={eos_token_id}");
 
-        // Load GGUF weights.
         let mut reader = std::fs::File::open(&gguf_path).map_err(TranslatorError::Io)?;
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| TranslatorError::Model(format!("GGUF read: {e}")))?;
 
-        let model_template =
-            quantized_gemma3::ModelWeights::from_gguf(content, &mut reader, &device)
-                .map_err(|e| TranslatorError::Model(format!("model init: {e}")))?;
+        let model_weights = ModelWeights::from_gguf(content, &mut reader, &device)
+            .map_err(|e| TranslatorError::Model(format!("model init: {e}")))?;
 
         tracing::info!("TranslateGemma model loaded from {}", model_dir.display());
 
         Ok(Self {
-            model_template,
+            model_weights,
             tokenizer: Arc::new(tokenizer),
             device,
             eos_token_id,
@@ -110,14 +109,46 @@ impl LoadedGemmaModel {
         &self.device
     }
 
-    /// Create a fresh per-slot decoder. Weights are Arc-shared with the template;
-    /// only per-slot KV cache memory is allocated on first forward pass.
-    pub fn new_slot_decoder(&self) -> GemmaSlotDecoder {
-        GemmaSlotDecoder::new(self.model_template.clone(), self.device.clone())
+    pub fn n_layers(&self) -> usize {
+        self.model_weights.n_layers()
     }
 
-    /// Tokenize a prompt string to token IDs. Does NOT add special tokens —
-    /// the caller is responsible for including <bos> and chat template tokens
+    /// Create a fresh per-slot decoder backed by an empty [`SlotKvCache`].
+    ///
+    /// The weights themselves are not cloned — the decoder only holds a KV cache
+    /// and a reference to the device.
+    pub fn new_slot_decoder(&self) -> GemmaSlotDecoder {
+        GemmaSlotDecoder::new(
+            SlotKvCache::new(self.model_weights.n_layers()),
+            self.device.clone(),
+        )
+    }
+
+    /// Single-slot forward pass.
+    ///
+    /// Wraps [`ModelWeights::forward`] with `TranslatorError` mapping.
+    pub fn forward_single(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        kv: &mut SlotKvCache,
+    ) -> Result<Tensor, TranslatorError> {
+        self.model_weights.forward(x, index_pos, kv).map_err(cerr)
+    }
+
+    /// N-slot batched decode step.
+    ///
+    /// Wraps [`ModelWeights::forward_batched`] with `TranslatorError` mapping.
+    pub fn forward_batched(
+        &self,
+        tokens: &Tensor,
+        kv_caches: &mut [SlotKvCache],
+    ) -> Result<Tensor, TranslatorError> {
+        self.model_weights.forward_batched(tokens, kv_caches).map_err(cerr)
+    }
+
+    /// Tokenize a prompt string to token IDs.  Does NOT add special tokens —
+    /// the caller is responsible for including `<bos>` and chat template tokens
     /// in the prompt string itself.
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>, TranslatorError> {
         let enc = self
