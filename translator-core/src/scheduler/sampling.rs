@@ -135,31 +135,26 @@ pub const TOP_P: f32 = 0.90;
 
 /// Sample the next token from `logits` using temperature / top-K / top-P.
 ///
-/// Mutates `logits` in place (temperature scaling only — positions are not
-/// set to `−∞` on return).  Uses `rng` for the weighted random draw.
+/// Does not mutate `logits`.  Uses `rng` for the weighted random draw.
 ///
-/// Hot-path optimisation: top-K is found with an O(V)-average quickselect
-/// (`select_nth_unstable_by`) rather than a full O(V log V) sort. Softmax,
-/// top-P filtering, and the weighted draw all operate on the ≤K candidate
-/// vec (≤40 elements), keeping per-token allocations under 320 B.
+/// Hot-path optimisation: temperature scaling and candidate collection are
+/// fused into a single O(V) pass.  Top-K is then found with an O(V)-average
+/// quickselect (`select_nth_unstable_by`) rather than a full O(V log V) sort.
+/// Softmax, top-P filtering, and the weighted draw all operate on the ≤K
+/// candidate vec (≤40 elements), keeping per-token allocations under 320 B.
 ///
 /// Call AFTER `apply_decoding_filters` and `apply_length_bias`.
 pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
     let vocab = logits.len();
 
-    // 1. Temperature scaling in-place — no clone needed.
-    for v in logits.iter_mut() {
-        *v /= TEMPERATURE;
-    }
-
-    // 2. Top-K: collect finite logits into (index, value) pairs, then
-    //    use O(n)-average quickselect to partition the top-K to the front.
+    // 1. Top-K: collect finite logits into (index, scaled-value) pairs in one
+    //    pass, applying temperature scaling inline to avoid a separate O(V) loop.
     let k = TOP_K.min(vocab);
     let mut candidates: Vec<(u32, f32)> = logits
         .iter()
         .enumerate()
         .filter(|&(_, &v)| v.is_finite())
-        .map(|(i, &v)| (i as u32, v))
+        .map(|(i, &v)| (i as u32, v / TEMPERATURE))
         .collect();
     if candidates.len() > k {
         candidates.select_nth_unstable_by(k, |a, b| {
@@ -172,7 +167,7 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
         return 0;
     }
 
-    // 3. Softmax over the ≤K candidates only.
+    // 2. Softmax over the ≤K candidates only.
     let max = candidates
         .iter()
         .map(|(_, v)| *v)
@@ -187,7 +182,7 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
         }
     }
 
-    // 4. Top-P (nucleus): sort the small K-element vec by probability, then
+    // 3. Top-P (nucleus): sort the small K-element vec by probability, then
     //    truncate once cumulative mass >= TOP_P.
     candidates.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -203,7 +198,7 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
     }
     candidates.truncate(cutoff);
 
-    // 5. Renormalise & weighted draw.
+    // 4. Renormalise & weighted draw.
     let sum: f32 = candidates.iter().map(|(_, v)| v).sum();
     let draw: f32 = Standard.sample(rng);
     let threshold = draw * sum;

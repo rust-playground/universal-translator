@@ -7,6 +7,7 @@ use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
 use crate::scheduler::{ContinuousScheduler, InferRequest};
 use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
+use futures::future::try_join_all;
 use tokio::task;
 
 // ── Language helpers ─────────────────────────────────────────────────────────
@@ -265,15 +266,14 @@ impl TranslationEngine {
                 })?;
                 reply_rxs.push(reply_rx);
             }
-            let mut translated = Vec::with_capacity(reply_rxs.len());
-            for rx in reply_rxs {
-                translated.push(
-                    rx.await
-                        .map_err(|_| {
-                            TranslatorError::TranslationFailed("scheduler dropped reply".into())
-                        })??,
-                );
-            }
+            let translated: Vec<String> = try_join_all(reply_rxs.into_iter().map(|rx| async move {
+                rx.await
+                    .map_err(|_| {
+                        TranslatorError::TranslationFailed("scheduler dropped reply".into())
+                    })
+                    .and_then(|r| r)
+            }))
+            .await?;
             for ((text_idx, target_lang), result) in work_indices.iter().zip(translated) {
                 all_translations[*text_idx].insert(target_lang.clone(), result);
             }

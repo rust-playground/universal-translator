@@ -28,3 +28,4 @@ lingua              = "1"
 clap                = { version = "4", features = ["derive", "env"] }
 axum                = { version = "0.8", features = ["json", "macros"] }
 tower-http          = { version = "0.6", features = ["trace"] }
+futures             = { version = "0.3", default-features = false, features = ["async-await", "alloc"] }

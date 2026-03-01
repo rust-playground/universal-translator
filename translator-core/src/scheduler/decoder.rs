@@ -33,6 +33,9 @@ pub struct GemmaSlotDecoder {
     /// Number of tokens processed so far (= index_pos for the next forward call).
     step: usize,
     device: Device,
+    /// Single-element scratch buffer reused across `decode_step` calls to avoid
+    /// a per-step heap allocation.
+    token_buf: Vec<u32>,
 }
 
 // SAFETY: ModelWeights is Arc-backed; per-slot KV caches are owned by this
@@ -41,7 +44,7 @@ unsafe impl Send for GemmaSlotDecoder {}
 
 impl GemmaSlotDecoder {
     pub fn new(model: quantized_gemma3::ModelWeights, device: Device) -> Self {
-        Self { model, step: 0, device }
+        Self { model, step: 0, device, token_buf: vec![0u32; 1] }
     }
 
     /// Process the full prompt in one forward pass.
@@ -70,7 +73,8 @@ impl GemmaSlotDecoder {
     /// `token_id` is the token that was just sampled (will be placed at
     /// position `self.step`).  `self.step` is incremented after the call.
     pub fn decode_step(&mut self, token_id: u32) -> Result<Vec<f32>, TranslatorError> {
-        let input = Tensor::from_slice(&[token_id], (1usize, 1usize), &self.device)
+        self.token_buf[0] = token_id;
+        let input = Tensor::from_slice(&self.token_buf, (1usize, 1usize), &self.device)
             .map_err(cerr)?;
 
         let logits = self.model.forward(&input, self.step).map_err(cerr)?;
