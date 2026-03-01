@@ -135,98 +135,88 @@ pub const TOP_P: f32 = 0.90;
 
 /// Sample the next token from `logits` using temperature / top-K / top-P.
 ///
-/// Mutates `logits` in place (applies temperature scaling, sets filtered
-/// positions to `−∞`).  Uses `rng` for the weighted random draw.
+/// Mutates `logits` in place (temperature scaling only — positions are not
+/// set to `−∞` on return).  Uses `rng` for the weighted random draw.
+///
+/// Hot-path optimisation: top-K is found with an O(V)-average quickselect
+/// (`select_nth_unstable_by`) rather than a full O(V log V) sort. Softmax,
+/// top-P filtering, and the weighted draw all operate on the ≤K candidate
+/// vec (≤40 elements), keeping per-token allocations under 320 B.
 ///
 /// Call AFTER `apply_decoding_filters` and `apply_length_bias`.
 pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
     let vocab = logits.len();
 
-    // 1. Temperature scaling.
+    // 1. Temperature scaling in-place — no clone needed.
     for v in logits.iter_mut() {
         *v /= TEMPERATURE;
     }
 
-    // 2. Top-K: zero out all but the TOP_K highest logits.
-    if TOP_K < vocab {
-        // Find the K-th largest value.
-        let mut sorted: Vec<f32> = logits.to_vec();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let threshold = sorted[TOP_K - 1];
-        for v in logits.iter_mut() {
-            if *v < threshold {
-                *v = f32::NEG_INFINITY;
-            }
-        }
-    }
-
-    // 3. Softmax over the surviving logits.
-    let max = logits
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = logits
-        .iter()
-        .map(|&x| if x.is_finite() { (x - max).exp() } else { 0.0 })
-        .collect();
-    let sum: f32 = probs.iter().sum();
-    if sum > 0.0 {
-        for p in &mut probs {
-            *p /= sum;
-        }
-    }
-
-    // 4. Top-P (nucleus): discard tokens outside the nucleus.
-    {
-        let mut indexed: Vec<(usize, f32)> =
-            probs.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut cumsum = 0.0f32;
-        let mut cutoff = indexed.len();
-        for (rank, &(_, p)) in indexed.iter().enumerate() {
-            cumsum += p;
-            if cumsum >= TOP_P {
-                cutoff = rank + 1;
-                break;
-            }
-        }
-
-        let keep: std::collections::HashSet<usize> =
-            indexed[..cutoff].iter().map(|(i, _)| *i).collect();
-        for (i, p) in probs.iter_mut().enumerate() {
-            if !keep.contains(&i) {
-                *p = 0.0;
-            }
-        }
-    }
-
-    // 5. Renormalise.
-    let sum: f32 = probs.iter().sum();
-    if sum > 0.0 {
-        for p in &mut probs {
-            *p /= sum;
-        }
-    }
-
-    // 6. Weighted random draw.
-    let threshold: f32 = Standard.sample(rng);
-    let mut cumsum = 0.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        cumsum += p;
-        if cumsum >= threshold {
-            return i as u32;
-        }
-    }
-
-    // Fallback: return the argmax (should rarely trigger).
-    probs
+    // 2. Top-K: collect finite logits into (index, value) pairs, then
+    //    use O(n)-average quickselect to partition the top-K to the front.
+    let k = TOP_K.min(vocab);
+    let mut candidates: Vec<(u32, f32)> = logits
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+        .filter(|&(_, &v)| v.is_finite())
+        .map(|(i, &v)| (i as u32, v))
+        .collect();
+    if candidates.len() > k {
+        candidates.select_nth_unstable_by(k, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(k);
+    }
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    // 3. Softmax over the ≤K candidates only.
+    let max = candidates
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    for (_, v) in &mut candidates {
+        *v = (*v - max).exp();
+    }
+    let sum: f32 = candidates.iter().map(|(_, v)| v).sum();
+    if sum > 0.0 {
+        for (_, v) in &mut candidates {
+            *v /= sum;
+        }
+    }
+
+    // 4. Top-P (nucleus): sort the small K-element vec by probability, then
+    //    truncate once cumulative mass >= TOP_P.
+    candidates.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut cumsum = 0.0_f32;
+    let mut cutoff = candidates.len();
+    for (i, (_, p)) in candidates.iter().enumerate() {
+        cumsum += p;
+        if cumsum >= TOP_P {
+            cutoff = i + 1;
+            break;
+        }
+    }
+    candidates.truncate(cutoff);
+
+    // 5. Renormalise & weighted draw.
+    let sum: f32 = candidates.iter().map(|(_, v)| v).sum();
+    let draw: f32 = Standard.sample(rng);
+    let threshold = draw * sum;
+    let mut cumsum = 0.0_f32;
+    for &(idx, p) in &candidates {
+        cumsum += p;
+        if cumsum >= threshold {
+            return idx;
+        }
+    }
+
+    // Fallback (should be rare — floating-point rounding at the tail).
+    candidates[0].0
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

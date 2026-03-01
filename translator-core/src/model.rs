@@ -49,7 +49,6 @@ pub struct LoadedGemmaModel {
     tokenizer: Arc<Tokenizer>,
     device: Device,
     pub(crate) eos_token_id: u32,
-    pub(crate) bos_token_id: u32,
 }
 
 // SAFETY: Gemma weight tensors (QMatMul, RmsNorm, Embedding) are Arc-backed;
@@ -60,7 +59,7 @@ unsafe impl Sync for LoadedGemmaModel {}
 
 impl LoadedGemmaModel {
     /// Load the model directory.
-    pub fn load(model_dir: &Path, _num_threads: usize) -> Result<Self, TranslatorError> {
+    pub fn load(model_dir: &Path) -> Result<Self, TranslatorError> {
         let device = select_device()?;
 
         let gguf_path = model_dir.join("model-q4k.gguf");
@@ -80,9 +79,7 @@ impl LoadedGemmaModel {
             .token_to_id("<end_of_turn>")
             .or_else(|| tokenizer.token_to_id("<eos>"))
             .unwrap_or(1);
-        let bos_token_id = tokenizer.token_to_id("<bos>").unwrap_or(2);
-
-        tracing::info!("eos_token_id={eos_token_id}, bos_token_id={bos_token_id}");
+        tracing::info!("eos_token_id={eos_token_id}");
 
         // Load GGUF weights.
         let mut reader = std::fs::File::open(&gguf_path).map_err(TranslatorError::Io)?;
@@ -100,7 +97,6 @@ impl LoadedGemmaModel {
             tokenizer: Arc::new(tokenizer),
             device,
             eos_token_id,
-            bos_token_id,
         })
     }
 
@@ -108,10 +104,6 @@ impl LoadedGemmaModel {
 
     pub fn eos_token_id(&self) -> u32 {
         self.eos_token_id
-    }
-
-    pub fn bos_token_id(&self) -> u32 {
-        self.bos_token_id
     }
 
     pub fn device(&self) -> &Device {

@@ -307,7 +307,7 @@ impl TranslationEngine {
             tokio::spawn(async move {
                 tracing::info!("Continuous scheduler starting, loading model…");
                 let model =
-                    match task::spawn_blocking(move || LoadedGemmaModel::load(&model_dir, 4))
+                    match task::spawn_blocking(move || LoadedGemmaModel::load(&model_dir))
                         .await
                     {
                         Ok(Ok(m)) => Arc::new(m),
