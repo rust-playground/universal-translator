@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::mpsc;
 
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{DType, Tensor};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use tokio::sync::oneshot;
@@ -93,7 +93,6 @@ impl ContinuousScheduler {
 
 fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>) {
     let eos_id = model.eos_token_id();
-    let n_layers = model.n_layers();
     let mut slots: Vec<Option<Slot>> = (0..N_SLOTS).map(|_| None).collect();
     let mut rng = SmallRng::from_entropy();
 
@@ -168,7 +167,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
             .map(|&i| {
                 std::mem::replace(
                     &mut slots[i].as_mut().unwrap().decoder.kv_cache,
-                    SlotKvCache::new(n_layers),
+                    SlotKvCache { layers: Vec::new(), seq_len: 0 },
                 )
             })
             .collect();
@@ -179,7 +178,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
                 // Restore KV caches before retiring slots
                 for (bi, &si) in active_indices.iter().enumerate() {
                     slots[si].as_mut().unwrap().decoder.kv_cache =
-                        std::mem::replace(&mut batch_kv[bi], SlotKvCache::new(n_layers));
+                        std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
                 }
                 let msg = e.to_string();
                 for &si in &active_indices {
@@ -195,25 +194,30 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
         // ── Restore KV caches ─────────────────────────────────────────────
         for (bi, &si) in active_indices.iter().enumerate() {
             slots[si].as_mut().unwrap().decoder.kv_cache =
-                std::mem::replace(&mut batch_kv[bi], SlotKvCache::new(n_layers));
+                std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
         }
 
-        // ── Per-slot: slice logits, apply filters, sample, retire if EOS ──
-        for (batch_idx, &slot_idx) in active_indices.iter().enumerate() {
-            let logits_result = all_logits_t
-                .i(batch_idx)
-                .and_then(|t: Tensor| t.to_dtype(DType::F32))
-                .and_then(|t: Tensor| t.to_vec1::<f32>())
-                .map_err(cerr);
-
-            let mut logits = match logits_result {
-                Ok(l) => l,
-                Err(e) => {
-                    let finished = slots[slot_idx].take().unwrap();
-                    let _ = finished.reply_tx.send(Err(e));
-                    continue;
+        // ── Single GPU→CPU transfer: all slot logits at once ──────────────
+        let all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
+            .to_dtype(DType::F32)
+            .and_then(|t| t.to_vec2::<f32>())
+            .map_err(cerr)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                for &si in &active_indices {
+                    if let Some(finished) = slots[si].take() {
+                        let _ = finished.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
+                    }
                 }
-            };
+                continue;
+            }
+        };
+
+        // ── Per-slot: apply filters, sample, retire if EOS ────────────────
+        for (batch_idx, &slot_idx) in active_indices.iter().enumerate() {
+            let mut logits = all_logits_cpu[batch_idx].clone();
 
             let slot = slots[slot_idx].as_mut().unwrap();
 

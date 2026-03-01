@@ -343,7 +343,8 @@ impl LayerWeights {
         let device = x.device();
         let mut k_list: Vec<Tensor> = Vec::with_capacity(n);
         let mut v_list: Vec<Tensor> = Vec::with_capacity(n);
-        let mut mask_list: Vec<Tensor> = Vec::with_capacity(n);
+        // Single flat buffer for all slot masks — filled slot-by-slot, uploaded once.
+        let mut mask_buf = vec![0u32; n * total_kv_len];
 
         for i in 0..n {
             let pos_i = positions[i]; // = seq_len BEFORE this step
@@ -391,23 +392,23 @@ impl LayerWeights {
             k_list.push(k_padded);
             v_list.push(v_padded);
 
-            // Per-slot mask: attend to [sliding_start..=pos_i], mask everything else
+            // Per-slot mask: attend to [sliding_start..=pos_i], mask everything else.
+            // Write directly into the pre-allocated flat buffer (no heap allocation per slot).
             let sliding_start = match self.sliding_window_size {
                 Some(w) => pos_i.saturating_sub(w.saturating_sub(1)),
                 None => 0,
             };
-            let mask_vals: Vec<u32> = (0..total_kv_len)
-                .map(|j| if j >= sliding_start && j <= pos_i { 1u32 } else { 0u32 })
-                .collect();
-            let mask_i =
-                Tensor::from_slice(&mask_vals, (1usize, 1usize, 1usize, total_kv_len), device)?;
-            mask_list.push(mask_i);
+            let row_start = i * total_kv_len;
+            for j in sliding_start..=pos_i {
+                mask_buf[row_start + j] = 1u32;
+            }
         }
 
         // Stack across batch
         let k_all = Tensor::cat(&k_list, 0)?; // [N, n_kv_head, total_kv_len, head_dim]
         let v_all = Tensor::cat(&v_list, 0)?;
-        let mask_all = Tensor::cat(&mask_list, 0)?; // [N, 1, 1, total_kv_len]
+        // Upload the single flat mask buffer as one tensor — no per-slot alloc or cat.
+        let mask_all = Tensor::from_slice(&mask_buf, (n, 1usize, 1usize, total_kv_len), device)?; // [N, 1, 1, total_kv_len]
 
         // GQA: expand kv heads to match query head count
         let k_all = repeat_kv(k_all, self.n_head / self.n_kv_head)?;
