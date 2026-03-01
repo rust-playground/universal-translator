@@ -29,3 +29,12 @@ pub struct TranslationResult {
 pub struct TranslationResultSet {
     pub results: Vec<TranslationResult>,
 }
+
+/// Result of a standalone language detection request.
+#[derive(Debug, Serialize)]
+pub struct LanguageDetectionResult {
+    pub language_code: String,
+    pub language: String,
+    pub confidence: f64,
+    pub translation_supported: bool,
+}

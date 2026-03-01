@@ -6,7 +6,7 @@ use crate::detector::Detector;
 use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
 use crate::scheduler::{ContinuousScheduler, InferRequest, SLOT_CAPACITY};
-use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
+use crate::types::{LanguageDetectionResult, TranslationBatch, TranslationResult, TranslationResultSet};
 use futures::future::try_join_all;
 use tokio::task;
 
@@ -173,6 +173,26 @@ impl TranslationEngine {
         task::spawn_blocking(move || detector.detect(&text_owned))
             .await
             .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))?
+    }
+
+    /// Detect the language of `text`, returning full metadata including Lingua confidence.
+    pub async fn detect_language_full(
+        &self,
+        text: &str,
+    ) -> Result<LanguageDetectionResult, TranslatorError> {
+        let text_owned = text.to_string();
+        let detector = self.detector.clone();
+        let (code, language_name, confidence) =
+            task::spawn_blocking(move || detector.detect_with_confidence(&text_owned))
+                .await
+                .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;
+        let supported = supported_target_languages().contains(&code.as_str());
+        Ok(LanguageDetectionResult {
+            language_code: code,
+            language: language_name,
+            confidence,
+            translation_supported: supported,
+        })
     }
 
     /// Translate a batch of texts into all requested target languages.

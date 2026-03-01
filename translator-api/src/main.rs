@@ -52,6 +52,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/translate", post(routes::translate::translate))
+        .route("/detect-language", post(routes::detect_language::detect_language))
         .route("/languages", get(routes::languages::languages))
         .route("/health", get(|| async { "OK" }))
         .layer(TraceLayer::new_for_http())

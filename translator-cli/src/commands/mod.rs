@@ -1,4 +1,5 @@
 pub mod detect;
+pub mod detect_language;
 pub mod languages;
 pub mod translate;
 
@@ -11,6 +12,7 @@ use clap::Subcommand;
 pub enum Commands {
     Translate(translate::TranslateArgs),
     Detect(detect::DetectArgs),
+    DetectLanguage(detect_language::DetectLanguageArgs),
     Languages(languages::LanguagesArgs),
 }
 
@@ -19,6 +21,7 @@ impl Commands {
         match self {
             Commands::Translate(args) => args.run(models_dir).await,
             Commands::Detect(args) => args.run(models_dir).await,
+            Commands::DetectLanguage(args) => args.run(models_dir).await,
             Commands::Languages(args) => args.run(),
         }
     }

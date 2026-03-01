@@ -29,6 +29,44 @@ impl Detector {
             "Could not detect language for text: {text:?}"
         )))
     }
+
+    /// Returns `(iso_code, language_name, confidence)`.
+    ///
+    /// **Confidence semantics:** `top / (top + second)` — the fraction of probability
+    /// mass assigned to the top two Lingua candidates that belongs to the winner.
+    /// This is a *relative* score: it answers "how clearly does the top language beat
+    /// its nearest competitor?" rather than "how certain are we in absolute terms?"
+    ///
+    /// Because Lingua's raw scores sum to 1.0 across ~75 languages, even an obvious
+    /// detection like English "Hello, how are you?" would score only ~17% in absolute
+    /// terms. The relative formula gives ~73% for that same input, and 95%+ for longer
+    /// or script-distinctive text.
+    ///
+    /// Practical interpretation:
+    /// - > 0.90  — strong, unambiguous signal
+    /// - 0.70–0.90 — confident detection; short or common phrases may land here
+    /// - 0.50–0.70 — moderate; treat as a best guess
+    /// - < 0.50  — weak; text is very short or genuinely ambiguous
+    ///
+    /// Script fallback (Malayalam): confidence = 1.0 (unambiguous Unicode-range match).
+    pub fn detect_with_confidence(&self, text: &str) -> Result<(String, String, f64), TranslatorError> {
+        let values = self.inner.compute_language_confidence_values(text.to_string());
+        let mut iter = values.into_iter();
+        if let Some((lang, top)) = iter.next() {
+            let second = iter.next().map(|(_, s)| s).unwrap_or(0.0);
+            let confidence = if top + second > 0.0 { top / (top + second) } else { 1.0 };
+            let code = language_to_iso639_1(&lang);
+            let name = format!("{lang:?}");
+            return Ok((code, name, confidence));
+        }
+        // Lingua returned empty — try script fallback.
+        if let Some(code) = detect_script(text) {
+            return Ok((code.to_string(), "Malayalam".to_string(), 1.0));
+        }
+        Err(TranslatorError::DetectionFailed(format!(
+            "Could not detect language for text: {text:?}"
+        )))
+    }
 }
 
 impl Default for Detector {
