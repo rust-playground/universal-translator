@@ -29,7 +29,7 @@ fn cerr(e: candle_core::Error) -> TranslatorError {
 }
 
 /// Maximum output tokens per slot (prompt tokens + generated tokens combined).
-pub const SLOT_CAPACITY: usize = 512;
+pub const SLOT_CAPACITY: usize = 4096;
 
 /// Number of parallel decode slots in the pool.
 pub const N_SLOTS: usize = 24;

@@ -147,18 +147,12 @@ impl RotaryEmbedding {
     ) -> Result<(Tensor, Tensor)> {
         let half = q.dim(D::Minus1)? / 2;
 
-        // Build per-position cos/sin rows → each [1, 1, half], stacked to [N, 1, 1, half]
-        let cos_rows: Vec<Tensor> = positions
-            .iter()
-            .map(|&p| -> Result<Tensor> { self.cos.i(p)?.reshape((1, 1, half)) })
-            .collect::<Result<_>>()?;
-        let sin_rows: Vec<Tensor> = positions
-            .iter()
-            .map(|&p| -> Result<Tensor> { self.sin.i(p)?.reshape((1, 1, half)) })
-            .collect::<Result<_>>()?;
-
-        let cos = Tensor::stack(&cos_rows, 0)?; // [N, 1, 1, half]
-        let sin = Tensor::stack(&sin_rows, 0)?;
+        // Build [N, 1, 1, half] cos/sin via index_select (1 kernel vs N individual .i() + stack)
+        let n = positions.len();
+        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let positions_t = Tensor::from_slice(&pos_ids, n, self.cos.device())?;
+        let cos = self.cos.index_select(&positions_t, 0)?.reshape((n, 1, 1, half))?;
+        let sin = self.sin.index_select(&positions_t, 0)?.reshape((n, 1, 1, half))?;
 
         // Manual rotate-half: broadcast cos/sin [N,1,1,half] → [N, n_heads, 1, half]
         let rope = |t: &Tensor| -> Result<Tensor> {
@@ -368,19 +362,9 @@ impl LayerWeights {
             let cur_kv_len = pos_i + 1;
             let pad_len = total_kv_len - cur_kv_len;
             let (k_padded, v_padded) = if pad_len > 0 {
-                let k_pad = Tensor::zeros(
-                    (1, self.n_kv_head, pad_len, self.head_dim),
-                    k_updated.dtype(),
-                    k_updated.device(),
-                )?;
-                let v_pad = Tensor::zeros(
-                    (1, self.n_kv_head, pad_len, self.head_dim),
-                    v_updated.dtype(),
-                    v_updated.device(),
-                )?;
                 (
-                    Tensor::cat(&[&k_updated, &k_pad], 2)?,
-                    Tensor::cat(&[&v_updated, &v_pad], 2)?,
+                    k_updated.pad_with_zeros(2, 0, pad_len)?,
+                    v_updated.pad_with_zeros(2, 0, pad_len)?,
                 )
             } else {
                 (k_updated.clone(), v_updated.clone())
