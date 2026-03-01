@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use crate::detector::Detector;
 use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
-use crate::scheduler::{ContinuousScheduler, InferRequest};
+use crate::scheduler::{ContinuousScheduler, InferRequest, SLOT_CAPACITY};
 use crate::types::{TranslationBatch, TranslationResult, TranslationResultSet};
 use futures::future::try_join_all;
 use tokio::task;
@@ -83,10 +83,18 @@ fn lang_full_name(code: &str) -> &str {
 
 /// Build a Gemma instruct-format translation prompt.
 ///
-/// The prompt uses the standard Gemma 3 chat template:
-///   <bos><start_of_turn>user\nTranslate from {src} to {tgt}:\n{text}<end_of_turn>\n<start_of_turn>model\n
+/// Uses the Gemma 3 chat template with a system turn that constrains output
+/// to a single translation (prevents multi-option "helpful assistant" mode):
 ///
-/// `<bos>` is included in the string so we tokenize without `add_special_tokens`.
+///   <bos>
+///   <start_of_turn>system
+///   You are a translation engine. Output only the translated text. Do not add explanations, alternatives, notes, or any other text.<end_of_turn>
+///   <start_of_turn>user
+///   Translate from {src} to {tgt}:
+///   {text}<end_of_turn>
+///   <start_of_turn>model
+///
+/// `<bos>` is included so we tokenize without `add_special_tokens`.
 /// The model generates the translation and ends with `<end_of_turn>`.
 fn translate_gemma_prompt(src_lang: &str, tgt_lang: &str, text: &str) -> String {
     format!(
@@ -224,6 +232,7 @@ impl TranslationEngine {
 
         // Phase 2 — build flat list of work items for all texts × target languages.
         let mut work_texts: Vec<String> = vec![];
+        let mut work_expected_lens: Vec<usize> = vec![];
         let mut work_indices: Vec<(usize, String)> = vec![];
 
         for i in 0..n {
@@ -249,8 +258,12 @@ impl TranslationEngine {
                     continue;
                 }
 
-                let prompt = translate_gemma_prompt(src, norm_lang, &batch.texts[i]);
+                let text = &batch.texts[i];
+                // chars / 3 ≈ 1.5 tokens (UTF-8 bytes / 3 ≈ tokens), +15 slack.
+                let expected_output_len = (text.len() / 3 + 15).clamp(15, SLOT_CAPACITY);
+                let prompt = translate_gemma_prompt(src, norm_lang, text);
                 work_texts.push(prompt);
+                work_expected_lens.push(expected_output_len);
                 work_indices.push((i, target_lang.clone()));
             }
         }
@@ -259,21 +272,25 @@ impl TranslationEngine {
         if !work_texts.is_empty() {
             let tx = self.get_or_start_worker();
             let mut reply_rxs = Vec::with_capacity(work_texts.len());
-            for text in work_texts {
+            for (text, expected_output_len) in work_texts.into_iter().zip(work_expected_lens) {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                tx.send(InferRequest { text, reply_tx }).map_err(|_| {
-                    TranslatorError::TranslationFailed("scheduler stopped".into())
-                })?;
+                tx.send(InferRequest {
+                    text,
+                    expected_output_len,
+                    reply_tx,
+                })
+                .map_err(|_| TranslatorError::TranslationFailed("scheduler stopped".into()))?;
                 reply_rxs.push(reply_rx);
             }
-            let translated: Vec<String> = try_join_all(reply_rxs.into_iter().map(|rx| async move {
-                rx.await
-                    .map_err(|_| {
-                        TranslatorError::TranslationFailed("scheduler dropped reply".into())
-                    })
-                    .and_then(|r| r)
-            }))
-            .await?;
+            let translated: Vec<String> =
+                try_join_all(reply_rxs.into_iter().map(|rx| async move {
+                    rx.await
+                        .map_err(|_| {
+                            TranslatorError::TranslationFailed("scheduler dropped reply".into())
+                        })
+                        .and_then(|r| r)
+                }))
+                .await?;
             for ((text_idx, target_lang), result) in work_indices.iter().zip(translated) {
                 all_translations[*text_idx].insert(target_lang.clone(), result);
             }
@@ -307,9 +324,7 @@ impl TranslationEngine {
             tokio::spawn(async move {
                 tracing::info!("Continuous scheduler starting, loading model…");
                 let model =
-                    match task::spawn_blocking(move || LoadedGemmaModel::load(&model_dir))
-                        .await
-                    {
+                    match task::spawn_blocking(move || LoadedGemmaModel::load(&model_dir)).await {
                         Ok(Ok(m)) => Arc::new(m),
                         Ok(Err(e)) => {
                             tracing::error!("Scheduler failed to load model: {e}");

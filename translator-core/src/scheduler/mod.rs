@@ -10,7 +10,7 @@ pub mod continuous;
 pub mod decoder;
 pub mod sampling;
 
-pub use continuous::{ContinuousScheduler, InferRequest};
+pub use continuous::{ContinuousScheduler, InferRequest, SLOT_CAPACITY};
 pub use decoder::GemmaSlotDecoder;
 pub use sampling::{
     apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token,

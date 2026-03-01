@@ -42,6 +42,9 @@ pub const N_SLOTS: usize = 24;
 /// (e.g. the output of `translate_gemma_prompt()`).
 pub struct InferRequest {
     pub text: String,
+    /// Expected number of output tokens, used to calibrate EOS bias.
+    /// Computed by the engine from the original text length (not the prompt length).
+    pub expected_output_len: usize,
     pub reply_tx: oneshot::Sender<Result<String, TranslatorError>>,
 }
 
@@ -103,8 +106,8 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
                 continue;
             }
             match work_rx.try_recv() {
-                Ok(InferRequest { text, reply_tx }) => {
-                    if let Ok(s) = prefill_slot(model, text, reply_tx, eos_id, &mut rng) {
+                Ok(InferRequest { text, expected_output_len, reply_tx }) => {
+                    if let Ok(s) = prefill_slot(model, text, expected_output_len, reply_tx, eos_id, &mut rng) {
                         *slot = Some(s);
                     }
                 }
@@ -120,10 +123,10 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
             // No active work — block until a new request arrives.
             match work_rx.recv() {
                 Err(_) => break 'scheduler, // channel closed → clean shutdown
-                Ok(InferRequest { text, reply_tx }) => {
+                Ok(InferRequest { text, expected_output_len, reply_tx }) => {
                     for slot in slots.iter_mut() {
                         if slot.is_none() {
-                            if let Ok(s) = prefill_slot(model, text, reply_tx, eos_id, &mut rng)
+                            if let Ok(s) = prefill_slot(model, text, expected_output_len, reply_tx, eos_id, &mut rng)
                             {
                                 *slot = Some(s);
                             }
@@ -257,6 +260,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
 fn prefill_slot(
     model: &LoadedGemmaModel,
     text: String,
+    expected_output_len: usize,
     reply_tx: oneshot::Sender<Result<String, TranslatorError>>,
     eos_token_id: u32,
     rng: &mut SmallRng,
@@ -269,8 +273,7 @@ fn prefill_slot(
         }
     };
 
-    let prompt_len = token_ids.len();
-    let expected_len = ((prompt_len as f32 * 0.55 + 30.0) as usize).clamp(48, SLOT_CAPACITY);
+    let expected_len = expected_output_len;
 
     let mut decoder = model.new_slot_decoder();
 
