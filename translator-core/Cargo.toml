@@ -6,8 +6,9 @@ license.workspace = true
 
 [features]
 default = []
-metal   = ["candle-core/metal", "candle-transformers/metal", "candle-nn/metal"]
-cuda    = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda"]
+metal          = ["candle-core/metal", "candle-transformers/metal", "candle-nn/metal"]
+cuda           = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda"]
+opentelemetry  = ["dep:opentelemetry"]
 
 [dependencies]
 candle-core         = { workspace = true }
@@ -22,3 +23,4 @@ serde               = { workspace = true }
 tracing             = { workspace = true }
 rand                = { version = "0.8", features = ["small_rng"] }
 futures             = { workspace = true }
+opentelemetry       = { workspace = true, optional = true }

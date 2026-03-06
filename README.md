@@ -94,6 +94,17 @@ cargo run -p translator-api
 The server listens on `http://localhost:3000`. See [API.md](API.md) for endpoint
 reference and request/response schemas.
 
+To run with full observability (traces, metrics, logs pushed to a local monitoring stack):
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+OTLP_ENDPOINT=http://localhost:4317 \
+  cargo run -p translator-api --features opentelemetry
+```
+
+Grafana opens at http://localhost:3001 with a pre-built dashboard. See [METRICS.md](METRICS.md)
+for the full setup guide and metrics catalogue.
+
 ### Run the CLI
 
 ```bash
@@ -108,6 +119,7 @@ See [CLI.md](CLI.md) for the full command reference (`translate`, `detect-langua
 - [CLI Reference](CLI.md) — all subcommands, flags, and output formats
 - [API Reference](API.md) — HTTP endpoints, request/response schemas, examples
 - [Engine Internals](ENGINE.md) — inference limits, concurrency, sampling, language detection
+- [Observability](METRICS.md) — OTel traces/metrics/logs, Grafana dashboard, metrics catalogue
 
 ## Licensing
 

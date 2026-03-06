@@ -2,6 +2,33 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+#[cfg(feature = "opentelemetry")]
+mod metrics {
+    use opentelemetry::metrics::{Counter, Histogram};
+    use std::sync::LazyLock;
+
+    pub static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        opentelemetry::global::meter("translator")
+            .u64_counter("translator.translation.requests")
+            .build()
+    });
+
+    pub static BATCH_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+        opentelemetry::global::meter("translator")
+            .u64_histogram("translator.translation.batch_size")
+            .build()
+    });
+
+    pub static DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+        opentelemetry::global::meter("translator")
+            .f64_histogram("translator.translation.duration_ms")
+            .with_boundaries(vec![
+                100., 250., 500., 1000., 2000., 5000., 10000., 30000., 60000., 120000.,
+            ])
+            .build()
+    });
+}
+
 use crate::detector::Detector;
 use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
@@ -196,6 +223,7 @@ impl TranslationEngine {
     }
 
     /// Translate a batch of texts into all requested target languages.
+    #[tracing::instrument(skip(self, batch), fields(n_texts = batch.texts.len(), n_targets = batch.target_languages.len()))]
     pub async fn translate_batch(
         &self,
         mut batch: TranslationBatch,
@@ -211,6 +239,14 @@ impl TranslationEngine {
         }
 
         let n = batch.texts.len();
+
+        #[cfg(feature = "opentelemetry")]
+        let _start = std::time::Instant::now();
+        #[cfg(feature = "opentelemetry")]
+        {
+            metrics::REQUESTS.add(1, &[]);
+            metrics::BATCH_SIZE.record(n as u64, &[]);
+        }
 
         // Phase 1 — resolve source languages: use caller hint or detect in parallel.
         let source_langs: Vec<String> = if let Some(ref src) = batch.source_language {
@@ -322,6 +358,9 @@ impl TranslationEngine {
                 }
             })
             .collect();
+
+        #[cfg(feature = "opentelemetry")]
+        metrics::DURATION_MS.record(_start.elapsed().as_millis() as f64, &[]);
 
         Ok(TranslationResultSet { results })
     }

@@ -16,6 +16,32 @@ pub async fn translate(
         )));
     }
 
-    let result = state.engine.translate_batch(batch).await?;
+    let result = state
+        .engine
+        .translate_batch(batch)
+        .await
+        .map_err(|e| {
+            #[cfg(feature = "opentelemetry")]
+            {
+                use opentelemetry::{global::meter, KeyValue};
+                static ERROR_CTR: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+                    std::sync::LazyLock::new(|| {
+                        meter("translator")
+                            .u64_counter("translator.translation.errors")
+                            .build()
+                    });
+                let kind = match &e {
+                    TranslatorError::ModelNotFound(_) => "model_not_found",
+                    TranslatorError::DetectionFailed(_) => "detection_failed",
+                    TranslatorError::UnsupportedLanguage(_) => "unsupported_language",
+                    TranslatorError::TranslationFailed(_) => "translation_failed",
+                    TranslatorError::Io(_) => "io",
+                    TranslatorError::Model(_) => "model",
+                };
+                ERROR_CTR.add(1, &[KeyValue::new("error_type", kind)]);
+            }
+            ApiError(e)
+        })?;
+
     Ok(Json(result))
 }
