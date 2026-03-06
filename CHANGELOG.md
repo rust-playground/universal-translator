@@ -24,3 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   translation latency, scheduler slot utilisation, prefill time, prompt tokens, and error rates
 - **Docker Compose observability stack** — OTel Collector, Prometheus, Grafana, Tempo, and
   Loki wired together for local development
+
+
+
+[Unreleased]: https://github.com/rust-playground/universal-translator/compare/v0.0.1...HEAD
+
+[0.0.1]: https://github.com/rust-playground/universal-translator/compare/0044ce9fe79ee4ea73fa57dca12485b0bd22a5fb...v0.0.1
