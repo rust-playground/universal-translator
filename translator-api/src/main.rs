@@ -120,7 +120,13 @@ async fn main() {
     tracing::info!(?models_dir, "Loading translation engine");
 
     let engine = TranslationEngine::new(&models_dir);
-    let state = AppState { engine };
+    let state = AppState {
+        engine,
+        #[cfg(feature = "opentelemetry")]
+        error_ctr: opentelemetry::global::meter("translator")
+            .u64_counter("translator.translation.errors")
+            .build(),
+    };
 
     let app = Router::new()
         .route("/translate", post(routes::translate::translate))

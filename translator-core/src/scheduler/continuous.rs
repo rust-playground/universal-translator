@@ -24,63 +24,49 @@ use crate::scheduler::sampling::{
     apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token,
 };
 
-#[cfg(feature = "opentelemetry")]
-mod metrics {
-    use opentelemetry::metrics::{Counter, Gauge, Histogram};
-    use std::sync::LazyLock;
+struct Metrics {
+    #[cfg(feature = "opentelemetry")]
+    active_slots: opentelemetry::metrics::Gauge<u64>,
+    #[cfg(feature = "opentelemetry")]
+    decode_forward_ms: opentelemetry::metrics::Histogram<f64>,
+    #[cfg(feature = "opentelemetry")]
+    prefill_ms: opentelemetry::metrics::Histogram<f64>,
+    #[cfg(feature = "opentelemetry")]
+    prompt_tokens: opentelemetry::metrics::Histogram<u64>,
+    #[cfg(feature = "opentelemetry")]
+    slots_completed: opentelemetry::metrics::Counter<u64>,
+    #[cfg(feature = "opentelemetry")]
+    tokens_generated: opentelemetry::metrics::Counter<u64>,
+}
 
-    pub static ACTIVE_SLOTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .u64_gauge("translator.scheduler.active_slots")
-            .build()
-    });
-
-    // Defined for completeness; queue depth is not directly observable from mpsc::Receiver.
-    #[allow(dead_code)]
-    pub static QUEUE_DEPTH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .u64_gauge("translator.scheduler.queue_depth")
-            .build()
-    });
-
-    pub static DECODE_FORWARD_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .f64_histogram("translator.scheduler.decode_forward_ms")
-            .with_boundaries(vec![
-                1., 5., 10., 25., 50., 100., 250., 500., 1000., 2500., 5000.,
-            ])
-            .build()
-    });
-
-    pub static PREFILL_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .f64_histogram("translator.scheduler.prefill_ms")
-            .with_boundaries(vec![
-                50., 100., 200., 500., 1000., 2000., 5000., 10000., 30000.,
-            ])
-            .build()
-    });
-
-    pub static PROMPT_TOKENS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .u64_histogram("translator.scheduler.prompt_tokens")
-            .with_boundaries(vec![
-                10., 20., 50., 100., 200., 400., 600., 1024., 2048.,
-            ])
-            .build()
-    });
-
-    pub static SLOTS_COMPLETED: LazyLock<Counter<u64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .u64_counter("translator.scheduler.slots_completed")
-            .build()
-    });
-
-    pub static TOKENS_GENERATED: LazyLock<Counter<u64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .u64_counter("translator.scheduler.tokens_generated")
-            .build()
-    });
+impl Metrics {
+    fn new() -> Self {
+        #[cfg(feature = "opentelemetry")]
+        let meter = opentelemetry::global::meter("translator");
+        Self {
+            #[cfg(feature = "opentelemetry")]
+            active_slots: meter.u64_gauge("translator.scheduler.active_slots").build(),
+            #[cfg(feature = "opentelemetry")]
+            decode_forward_ms: meter
+                .f64_histogram("translator.scheduler.decode_forward_ms")
+                .with_boundaries(vec![1., 5., 10., 25., 50., 100., 250., 500., 1000., 2500., 5000.])
+                .build(),
+            #[cfg(feature = "opentelemetry")]
+            prefill_ms: meter
+                .f64_histogram("translator.scheduler.prefill_ms")
+                .with_boundaries(vec![50., 100., 200., 500., 1000., 2000., 5000., 10000., 30000.])
+                .build(),
+            #[cfg(feature = "opentelemetry")]
+            prompt_tokens: meter
+                .u64_histogram("translator.scheduler.prompt_tokens")
+                .with_boundaries(vec![10., 20., 50., 100., 200., 400., 600., 1024., 2048.])
+                .build(),
+            #[cfg(feature = "opentelemetry")]
+            slots_completed: meter.u64_counter("translator.scheduler.slots_completed").build(),
+            #[cfg(feature = "opentelemetry")]
+            tokens_generated: meter.u64_counter("translator.scheduler.tokens_generated").build(),
+        }
+    }
 }
 
 fn cerr(e: candle_core::Error) -> TranslatorError {
@@ -129,11 +115,12 @@ struct Slot {
 pub struct ContinuousScheduler {
     model: Arc<LoadedGemmaModel>,
     work_rx: mpsc::Receiver<InferRequest>,
+    metrics: Metrics,
 }
 
 impl ContinuousScheduler {
     pub fn new(model: Arc<LoadedGemmaModel>, work_rx: mpsc::Receiver<InferRequest>) -> Self {
-        Self { model, work_rx }
+        Self { model, work_rx, metrics: Metrics::new() }
     }
 
     /// Drive the scheduler to completion.
@@ -142,9 +129,10 @@ impl ContinuousScheduler {
     pub async fn run(self) {
         let model = self.model;
         let mut work_rx = self.work_rx;
+        let metrics = self.metrics;
 
         tokio::task::spawn_blocking(move || {
-            run_loop(&model, &mut work_rx);
+            run_loop(&model, &mut work_rx, &metrics);
         })
         .await
         .ok();
@@ -153,7 +141,7 @@ impl ContinuousScheduler {
 
 // ── Scheduler loop ────────────────────────────────────────────────────────────
 
-fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>) {
+fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>, metrics: &Metrics) {
     let eos_id = model.eos_token_id();
     let mut slots: Vec<Option<Slot>> = (0..N_SLOTS).map(|_| None).collect();
     let mut rng = SmallRng::from_entropy();
@@ -166,7 +154,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
             }
             match work_rx.try_recv() {
                 Ok(InferRequest { text, expected_output_len, reply_tx }) => {
-                    if let Ok(s) = prefill_slot(model, text, expected_output_len, reply_tx, eos_id, &mut rng) {
+                    if let Ok(s) = prefill_slot(model, text, expected_output_len, reply_tx, eos_id, &mut rng, metrics) {
                         *slot = Some(s);
                     }
                 }
@@ -179,7 +167,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
             slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|_| i)).collect();
 
         #[cfg(feature = "opentelemetry")]
-        metrics::ACTIVE_SLOTS.record(active_indices.len() as u64, &[]);
+        metrics.active_slots.record(active_indices.len() as u64, &[]);
 
         if active_indices.is_empty() {
             // No active work — block until a new request arrives.
@@ -188,8 +176,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
                 Ok(InferRequest { text, expected_output_len, reply_tx }) => {
                     for slot in slots.iter_mut() {
                         if slot.is_none() {
-                            if let Ok(s) = prefill_slot(model, text, expected_output_len, reply_tx, eos_id, &mut rng)
-                            {
+                            if let Ok(s) = prefill_slot(model, text, expected_output_len, reply_tx, eos_id, &mut rng, metrics) {
                                 *slot = Some(s);
                             }
                             break;
@@ -241,7 +228,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
         let _fw = std::time::Instant::now();
         let forward_result = model.forward_batched(&tokens_t, &mut batch_kv);
         #[cfg(feature = "opentelemetry")]
-        metrics::DECODE_FORWARD_MS.record(_fw.elapsed().as_millis() as f64, &[]);
+        metrics.decode_forward_ms.record(_fw.elapsed().as_millis() as f64, &[]);
 
         let all_logits_t = match forward_result {
             Ok(t) => t,
@@ -314,8 +301,8 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
                 {
                     use opentelemetry::KeyValue;
                     let cause = if tok == eos_id { "eos" } else { "capacity" };
-                    metrics::SLOTS_COMPLETED.add(1, &[KeyValue::new("cause", cause)]);
-                    metrics::TOKENS_GENERATED.add(finished.output_ids.len() as u64, &[]);
+                    metrics.slots_completed.add(1, &[KeyValue::new("cause", cause)]);
+                    metrics.tokens_generated.add(finished.output_ids.len() as u64, &[]);
                 }
                 let text = model.decode_output_ids(&finished.output_ids);
                 let _ = finished.reply_tx.send(text);
@@ -332,7 +319,8 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
 /// Prefill the prompt, sample the first output token, and construct a [`Slot`].
 ///
 /// On any error the error is sent through `reply_tx` before returning `Err(())`.
-#[tracing::instrument(skip(model, text, reply_tx, rng), fields(prompt_len = text.len()))]
+#[cfg_attr(not(feature = "opentelemetry"), allow(unused_variables))]
+#[tracing::instrument(skip(model, text, reply_tx, rng, metrics), fields(prompt_len = text.len()))]
 fn prefill_slot(
     model: &LoadedGemmaModel,
     text: String,
@@ -340,6 +328,7 @@ fn prefill_slot(
     reply_tx: oneshot::Sender<Result<String, TranslatorError>>,
     eos_token_id: u32,
     rng: &mut SmallRng,
+    metrics: &Metrics,
 ) -> Result<Slot, ()> {
     let token_ids = match model.tokenize(&text) {
         Ok(ids) => ids,
@@ -350,7 +339,7 @@ fn prefill_slot(
     };
 
     #[cfg(feature = "opentelemetry")]
-    metrics::PROMPT_TOKENS.record(token_ids.len() as u64, &[]);
+    metrics.prompt_tokens.record(token_ids.len() as u64, &[]);
 
     let expected_len = expected_output_len;
 
@@ -360,7 +349,7 @@ fn prefill_slot(
     let _pf = std::time::Instant::now();
     let prefill_result = decoder.prefill(model, &token_ids);
     #[cfg(feature = "opentelemetry")]
-    metrics::PREFILL_MS.record(_pf.elapsed().as_millis() as f64, &[]);
+    metrics.prefill_ms.record(_pf.elapsed().as_millis() as f64, &[]);
 
     let mut logits = match prefill_result {
         Ok(l) => l,

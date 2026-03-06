@@ -23,13 +23,7 @@ pub async fn translate(
         .map_err(|e| {
             #[cfg(feature = "opentelemetry")]
             {
-                use opentelemetry::{global::meter, KeyValue};
-                static ERROR_CTR: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
-                    std::sync::LazyLock::new(|| {
-                        meter("translator")
-                            .u64_counter("translator.translation.errors")
-                            .build()
-                    });
+                use opentelemetry::KeyValue;
                 let kind = match &e {
                     TranslatorError::ModelNotFound(_) => "model_not_found",
                     TranslatorError::DetectionFailed(_) => "detection_failed",
@@ -38,7 +32,7 @@ pub async fn translate(
                     TranslatorError::Io(_) => "io",
                     TranslatorError::Model(_) => "model",
                 };
-                ERROR_CTR.add(1, &[KeyValue::new("error_type", kind)]);
+                state.error_ctr.add(1, &[KeyValue::new("error_type", kind)]);
             }
             ApiError(e)
         })?;

@@ -2,33 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-#[cfg(feature = "opentelemetry")]
-mod metrics {
-    use opentelemetry::metrics::{Counter, Histogram};
-    use std::sync::LazyLock;
-
-    pub static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .u64_counter("translator.translation.requests")
-            .build()
-    });
-
-    pub static BATCH_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .u64_histogram("translator.translation.batch_size")
-            .build()
-    });
-
-    pub static DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
-        opentelemetry::global::meter("translator")
-            .f64_histogram("translator.translation.duration_ms")
-            .with_boundaries(vec![
-                100., 250., 500., 1000., 2000., 5000., 10000., 30000., 60000., 120000.,
-            ])
-            .build()
-    });
-}
-
 use crate::detector::Detector;
 use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
@@ -181,15 +154,34 @@ pub struct TranslationEngine {
     detector: Arc<Detector>,
     /// Sender half of the continuous-batching scheduler channel.  Initialised lazily.
     work_tx: Arc<OnceLock<std::sync::mpsc::Sender<InferRequest>>>,
+    #[cfg(feature = "opentelemetry")]
+    requests: opentelemetry::metrics::Counter<u64>,
+    #[cfg(feature = "opentelemetry")]
+    batch_size: opentelemetry::metrics::Histogram<u64>,
+    #[cfg(feature = "opentelemetry")]
+    duration_ms: opentelemetry::metrics::Histogram<f64>,
 }
 
 impl TranslationEngine {
     pub fn new(models_dir: impl AsRef<Path>) -> Self {
+        #[cfg(feature = "opentelemetry")]
+        let meter = opentelemetry::global::meter("translator");
         Self {
             models_dir: models_dir.as_ref().to_path_buf(),
             model_cache: Arc::new(OnceLock::new()),
             detector: Arc::new(Detector::new()),
             work_tx: Arc::new(OnceLock::new()),
+            #[cfg(feature = "opentelemetry")]
+            requests: meter.u64_counter("translator.translation.requests").build(),
+            #[cfg(feature = "opentelemetry")]
+            batch_size: meter.u64_histogram("translator.translation.batch_size").build(),
+            #[cfg(feature = "opentelemetry")]
+            duration_ms: meter
+                .f64_histogram("translator.translation.duration_ms")
+                .with_boundaries(vec![
+                    100., 250., 500., 1000., 2000., 5000., 10000., 30000., 60000., 120000.,
+                ])
+                .build(),
         }
     }
 
@@ -244,8 +236,8 @@ impl TranslationEngine {
         let _start = std::time::Instant::now();
         #[cfg(feature = "opentelemetry")]
         {
-            metrics::REQUESTS.add(1, &[]);
-            metrics::BATCH_SIZE.record(n as u64, &[]);
+            self.requests.add(1, &[]);
+            self.batch_size.record(n as u64, &[]);
         }
 
         // Phase 1 — resolve source languages: use caller hint or detect in parallel.
@@ -360,7 +352,7 @@ impl TranslationEngine {
             .collect();
 
         #[cfg(feature = "opentelemetry")]
-        metrics::DURATION_MS.record(_start.elapsed().as_millis() as f64, &[]);
+        self.duration_ms.record(_start.elapsed().as_millis() as f64, &[]);
 
         Ok(TranslationResultSet { results })
     }

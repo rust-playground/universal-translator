@@ -4,4 +4,6 @@ use translator_core::engine::TranslationEngine;
 #[derive(Clone)]
 pub struct AppState {
     pub engine: TranslationEngine,
+    #[cfg(feature = "opentelemetry")]
+    pub error_ctr: opentelemetry::metrics::Counter<u64>,
 }
