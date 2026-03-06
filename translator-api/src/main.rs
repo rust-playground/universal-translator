@@ -47,7 +47,7 @@ fn init_telemetry() -> opentelemetry_sdk::metrics::SdkMeterProvider {
     use opentelemetry::trace::TracerProvider as _; // bring .tracer() into scope
     use opentelemetry_otlp::WithExportConfig;
     use opentelemetry_sdk::{
-        logs::LoggerProvider, metrics::SdkMeterProvider, runtime::Tokio, trace::TracerProvider,
+        logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider,
     };
 
     let endpoint = std::env::var("OTLP_ENDPOINT")
@@ -59,8 +59,8 @@ fn init_telemetry() -> opentelemetry_sdk::metrics::SdkMeterProvider {
         .with_endpoint(&endpoint)
         .build()
         .expect("trace exporter");
-    let tracer_provider = TracerProvider::builder()
-        .with_batch_exporter(trace_exporter, Tokio)
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(trace_exporter)
         .build();
     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
     let tracer = tracer_provider.tracer("translator-api");
@@ -71,12 +71,9 @@ fn init_telemetry() -> opentelemetry_sdk::metrics::SdkMeterProvider {
         .with_endpoint(&endpoint)
         .build()
         .expect("metrics exporter");
-    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
-        metrics_exporter,
-        opentelemetry_sdk::runtime::Tokio,
-    )
-    .with_interval(std::time::Duration::from_secs(10))
-    .build();
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metrics_exporter)
+        .with_interval(std::time::Duration::from_secs(10))
+        .build();
     let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
     opentelemetry::global::set_meter_provider(meter_provider.clone());
 
@@ -86,8 +83,8 @@ fn init_telemetry() -> opentelemetry_sdk::metrics::SdkMeterProvider {
         .with_endpoint(&endpoint)
         .build()
         .expect("log exporter");
-    let logger_provider = LoggerProvider::builder()
-        .with_batch_exporter(log_exporter, Tokio)
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_batch_exporter(log_exporter)
         .build();
     // Bridge: tracing events → OTel logs
     let log_layer = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(

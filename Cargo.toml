@@ -29,8 +29,8 @@ clap                = { version = "4", features = ["derive", "env"] }
 axum                = { version = "0.8", features = ["json", "macros"] }
 tower-http          = { version = "0.6", features = ["trace"] }
 futures             = { version = "0.3", default-features = false, features = ["async-await", "alloc"] }
-opentelemetry          = { version = "0.27" }
-opentelemetry_sdk      = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp     = { version = "0.27", features = ["trace", "metrics", "logs", "grpc-tonic"] }
-tracing-opentelemetry  = { version = "0.28" }
-opentelemetry-appender-tracing = { version = "0.27" }
+opentelemetry          = { version = "0.31" }
+opentelemetry_sdk      = { version = "0.31" }
+opentelemetry-otlp     = { version = "0.31", features = ["trace", "metrics", "logs", "grpc-tonic"] }
+tracing-opentelemetry  = { version = "0.32" }
+opentelemetry-appender-tracing = { version = "0.31" }
