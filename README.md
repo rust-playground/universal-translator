@@ -1,5 +1,10 @@
 # universal-translator
 
+
+[![CI](https://github.com/rust-playground/universal-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-playground/universal-translator/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)]()
+
 A universal text translator built in Rust. Uses [Candle](https://github.com/huggingface/candle) for fast, fully local inference of [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) (Gemma 3 4B instruction-tuned), covering 55 languages, and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection.
 
 No API keys required. No network calls at runtime. Everything runs on your machine.
@@ -8,9 +13,6 @@ No API keys required. No network calls at runtime. Everything runs on your machi
 **Model attributions:** see [ATTRIBUTIONS.md](ATTRIBUTIONS.md) — covers TranslateGemma 4B and the runtime libraries used for inference.
 **Model license:** TranslateGemma 4B weights are subject to the [Gemma Terms of Use](https://ai.google.dev/gemma/terms) — see [LICENSE-GEMMA](LICENSE-GEMMA) and [NOTICE](NOTICE).
 
-[![CI](https://github.com/rust-playground/universal-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-playground/universal-translator/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)]()
 
 ---
 
