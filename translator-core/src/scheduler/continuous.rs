@@ -16,6 +16,7 @@ use std::sync::{Arc, mpsc};
 use candle_core::{DType, Tensor};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use rayon::prelude::*;
 
 use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
@@ -310,26 +311,47 @@ fn run_loop(
         };
 
         // ── Per-slot: apply filters, sample, retire if EOS ────────────────
-        // `all_logits_cpu.into_iter()` takes ownership — no per-slot Vec clone.
-        for (mut logits, &slot_idx) in all_logits_cpu.into_iter().zip(active_indices.iter()) {
-            let slot = slots[slot_idx].as_mut().unwrap();
+        // Collect per-slot read-only data needed for the parallel sampling step.
+        // Cloning output_ids (typically a few hundred tokens) is far cheaper
+        // than the 25 MB logit transfer we just did.
+        let slot_data: Vec<(Vec<u32>, usize)> = active_indices
+            .iter()
+            .map(|&i| {
+                let slot = slots[i].as_ref().unwrap();
+                (slot.output_ids.clone(), slot.expected_len)
+            })
+            .collect();
 
-            apply_decoding_filters(&mut logits, &slot.output_ids);
-            apply_length_bias(&mut logits, eos_id, slot.output_ids.len(), slot.expected_len);
-            force_eos_on_tail_repeat(&mut logits, eos_id, &slot.output_ids);
+        // Parallel filter + sample — each task owns its own rng and scratch buffer.
+        // Rayon parallelises across active slots; serial retire loop follows.
+        let sampling_results: Vec<(usize, u32)> = all_logits_cpu
+            .into_par_iter()
+            .zip(active_indices.par_iter().copied())
+            .zip(slot_data.into_par_iter())
+            .map(|((mut logits, slot_idx), (output_ids, expected_len))| {
+                apply_decoding_filters(&mut logits, &output_ids);
+                apply_length_bias(&mut logits, eos_id, output_ids.len(), expected_len);
+                force_eos_on_tail_repeat(&mut logits, eos_id, &output_ids);
 
-            // Hard ceiling: force EOS when approaching capacity
-            if slot.output_ids.len() + 1 >= SLOT_CAPACITY {
-                for (i, v) in logits.iter_mut().enumerate() {
-                    if i != eos_id as usize {
-                        *v = f32::NEG_INFINITY;
+                // Hard ceiling: force EOS when approaching capacity.
+                if output_ids.len() + 1 >= SLOT_CAPACITY {
+                    for (i, v) in logits.iter_mut().enumerate() {
+                        if i != eos_id as usize {
+                            *v = f32::NEG_INFINITY;
+                        }
                     }
                 }
-            }
 
-            let tok = sample_token(&mut logits, &mut rng, &mut sample_scratch);
-            let at_capacity = slot.output_ids.len() + 1 >= SLOT_CAPACITY;
+                let mut local_rng = SmallRng::from_entropy();
+                let mut local_scratch = Vec::with_capacity(TOP_K + 1);
+                let tok = sample_token(&mut logits, &mut local_rng, &mut local_scratch);
+                (slot_idx, tok)
+            })
+            .collect();
 
+        // Serial retire/update — mutates slots[], cheap.
+        for (slot_idx, tok) in sampling_results {
+            let at_capacity = slots[slot_idx].as_ref().unwrap().output_ids.len() + 1 >= SLOT_CAPACITY;
             if tok == eos_id || at_capacity {
                 let finished = slots[slot_idx].take().unwrap();
                 #[cfg(feature = "opentelemetry")]
@@ -342,6 +364,7 @@ fn run_loop(
                 let text = model.decode_output_ids(&finished.output_ids);
                 let _ = finished.reply_tx.send((finished.index, text));
             } else {
+                let slot = slots[slot_idx].as_mut().unwrap();
                 slot.output_ids.push(tok);
                 slot.current_token = tok;
             }
