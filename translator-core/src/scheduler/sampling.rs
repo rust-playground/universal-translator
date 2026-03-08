@@ -69,9 +69,7 @@ pub const EOS_LOGIT_BIAS: f32 = 6.0;
 /// adds a linearly increasing bonus that saturates at `EOS_LOGIT_BIAS` when
 /// `step >= expected_len`.
 ///
-/// **Note**: logits are expected to be already temperature-scaled (divided by
-/// `TEMPERATURE` on the GPU before CPU transfer).  The additive bias is divided
-/// by `TEMPERATURE` here to maintain the same effective probability shift.
+/// Applied to raw logits (before temperature scaling inside `sample_token`).
 pub fn apply_length_bias(
     logits: &mut [f32],
     eos_token_id: u32,
@@ -86,7 +84,7 @@ pub fn apply_length_bias(
     if progress >= LENGTH_PENALTY_START {
         let fraction =
             ((progress - LENGTH_PENALTY_START) / (1.0 - LENGTH_PENALTY_START)).min(1.0);
-        logits[eos] += fraction * EOS_LOGIT_BIAS / TEMPERATURE;
+        logits[eos] += fraction * EOS_LOGIT_BIAS;
     }
 }
 
@@ -137,12 +135,11 @@ pub const TOP_K: usize = 40;
 /// probability reaches this threshold.
 pub const TOP_P: f32 = 0.90;
 
-/// Sample the next token from `logits` using top-K / top-P.
+/// Sample the next token from `logits` using top-K / top-P / temperature.
 ///
-/// **`logits` must already be temperature-scaled** (divided by `TEMPERATURE`
-/// on the GPU before CPU transfer).  This function does NOT divide by
-/// temperature — it only applies top-K filtering, softmax, top-P truncation,
-/// and a weighted draw.
+/// Temperature is applied to the ≤K candidates AFTER top-K selection —
+/// since temperature is a positive constant it doesn't change rank order,
+/// so top-K can run on raw logits (saving ~262 K divisions per call).
 ///
 /// `scratch` is a caller-supplied reusable buffer for the candidates vec.
 /// Pre-allocate once with `Vec::with_capacity(TOP_K + 1)` and pass on every call
@@ -152,8 +149,7 @@ pub const TOP_P: f32 = 0.90;
 pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng, scratch: &mut Vec<(u32, f32)>) -> u32 {
     let vocab = logits.len();
 
-    // 1. Top-K: collect finite logits into (index, value) pairs.
-    //    Temperature scaling is pre-applied on the GPU — no division here.
+    // 1. Top-K: collect finite logits by raw value (temperature preserves rank order).
     let k = TOP_K.min(vocab);
     scratch.clear();
     scratch.extend(
@@ -174,7 +170,12 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng, scratch: &mut Vec<(u
         return 0;
     }
 
-    // 2. Softmax over the ≤K candidates only.
+    // 2. Apply temperature to the ≤K candidates only (~40 divisions instead of 262K).
+    for (_, v) in scratch.iter_mut() {
+        *v /= TEMPERATURE;
+    }
+
+    // 3. Softmax over the ≤K candidates only.
     let max = scratch.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
     for (_, v) in scratch.iter_mut() {
         *v = (*v - max).exp();
@@ -186,7 +187,7 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng, scratch: &mut Vec<(u
         }
     }
 
-    // 3. Top-P (nucleus): sort the small K-element vec by probability, then
+    // 4. Top-P (nucleus): sort the small K-element vec by probability, then
     //    truncate once cumulative mass >= TOP_P.
     scratch.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -202,7 +203,7 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng, scratch: &mut Vec<(u
     }
     scratch.truncate(cutoff);
 
-    // 4. Renormalise & weighted draw.
+    // 5. Renormalise & weighted draw.
     let sum: f32 = scratch.iter().map(|(_, v)| v).sum();
     let draw: f32 = Standard.sample(rng);
     let threshold = draw * sum;
@@ -284,12 +285,11 @@ mod tests {
 
     #[test]
     fn length_bias_at_capacity() {
-        // step == expected_len → fraction = 1.0 → bias == EOS_LOGIT_BIAS / TEMPERATURE.
-        // (logits are expected to be pre-scaled by 1/TEMPERATURE on the GPU)
+        // step == expected_len → fraction = 1.0 → bias == EOS_LOGIT_BIAS (raw logit space).
         let mut logits = vec![0.0f32; 5];
         let eos = 0u32;
         apply_length_bias(&mut logits, eos, 10, 10);
-        assert!((logits[eos as usize] - EOS_LOGIT_BIAS / TEMPERATURE).abs() < 1e-5);
+        assert!((logits[eos as usize] - EOS_LOGIT_BIAS).abs() < 1e-6);
     }
 
     #[test]

@@ -22,8 +22,7 @@ use crate::model::LoadedGemmaModel;
 use crate::model_batched::SlotKvCache;
 use crate::scheduler::decoder::GemmaSlotDecoder;
 use crate::scheduler::sampling::{
-    apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token, TEMPERATURE,
-    TOP_K,
+    apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token, TOP_K,
 };
 
 struct Metrics {
@@ -286,16 +285,12 @@ fn run_loop(
                 std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
         }
 
-        // ── GPU→CPU transfer with temperature pre-scaling ────────────────
-        // Temperature is applied on-device (one GPU kernel) so that the per-slot
-        // CPU sampling loop only works on already-divided logits — saving N×256K
-        // float divisions on CPU per decode step.
+        // ── GPU→CPU transfer ─────────────────────────────────────────────
+        // Temperature is applied CPU-side after top-K selection (only ≤40
+        // candidates), avoiding a full-vocab GPU kernel every step.
         let all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
             .to_dtype(DType::F32)
-            .and_then(|t| {
-                let t = (t * (1.0 / TEMPERATURE as f64))?;
-                t.to_vec2::<f32>()
-            })
+            .and_then(|t| t.to_vec2::<f32>())
             .map_err(cerr)
         {
             Ok(v) => v,
@@ -408,6 +403,7 @@ fn batch_prefill_and_assign(
     metrics: &Metrics,
     sample_scratch: &mut Vec<(u32, f32)>,
 ) {
+    tracing::debug!(batch_size = pending.len(), "prefill batch");
     let seqs: Vec<Vec<u32>> = pending.iter().map(|p| p.token_ids.clone()).collect();
     let mut kv_caches: Vec<SlotKvCache> = (0..seqs.len())
         .map(|_| SlotKvCache::new(model.n_layers()))
@@ -430,13 +426,10 @@ fn batch_prefill_and_assign(
     #[cfg(feature = "opentelemetry")]
     metrics.prefill_ms.record(_pf.elapsed().as_millis() as f64, &[]);
 
-    // Transfer all logits to CPU with temperature pre-scaling (consistent with decode path).
+    // Transfer all logits to CPU. Temperature is applied CPU-side after top-K.
     let all_logits_cpu = match all_logits_t
         .to_dtype(DType::F32)
-        .and_then(|t| {
-            let t = (t * (1.0 / TEMPERATURE as f64))?;
-            t.to_vec2::<f32>()
-        })
+        .and_then(|t| t.to_vec2::<f32>())
     {
         Ok(v) => v,
         Err(e) => {
