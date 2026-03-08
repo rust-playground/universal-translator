@@ -558,6 +558,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -881,20 +890,6 @@ checksum = "0f158e3ff0a1b334408dc9fb811cd99b446986f4d8b741bb08f9df1604085ae7"
 dependencies = [
  "lazy_static",
  "num",
-]
-
-[[package]]
-name = "futures"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-io",
- "futures-sink",
- "futures-task",
- "futures-util",
 ]
 
 [[package]]
@@ -3826,7 +3821,6 @@ dependencies = [
  "dirs",
  "lingua",
  "serde_json",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "translator-core",
@@ -3839,15 +3833,15 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
- "futures",
+ "crossbeam-channel",
  "lingua",
  "opentelemetry",
  "rand 0.8.5",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokenizers",
- "tokio",
  "tracing",
 ]
 

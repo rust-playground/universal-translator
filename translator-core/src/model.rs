@@ -147,6 +147,17 @@ impl LoadedGemmaModel {
         self.model_weights.forward_batched(tokens, kv_caches).map_err(cerr)
     }
 
+    /// Batched prefill: N variable-length prompts in one GPU pass.
+    ///
+    /// Wraps [`ModelWeights::forward_prefill_batched`] with `TranslatorError` mapping.
+    pub fn forward_prefill_batched(
+        &self,
+        sequences: &[Vec<u32>],
+        kv_caches: &mut [SlotKvCache],
+    ) -> Result<Tensor, TranslatorError> {
+        self.model_weights.forward_prefill_batched(sequences, kv_caches).map_err(cerr)
+    }
+
     /// Tokenize a prompt string to token IDs.  Does NOT add special tokens —
     /// the caller is responsible for including `<bos>` and chat template tokens
     /// in the prompt string itself.

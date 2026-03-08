@@ -1,20 +1,21 @@
 //! Continuous-batching scheduler for TranslateGemma.
 //!
-//! Maintains a fixed pool of [`N_SLOTS`] decode slots.  When a slot's
-//! sequence emits EOS (or `<end_of_turn>`) it is retired immediately and the
-//! freed slot is filled from the incoming work queue.
+//! Maintains a configurable pool of decode slots.  When a slot's sequence
+//! emits EOS (or `<end_of_turn>`) it is retired immediately and the freed
+//! slot is filled from the incoming work queue.
 //!
-//! Each slot prefills its prompt in one forward pass, then participates in
-//! batched decode via [`LoadedGemmaModel::forward_batched`] — one call per
-//! round processes all active slots simultaneously instead of serially.
+//! **Batched prefill**: each scheduler loop iteration collects all immediately-
+//! available requests and prefills them in a single `forward_prefill_batched`
+//! call instead of N serial single-slot forward passes.
+//!
+//! **Batched decode**: every active slot participates in one `forward_batched`
+//! call per step — one call per round regardless of batch size.
 
-use std::sync::Arc;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use candle_core::{DType, Tensor};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
-use tokio::sync::oneshot;
 
 use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
@@ -76,9 +77,6 @@ fn cerr(e: candle_core::Error) -> TranslatorError {
 /// Maximum output tokens per slot (prompt tokens + generated tokens combined).
 pub const SLOT_CAPACITY: usize = 4096;
 
-/// Number of parallel decode slots in the pool.
-pub const N_SLOTS: usize = 24;
-
 // ── Public request type ───────────────────────────────────────────────────────
 
 /// A single translation request dispatched to the continuous scheduler.
@@ -90,10 +88,17 @@ pub struct InferRequest {
     /// Expected number of output tokens, used to calibrate EOS bias.
     /// Computed by the engine from the original text length (not the prompt length).
     pub expected_output_len: usize,
-    pub reply_tx: oneshot::Sender<Result<String, TranslatorError>>,
+    pub reply_tx: mpsc::Sender<Result<String, TranslatorError>>,
 }
 
-// ── Internal slot ─────────────────────────────────────────────────────────────
+// ── Internal types ────────────────────────────────────────────────────────────
+
+/// Tokenized request waiting to be prefilled.
+struct PendingPrefill {
+    token_ids: Vec<u32>,
+    expected_len: usize,
+    reply_tx: mpsc::Sender<Result<String, TranslatorError>>,
+}
 
 struct Slot {
     decoder: GemmaSlotDecoder,
@@ -103,62 +108,59 @@ struct Slot {
     output_ids: Vec<u32>,
     /// Predicted natural endpoint for EOS bias (decoupled from SLOT_CAPACITY).
     expected_len: usize,
-    reply_tx: oneshot::Sender<Result<String, TranslatorError>>,
+    reply_tx: mpsc::Sender<Result<String, TranslatorError>>,
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
 /// Continuous-batching decode scheduler for TranslateGemma.
 ///
-/// Spawn via [`ContinuousScheduler::run`] — it drives the decode loop until the
-/// work channel closes.
+/// Call [`ContinuousScheduler::run`] on a dedicated OS thread — it drives the
+/// decode loop until the work channel closes.
 pub struct ContinuousScheduler {
     model: Arc<LoadedGemmaModel>,
-    work_rx: mpsc::Receiver<InferRequest>,
+    work_rx: crossbeam_channel::Receiver<InferRequest>,
+    n_slots: usize,
     metrics: Metrics,
 }
 
 impl ContinuousScheduler {
-    pub fn new(model: Arc<LoadedGemmaModel>, work_rx: mpsc::Receiver<InferRequest>) -> Self {
-        Self { model, work_rx, metrics: Metrics::new() }
+    pub fn new(
+        model: Arc<LoadedGemmaModel>,
+        work_rx: crossbeam_channel::Receiver<InferRequest>,
+        n_slots: usize,
+    ) -> Self {
+        Self { model, work_rx, n_slots, metrics: Metrics::new() }
     }
 
-    /// Drive the scheduler to completion.
+    /// Drive the scheduler to completion (blocking).
     ///
-    /// Spawns onto a blocking thread and returns when the work channel closes.
-    pub async fn run(self) {
-        let model = self.model;
-        let mut work_rx = self.work_rx;
-        let metrics = self.metrics;
-
-        tokio::task::spawn_blocking(move || {
-            run_loop(&model, &mut work_rx, &metrics);
-        })
-        .await
-        .ok();
+    /// Call from a dedicated `std::thread::spawn` thread.
+    /// Returns when the work channel closes.
+    pub fn run(self) {
+        run_loop(&self.model, &self.work_rx, self.n_slots, &self.metrics);
     }
 }
 
 // ── Scheduler loop ────────────────────────────────────────────────────────────
 
-fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>, metrics: &Metrics) {
+fn run_loop(
+    model: &LoadedGemmaModel,
+    work_rx: &crossbeam_channel::Receiver<InferRequest>,
+    n_slots: usize,
+    metrics: &Metrics,
+) {
     let eos_id = model.eos_token_id();
-    let mut slots: Vec<Option<Slot>> = (0..N_SLOTS).map(|_| None).collect();
+    let mut slots: Vec<Option<Slot>> = (0..n_slots).map(|_| None).collect();
     let mut rng = SmallRng::from_entropy();
 
     'scheduler: loop {
-        // ── Fill empty slots from the work queue (non-blocking) ───────────
-        for slot in slots.iter_mut() {
-            if slot.is_some() {
-                continue;
-            }
-            match work_rx.try_recv() {
-                Ok(InferRequest { text, expected_output_len, reply_tx }) => {
-                    if let Ok(s) = prefill_slot(model, text, expected_output_len, reply_tx, eos_id, &mut rng, metrics) {
-                        *slot = Some(s);
-                    }
-                }
-                Err(_) => break, // no more queued work
+        // ── Fill empty slots via batched prefill ──────────────────────────
+        let n_empty = slots.iter().filter(|s| s.is_none()).count();
+        if n_empty > 0 {
+            let mut pending = collect_pending(model, work_rx, n_empty, metrics);
+            if !pending.is_empty() {
+                batch_prefill_and_assign(model, &mut pending, &mut slots, eos_id, &mut rng, metrics);
             }
         }
 
@@ -170,17 +172,19 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
         metrics.active_slots.record(active_indices.len() as u64, &[]);
 
         if active_indices.is_empty() {
-            // No active work — block until a new request arrives.
+            // No active work — block until a request arrives (or channel closes).
             match work_rx.recv() {
-                Err(_) => break 'scheduler, // channel closed → clean shutdown
-                Ok(InferRequest { text, expected_output_len, reply_tx }) => {
-                    for slot in slots.iter_mut() {
-                        if slot.is_none() {
-                            if let Ok(s) = prefill_slot(model, text, expected_output_len, reply_tx, eos_id, &mut rng, metrics) {
-                                *slot = Some(s);
-                            }
-                            break;
-                        }
+                Err(_) => break 'scheduler, // all senders dropped → clean shutdown
+                Ok(req) => {
+                    let mut pending = Vec::new();
+                    tokenize_into_pending(model, req, &mut pending, metrics);
+                    while let Ok(r) = work_rx.try_recv() {
+                        tokenize_into_pending(model, r, &mut pending, metrics);
+                    }
+                    if !pending.is_empty() {
+                        batch_prefill_and_assign(
+                            model, &mut pending, &mut slots, eos_id, &mut rng, metrics,
+                        );
                     }
                 }
             }
@@ -204,16 +208,13 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
                 let msg = e.to_string();
                 for &si in &active_indices {
                     let finished = slots[si].take().unwrap();
-                    let _ = finished
-                        .reply_tx
-                        .send(Err(TranslatorError::Model(msg.clone())));
+                    let _ = finished.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
                 }
                 continue;
             }
         };
 
-        // ── Temporarily move KV caches out so we can pass &mut [SlotKvCache]
-        //    while still holding the rest of each Slot by index ─────────────
+        // ── Temporarily move KV caches out ───────────────────────────────
         let mut batch_kv: Vec<SlotKvCache> = active_indices
             .iter()
             .map(|&i| {
@@ -233,7 +234,6 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
         let all_logits_t = match forward_result {
             Ok(t) => t,
             Err(e) => {
-                // Restore KV caches before retiring slots
                 for (bi, &si) in active_indices.iter().enumerate() {
                     slots[si].as_mut().unwrap().decoder.kv_cache =
                         std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
@@ -241,9 +241,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
                 let msg = e.to_string();
                 for &si in &active_indices {
                     let finished = slots[si].take().unwrap();
-                    let _ = finished
-                        .reply_tx
-                        .send(Err(TranslatorError::Model(msg.clone())));
+                    let _ = finished.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
                 }
                 continue;
             }
@@ -255,7 +253,7 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
                 std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
         }
 
-        // ── Single GPU→CPU transfer: all slot logits at once ──────────────
+        // ── Single GPU→CPU transfer ───────────────────────────────────────
         let all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
             .to_dtype(DType::F32)
             .and_then(|t| t.to_vec2::<f32>())
@@ -314,66 +312,127 @@ fn run_loop(model: &LoadedGemmaModel, work_rx: &mut mpsc::Receiver<InferRequest>
     }
 }
 
-// ── Slot initialisation ───────────────────────────────────────────────────────
+// ── Helper: collect pending prefill items ────────────────────────────────────
 
-/// Prefill the prompt, sample the first output token, and construct a [`Slot`].
-///
-/// On any error the error is sent through `reply_tx` before returning `Err(())`.
-#[cfg_attr(not(feature = "opentelemetry"), allow(unused_variables))]
-#[tracing::instrument(skip(model, text, reply_tx, rng, metrics), fields(prompt_len = text.len()))]
-fn prefill_slot(
+/// Non-blocking drain of up to `limit` items from the work queue.
+/// Tokenizes each request; on tokenization failure, sends error and skips.
+fn collect_pending(
     model: &LoadedGemmaModel,
-    text: String,
-    expected_output_len: usize,
-    reply_tx: oneshot::Sender<Result<String, TranslatorError>>,
-    eos_token_id: u32,
+    work_rx: &crossbeam_channel::Receiver<InferRequest>,
+    limit: usize,
+    metrics: &Metrics,
+) -> Vec<PendingPrefill> {
+    let mut pending = Vec::new();
+    for _ in 0..limit {
+        match work_rx.try_recv() {
+            Ok(req) => tokenize_into_pending(model, req, &mut pending, metrics),
+            Err(_) => break,
+        }
+    }
+    pending
+}
+
+/// Tokenize a single request and push into `pending`, or send error on failure.
+#[cfg_attr(not(feature = "opentelemetry"), allow(unused_variables))]
+fn tokenize_into_pending(
+    model: &LoadedGemmaModel,
+    req: InferRequest,
+    pending: &mut Vec<PendingPrefill>,
+    metrics: &Metrics,
+) {
+    match model.tokenize(&req.text) {
+        Ok(token_ids) => {
+            #[cfg(feature = "opentelemetry")]
+            metrics.prompt_tokens.record(token_ids.len() as u64, &[]);
+            pending.push(PendingPrefill {
+                token_ids,
+                expected_len: req.expected_output_len,
+                reply_tx: req.reply_tx,
+            });
+        }
+        Err(e) => {
+            let _ = req.reply_tx.send(Err(e));
+        }
+    }
+}
+
+// ── Batched prefill ───────────────────────────────────────────────────────────
+
+/// Prefill all `pending` requests in one GPU call, sample first tokens, and
+/// assign the resulting [`Slot`]s into empty entries of `slots`.
+#[cfg_attr(not(feature = "opentelemetry"), allow(unused_variables))]
+fn batch_prefill_and_assign(
+    model: &LoadedGemmaModel,
+    pending: &mut Vec<PendingPrefill>,
+    slots: &mut [Option<Slot>],
+    eos_id: u32,
     rng: &mut SmallRng,
     metrics: &Metrics,
-) -> Result<Slot, ()> {
-    let token_ids = match model.tokenize(&text) {
-        Ok(ids) => ids,
-        Err(e) => {
-            let _ = reply_tx.send(Err(e));
-            return Err(());
-        }
-    };
-
-    #[cfg(feature = "opentelemetry")]
-    metrics.prompt_tokens.record(token_ids.len() as u64, &[]);
-
-    let expected_len = expected_output_len;
-
-    let mut decoder = model.new_slot_decoder();
+) {
+    let seqs: Vec<Vec<u32>> = pending.iter().map(|p| p.token_ids.clone()).collect();
+    let mut kv_caches: Vec<SlotKvCache> = (0..seqs.len())
+        .map(|_| SlotKvCache::new(model.n_layers()))
+        .collect();
 
     #[cfg(feature = "opentelemetry")]
     let _pf = std::time::Instant::now();
-    let prefill_result = decoder.prefill(model, &token_ids);
-    #[cfg(feature = "opentelemetry")]
-    metrics.prefill_ms.record(_pf.elapsed().as_millis() as f64, &[]);
 
-    let mut logits = match prefill_result {
-        Ok(l) => l,
+    let all_logits_t = match model.forward_prefill_batched(&seqs, &mut kv_caches) {
+        Ok(t) => t,
         Err(e) => {
-            let _ = reply_tx.send(Err(e));
-            return Err(());
+            let msg = e.to_string();
+            for pb in pending.drain(..) {
+                let _ = pb.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
+            }
+            return;
         }
     };
 
-    apply_decoding_filters(&mut logits, &[]);
-    apply_length_bias(&mut logits, eos_token_id, 0, expected_len);
+    #[cfg(feature = "opentelemetry")]
+    metrics.prefill_ms.record(_pf.elapsed().as_millis() as f64, &[]);
 
-    let first_token = sample_token(&mut logits, rng);
+    // Transfer all logits to CPU in one call.
+    let all_logits_cpu = match all_logits_t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.to_vec2::<f32>())
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            for pb in pending.drain(..) {
+                let _ = pb.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
+            }
+            return;
+        }
+    };
 
-    if first_token == eos_token_id {
-        let _ = reply_tx.send(Ok(String::new()));
-        return Err(());
+    let mut kv_iter = kv_caches.into_iter();
+    for (pb, mut logits) in pending.drain(..).zip(all_logits_cpu) {
+        let kv = kv_iter.next().unwrap();
+
+        apply_decoding_filters(&mut logits, &[]);
+        apply_length_bias(&mut logits, eos_id, 0, pb.expected_len);
+        let first_token = sample_token(&mut logits, rng);
+
+        if first_token == eos_id {
+            let _ = pb.reply_tx.send(Ok(String::new()));
+            continue;
+        }
+
+        let decoder = GemmaSlotDecoder::new(kv, model.device().clone());
+
+        // Assign to the first empty slot.
+        for slot in slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(Slot {
+                    decoder,
+                    current_token: first_token,
+                    output_ids: vec![first_token],
+                    expected_len: pb.expected_len,
+                    reply_tx: pb.reply_tx,
+                });
+                break;
+            }
+        }
     }
-
-    Ok(Slot {
-        decoder,
-        current_token: first_token,
-        output_ids: vec![first_token],
-        expected_len,
-        reply_tx,
-    })
 }

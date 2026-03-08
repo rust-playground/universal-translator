@@ -20,9 +20,9 @@ pub struct DetectLanguageArgs {
 }
 
 impl DetectLanguageArgs {
-    pub async fn run(self, models_dir: &Path) -> Result<()> {
+    pub fn run(self, models_dir: &Path) -> Result<()> {
         let engine = TranslationEngine::new(models_dir);
-        let result = engine.detect_language_full(&self.text).await?;
+        let result = engine.detect_language_full(&self.text)?;
 
         match self.output {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),

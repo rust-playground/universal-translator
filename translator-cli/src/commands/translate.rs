@@ -30,7 +30,7 @@ pub struct TranslateArgs {
 }
 
 impl TranslateArgs {
-    pub async fn run(self, models_dir: &Path) -> Result<()> {
+    pub fn run(self, models_dir: &Path) -> Result<()> {
         let engine = TranslationEngine::new(models_dir);
         let batch = TranslationBatch {
             texts: self.texts,
@@ -38,7 +38,7 @@ impl TranslateArgs {
             source_language: self.source_language,
         };
 
-        let result = engine.translate_batch(batch).await?;
+        let result = engine.translate_batch(batch)?;
 
         match self.output {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),

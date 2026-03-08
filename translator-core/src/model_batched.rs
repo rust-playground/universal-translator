@@ -52,8 +52,10 @@ fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         return Ok(xs);
     }
     let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
-    // Cat n_rep copies along the seq_len dim then reshape — equivalent to head repetition.
-    Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+    xs.unsqueeze(2)?
+        .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
+        .contiguous()?
+        .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
 }
 
 // ── QMatMul wrapper ───────────────────────────────────────────────────────────
@@ -155,6 +157,30 @@ impl RotaryEmbedding {
         let sin = self.sin.index_select(&positions_t, 0)?.reshape((n, 1, 1, half))?;
 
         // Manual rotate-half: broadcast cos/sin [N,1,1,half] → [N, n_heads, 1, half]
+        let rope = |t: &Tensor| -> Result<Tensor> {
+            let t1 = t.narrow(D::Minus1, 0, half)?;
+            let t2 = t.narrow(D::Minus1, half, half)?;
+            let new_t1 = t1.broadcast_mul(&cos)?.sub(&t2.broadcast_mul(&sin)?)?;
+            let new_t2 = t1.broadcast_mul(&sin)?.add(&t2.broadcast_mul(&cos)?)?;
+            Tensor::cat(&[new_t1, new_t2], D::Minus1)
+        };
+        Ok((rope(q)?, rope(k)?))
+    }
+
+    /// RoPE for batched prefill: all N sequences start at position 0.
+    ///
+    /// `q`: `[N, n_heads, max_len, head_dim]`, `k`: `[N, n_kv_heads, max_len, head_dim]`
+    /// Returns tensors of the same shape.
+    fn apply_rotary_emb_prefill(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        max_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let half = q.dim(D::Minus1)? / 2;
+        // All sequences share positions 0..max_len — compute cos/sin once.
+        let cos = self.cos.narrow(0, 0, max_len)?.reshape((1usize, 1usize, max_len, half))?;
+        let sin = self.sin.narrow(0, 0, max_len)?.reshape((1usize, 1usize, max_len, half))?;
         let rope = |t: &Tensor| -> Result<Tensor> {
             let t1 = t.narrow(D::Minus1, 0, half)?;
             let t2 = t.narrow(D::Minus1, half, half)?;
@@ -415,6 +441,102 @@ impl LayerWeights {
             attn_output.transpose(1, 2)?.reshape((n, seq_len, self.q_dim))?;
         self.attention_wo.forward(&attn_output)
     }
+
+    /// Batched prefill attention for N sequences of variable length.
+    ///
+    /// `x`:        `[N, max_len, dim]` — padded input (real tokens followed by zeros)
+    /// `real_lens`: number of real tokens per sequence
+    ///
+    /// Builds per-sequence causal+padding masks, runs batched SDPA, and stores
+    /// the unpadded KV slices (0..real_lens[b]) into `kv_caches[b].layers[layer_idx]`.
+    ///
+    /// Returns `[N, max_len, dim]`.
+    fn forward_attn_prefill_batched(
+        &self,
+        x: &Tensor,
+        kv_caches: &mut [SlotKvCache],
+        layer_idx: usize,
+        real_lens: &[usize],
+    ) -> Result<Tensor> {
+        let _enter = self.span_attn.enter();
+        let (n, max_len, _) = x.dims3()?;
+        let device = x.device();
+
+        // Project Q/K/V: [N, max_len, dim] → [N, n_head/n_kv_head, max_len, head_dim]
+        let q = self.attention_wq.forward(x)?;
+        let k = self.attention_wk.forward(x)?;
+        let v = self.attention_wv.forward(x)?;
+
+        let q = q.reshape((n, max_len, self.n_head, self.head_dim))?.transpose(1, 2)?;
+        let k = k.reshape((n, max_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+        let v = v.reshape((n, max_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+
+        let q = self.attention_q_norm.forward(&q.contiguous()?)?;
+        let k = self.attention_k_norm.forward(&k.contiguous()?)?;
+
+        let (q, k) = self.rotary_embedding.apply_rotary_emb_prefill(&q, &k, max_len)?;
+
+        // Clone K/V before GQA expansion — needed for cache storage (without extra head copies).
+        let k_for_cache = k.clone();
+        let v_for_cache = v.clone();
+
+        // GQA: expand kv heads to full head count
+        let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
+        let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
+
+        // Build per-sequence causal+padding mask: [N, 1, max_len, max_len]
+        // mask[b, 0, i, j] = 1 iff i < real_lens[b] AND j <= i (AND sliding window if active)
+        let mut mask_data = vec![0u32; n * max_len * max_len];
+        for (b, &real_len) in real_lens.iter().enumerate() {
+            let base = b * max_len * max_len;
+            for i in 0..real_len {
+                let sliding_start = match self.sliding_window_size {
+                    Some(w) => i.saturating_sub(w.saturating_sub(1)),
+                    None => 0,
+                };
+                for j in sliding_start..=i {
+                    mask_data[base + i * max_len + j] = 1;
+                }
+            }
+            // Padding rows: allow attending to position 0 to prevent all-masked
+            // softmax (NaN). Output at padding positions is unused (discarded in
+            // last-real-token extraction), so this garbage-but-finite value is harmless.
+            for i in real_len..max_len {
+                mask_data[base + i * max_len] = 1; // attend to position 0 only
+            }
+        }
+        let mask = Tensor::from_slice(&mask_data, (n, 1usize, max_len, max_len), device)?;
+
+        // Scaled dot-product attention
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        // attn_weights: [N, n_head, max_len, max_len]
+
+        let mask_bc = mask.broadcast_as(attn_weights.shape())?;
+        let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
+        attn_weights = mask_bc.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
+
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.matmul(&v)?;
+        // attn_output: [N, n_head, max_len, head_dim]
+
+        let attn_output = attn_output.transpose(1, 2)?.reshape((n, max_len, self.q_dim))?;
+        let out = self.attention_wo.forward(&attn_output)?;
+
+        // Store unpadded K/V slices into per-slot caches.
+        // Correctness invariant: only real token KV (0..real_lens[b]) is stored.
+        for b in 0..n {
+            let real_len = real_lens[b];
+            // k_for_cache.i(b): [n_kv_head, max_len, head_dim]
+            // narrow(dim=1, 0, real_len): [n_kv_head, real_len, head_dim]
+            // unsqueeze(0):               [1, n_kv_head, real_len, head_dim]
+            let k_b = k_for_cache.i(b)?.narrow(1, 0, real_len)?.unsqueeze(0)?;
+            let v_b = v_for_cache.i(b)?.narrow(1, 0, real_len)?.unsqueeze(0)?;
+            kv_caches[b].layers[layer_idx] = Some((k_b, v_b));
+        }
+
+        Ok(out)
+    }
 }
 
 // ── Model weights ─────────────────────────────────────────────────────────────
@@ -423,6 +545,7 @@ impl LayerWeights {
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     embedding_length: usize,
+    device: Device,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     output: QMatMul,
@@ -587,6 +710,7 @@ impl ModelWeights {
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             embedding_length,
+            device: device.clone(),
             layers,
             norm,
             output: QMatMul::from_qtensor(output)?,
@@ -598,6 +722,81 @@ impl ModelWeights {
     /// Return the number of transformer layers (= number of KV cache entries per slot).
     pub fn n_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Return the device the model weights are on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Batched prefill: process N variable-length prompts in a single GPU pass.
+    ///
+    /// - `sequences`:  token ID sequences (variable length, start from position 0)
+    /// - `kv_caches`:  one fresh [`SlotKvCache`] per sequence (seq_len=0 on entry)
+    ///
+    /// Populates each `kv_caches[b]` with the real-token KV and sets
+    /// `kv_caches[b].seq_len = sequences[b].len()`.
+    ///
+    /// Returns `[N, vocab_size]` logits — one row per sequence (last real token).
+    pub fn forward_prefill_batched(
+        &self,
+        sequences: &[Vec<u32>],
+        kv_caches: &mut [SlotKvCache],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let n = sequences.len();
+        assert_eq!(n, kv_caches.len(), "sequences and kv_caches must have the same length");
+
+        let real_lens: Vec<usize> = sequences.iter().map(|s| s.len()).collect();
+        let max_len = real_lens.iter().copied().max().unwrap_or(1);
+
+        // Build padded token tensor [N, max_len] — pad with token 0.
+        let mut token_data = vec![0u32; n * max_len];
+        for (b, seq) in sequences.iter().enumerate() {
+            for (j, &tok) in seq.iter().enumerate() {
+                token_data[b * max_len + j] = tok;
+            }
+        }
+        let tokens = Tensor::from_slice(&token_data, (n, max_len), &self.device)?;
+
+        // Embed and scale: [N, max_len, dim]
+        let mut layer_in = self.tok_embeddings.forward(&tokens)?;
+        layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let residual = &layer_in;
+            let x = layer.attention_norm.forward(&layer_in)?;
+            let x = layer.forward_attn_prefill_batched(&x, kv_caches, layer_idx, &real_lens)?;
+            let x = layer.post_attention_norm.forward(&x)?;
+            let x = (x + residual)?;
+
+            let _enter = layer.span_mlp.enter();
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp.forward(&x)?;
+            let x = layer.post_ffn_norm.forward(&x)?;
+            let x = (x + residual)?;
+            drop(_enter);
+
+            layer_in = x;
+        }
+
+        // Set seq_len on all caches.
+        for (b, kv) in kv_caches.iter_mut().enumerate() {
+            kv.seq_len = real_lens[b];
+        }
+
+        // Extract last real token hidden state per sequence, stack → [N, dim].
+        let _enter = self.span_output.enter();
+        let mut last_hidden: Vec<Tensor> = Vec::with_capacity(n);
+        for (b, &real_len) in real_lens.iter().enumerate() {
+            let pos = real_len.saturating_sub(1);
+            last_hidden.push(layer_in.i((b, pos))?);
+        }
+        let hidden = Tensor::stack(&last_hidden, 0)?; // [N, dim]
+        let hidden = self.norm.forward(&hidden)?;
+        let output = self.output.forward(&hidden)?; // [N, vocab_size]
+        Ok(output)
     }
 
     /// Single-slot forward pass (prefill or single-slot decode).

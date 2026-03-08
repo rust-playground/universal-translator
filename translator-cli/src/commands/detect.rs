@@ -20,9 +20,9 @@ pub struct DetectArgs {
 }
 
 impl DetectArgs {
-    pub async fn run(self, models_dir: &Path) -> Result<()> {
+    pub fn run(self, models_dir: &Path) -> Result<()> {
         let engine = TranslationEngine::new(models_dir);
-        let detected = engine.detect_language(&self.text).await?;
+        let detected = engine.detect_language(&self.text)?;
 
         match self.output {
             OutputFormat::Json => println!(

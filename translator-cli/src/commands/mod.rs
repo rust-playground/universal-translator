@@ -17,11 +17,11 @@ pub enum Commands {
 }
 
 impl Commands {
-    pub async fn run(self, models_dir: &Path) -> Result<()> {
+    pub fn run(self, models_dir: &Path) -> Result<()> {
         match self {
-            Commands::Translate(args) => args.run(models_dir).await,
-            Commands::Detect(args) => args.run(models_dir).await,
-            Commands::DetectLanguage(args) => args.run(models_dir).await,
+            Commands::Translate(args) => args.run(models_dir),
+            Commands::Detect(args) => args.run(models_dir),
+            Commands::DetectLanguage(args) => args.run(models_dir),
             Commands::Languages(args) => args.run(),
         }
     }

@@ -17,10 +17,10 @@ candle-nn           = { workspace = true }
 tokenizers          = { workspace = true }
 serde_json          = { workspace = true }
 lingua              = { workspace = true }
-tokio               = { workspace = true, features = ["rt", "sync"] }
 thiserror           = { workspace = true }
 serde               = { workspace = true }
 tracing             = { workspace = true }
 rand                = { version = "0.8", features = ["small_rng"] }
-futures             = { workspace = true }
+crossbeam-channel   = "0.5"
+rayon               = "1"
 opentelemetry       = { workspace = true, optional = true }

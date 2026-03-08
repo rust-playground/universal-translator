@@ -19,4 +19,7 @@ pub enum TranslatorError {
 
     #[error("Model error: {0}")]
     Model(String),
+
+    #[error("Service overloaded: {0}")]
+    ServiceUnavailable(String),
 }

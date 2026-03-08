@@ -16,10 +16,10 @@ pub async fn translate(
         )));
     }
 
-    let result = state
-        .engine
-        .translate_batch(batch)
+    let engine = state.engine.clone();
+    let result = tokio::task::spawn_blocking(move || engine.translate_batch(batch))
         .await
+        .map_err(|_| ApiError(TranslatorError::TranslationFailed("scheduler panicked".into())))?
         .map_err(|e| {
             #[cfg(feature = "opentelemetry")]
             {
@@ -31,6 +31,7 @@ pub async fn translate(
                     TranslatorError::TranslationFailed(_) => "translation_failed",
                     TranslatorError::Io(_) => "io",
                     TranslatorError::Model(_) => "model",
+                    TranslatorError::ServiceUnavailable(_) => "service_unavailable",
                 };
                 state.error_ctr.add(1, &[KeyValue::new("error_type", kind)]);
             }

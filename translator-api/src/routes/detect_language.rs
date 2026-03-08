@@ -25,6 +25,10 @@ pub async fn detect_language(
     State(state): State<AppState>,
     Json(req): Json<DetectLanguageRequest>,
 ) -> Result<Json<LanguageDetectionResult>, ApiError> {
-    let result = state.engine.detect_language_full(&req.text).await?;
+    let engine = state.engine.clone();
+    let text = req.text.clone();
+    let result = tokio::task::spawn_blocking(move || engine.detect_language_full(&text))
+        .await
+        .map_err(|_| ApiError(translator_core::error::TranslatorError::TranslationFailed("detect panicked".into())))??;
     Ok(Json(result))
 }

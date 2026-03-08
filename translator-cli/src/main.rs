@@ -23,8 +23,7 @@ struct Cli {
     command: commands::Commands,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .with(tracing_subscriber::fmt::layer())
@@ -32,5 +31,5 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let models_dir = cli.models_dir.unwrap_or_else(default_models_dir);
-    cli.command.run(&models_dir).await
+    cli.command.run(&models_dir)
 }
