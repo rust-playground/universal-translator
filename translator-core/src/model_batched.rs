@@ -339,6 +339,7 @@ impl LayerWeights {
         layer_idx: usize,
         positions: &[usize],
         max_kv_len: usize,
+        mask_workspace: &mut Vec<u32>,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let n = positions.len();
@@ -363,8 +364,11 @@ impl LayerWeights {
         let device = x.device();
         let mut k_list: Vec<Tensor> = Vec::with_capacity(n);
         let mut v_list: Vec<Tensor> = Vec::with_capacity(n);
-        // Single flat buffer for all slot masks — filled slot-by-slot, uploaded once.
-        let mut mask_buf = vec![0u32; n * total_kv_len];
+        // Reuse caller-provided flat buffer — avoids 26 heap allocs per decode step.
+        let needed = n * total_kv_len;
+        mask_workspace.resize(needed, 0);
+        mask_workspace[..needed].fill(0);
+        let mask_buf: &mut [u32] = &mut mask_workspace[..needed];
 
         for i in 0..n {
             let pos_i = positions[i]; // = seq_len BEFORE this step
@@ -418,7 +422,7 @@ impl LayerWeights {
         let k_all = Tensor::cat(&k_list, 0)?; // [N, n_kv_head, total_kv_len, head_dim]
         let v_all = Tensor::cat(&v_list, 0)?;
         // Upload the single flat mask buffer as one tensor — no per-slot alloc or cat.
-        let mask_all = Tensor::from_slice(&mask_buf, (n, 1usize, 1usize, total_kv_len), device)?; // [N, 1, 1, total_kv_len]
+        let mask_all = Tensor::from_slice(mask_buf, (n, 1usize, 1usize, total_kv_len), device)?; // [N, 1, 1, total_kv_len]
 
         // GQA: expand kv heads to match query head count
         let k_all = repeat_kv(k_all, self.n_head / self.n_kv_head)?;
@@ -551,6 +555,12 @@ pub struct ModelWeights {
     output: QMatMul,
     span: tracing::Span,
     span_output: tracing::Span,
+    /// Reusable mask buffer for `forward_attn_batched` — avoids 26 heap
+    /// allocations per decode step.  Access is single-threaded (scheduler
+    /// thread only); `RefCell` is used instead of `Mutex` for zero overhead.
+    /// SAFETY: the `unsafe impl Sync for LoadedGemmaModel` in model.rs
+    /// guarantees that only one thread calls forward methods at a time.
+    mask_workspace: std::cell::RefCell<Vec<u32>>,
 }
 
 impl ModelWeights {
@@ -716,6 +726,7 @@ impl ModelWeights {
             output: QMatMul::from_qtensor(output)?,
             span,
             span_output,
+            mask_workspace: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -875,6 +886,10 @@ impl ModelWeights {
         layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;
         // layer_in: [N, 1, dim]
 
+        // Borrow the shared mask workspace for the entire layer loop — avoids
+        // 26 Vec allocations per decode step (one per attention layer).
+        let mut mask_workspace = self.mask_workspace.borrow_mut();
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let residual = &layer_in;
             let x = layer.attention_norm.forward(&layer_in)?;
@@ -884,6 +899,7 @@ impl ModelWeights {
                 layer_idx,
                 &positions,
                 max_kv_len,
+                &mut mask_workspace,
             )?;
             let x = layer.post_attention_norm.forward(&x)?;
             let x = (x + residual)?;

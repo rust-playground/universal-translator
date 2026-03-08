@@ -22,12 +22,15 @@ use crate::model::LoadedGemmaModel;
 use crate::model_batched::SlotKvCache;
 use crate::scheduler::decoder::GemmaSlotDecoder;
 use crate::scheduler::sampling::{
-    apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token,
+    apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token, TEMPERATURE,
+    TOP_K,
 };
 
 struct Metrics {
     #[cfg(feature = "opentelemetry")]
     active_slots: opentelemetry::metrics::Gauge<u64>,
+    #[cfg(feature = "opentelemetry")]
+    slot_utilisation_pct: opentelemetry::metrics::Gauge<u64>,
     #[cfg(feature = "opentelemetry")]
     decode_forward_ms: opentelemetry::metrics::Histogram<f64>,
     #[cfg(feature = "opentelemetry")]
@@ -47,6 +50,11 @@ impl Metrics {
         Self {
             #[cfg(feature = "opentelemetry")]
             active_slots: meter.u64_gauge("translator.scheduler.active_slots").build(),
+            #[cfg(feature = "opentelemetry")]
+            slot_utilisation_pct: meter
+                .u64_gauge("translator.scheduler.slot_utilisation_pct")
+                .with_description("Active slot utilisation as integer percentage (0-100)")
+                .build(),
             #[cfg(feature = "opentelemetry")]
             decode_forward_ms: meter
                 .f64_histogram("translator.scheduler.decode_forward_ms")
@@ -150,9 +158,17 @@ fn run_loop(
     n_slots: usize,
     metrics: &Metrics,
 ) {
+    tracing::info!(n_slots, "ContinuousScheduler started");
+
     let eos_id = model.eos_token_id();
     let mut slots: Vec<Option<Slot>> = (0..n_slots).map(|_| None).collect();
     let mut rng = SmallRng::from_entropy();
+
+    // Pre-allocated arena buffers — reused every iteration to avoid hot-path allocs.
+    let mut active_indices: Vec<usize> = Vec::with_capacity(n_slots);
+    let mut tokens_vec: Vec<u32> = Vec::with_capacity(n_slots);
+    // Scratch buffer for sample_token — avoids one Vec alloc per token generated.
+    let mut sample_scratch: Vec<(u32, f32)> = Vec::with_capacity(TOP_K + 1);
 
     'scheduler: loop {
         // ── Fill empty slots via batched prefill ──────────────────────────
@@ -160,16 +176,28 @@ fn run_loop(
         if n_empty > 0 {
             let mut pending = collect_pending(model, work_rx, n_empty, metrics);
             if !pending.is_empty() {
-                batch_prefill_and_assign(model, &mut pending, &mut slots, eos_id, &mut rng, metrics);
+                batch_prefill_and_assign(
+                    model, &mut pending, &mut slots, eos_id, &mut rng, metrics, &mut sample_scratch,
+                );
             }
         }
 
-        // ── Collect active slot indices ───────────────────────────────────
-        let active_indices: Vec<usize> =
-            slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|_| i)).collect();
+        // ── Collect active slot indices (reuse pre-allocated vec) ─────────
+        active_indices.clear();
+        for (i, s) in slots.iter().enumerate() {
+            if s.is_some() {
+                active_indices.push(i);
+            }
+        }
+
+        let n_active = active_indices.len();
 
         #[cfg(feature = "opentelemetry")]
-        metrics.active_slots.record(active_indices.len() as u64, &[]);
+        {
+            metrics.active_slots.record(n_active as u64, &[]);
+            let utilisation = (n_active as f64 / n_slots as f64 * 100.0) as u64;
+            metrics.slot_utilisation_pct.record(utilisation, &[]);
+        }
 
         if active_indices.is_empty() {
             // No active work — block until a request arrives (or channel closes).
@@ -183,7 +211,13 @@ fn run_loop(
                     }
                     if !pending.is_empty() {
                         batch_prefill_and_assign(
-                            model, &mut pending, &mut slots, eos_id, &mut rng, metrics,
+                            model,
+                            &mut pending,
+                            &mut slots,
+                            eos_id,
+                            &mut rng,
+                            metrics,
+                            &mut sample_scratch,
                         );
                     }
                 }
@@ -191,16 +225,15 @@ fn run_loop(
             continue;
         }
 
-        let n = active_indices.len();
-        tracing::debug!(active_slots = n, "batched decode pass");
+        tracing::debug!(active_slots = n_active, "batched decode pass");
 
-        // ── Build [N, 1] token tensor ─────────────────────────────────────
-        let tokens_vec: Vec<u32> = active_indices
-            .iter()
-            .map(|&i| slots[i].as_ref().unwrap().current_token)
-            .collect();
+        // ── Build [N, 1] token tensor (reuse pre-allocated vec) ──────────
+        tokens_vec.clear();
+        for &i in &active_indices {
+            tokens_vec.push(slots[i].as_ref().unwrap().current_token);
+        }
 
-        let tokens_t = match Tensor::from_slice(&tokens_vec, (n, 1), model.device())
+        let tokens_t = match Tensor::from_slice(&tokens_vec, (n_active, 1), model.device())
             .map_err(cerr)
         {
             Ok(t) => t,
@@ -253,10 +286,16 @@ fn run_loop(
                 std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
         }
 
-        // ── Single GPU→CPU transfer ───────────────────────────────────────
+        // ── GPU→CPU transfer with temperature pre-scaling ────────────────
+        // Temperature is applied on-device (one GPU kernel) so that the per-slot
+        // CPU sampling loop only works on already-divided logits — saving N×256K
+        // float divisions on CPU per decode step.
         let all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
             .to_dtype(DType::F32)
-            .and_then(|t| t.to_vec2::<f32>())
+            .and_then(|t| {
+                let t = (t * (1.0 / TEMPERATURE as f64))?;
+                t.to_vec2::<f32>()
+            })
             .map_err(cerr)
         {
             Ok(v) => v,
@@ -272,9 +311,8 @@ fn run_loop(
         };
 
         // ── Per-slot: apply filters, sample, retire if EOS ────────────────
-        for (batch_idx, &slot_idx) in active_indices.iter().enumerate() {
-            let mut logits = all_logits_cpu[batch_idx].clone();
-
+        // `all_logits_cpu.into_iter()` takes ownership — no per-slot Vec clone.
+        for (mut logits, &slot_idx) in all_logits_cpu.into_iter().zip(active_indices.iter()) {
             let slot = slots[slot_idx].as_mut().unwrap();
 
             apply_decoding_filters(&mut logits, &slot.output_ids);
@@ -290,7 +328,7 @@ fn run_loop(
                 }
             }
 
-            let tok = sample_token(&mut logits, &mut rng);
+            let tok = sample_token(&mut logits, &mut rng, &mut sample_scratch);
             let at_capacity = slot.output_ids.len() + 1 >= SLOT_CAPACITY;
 
             if tok == eos_id || at_capacity {
@@ -368,6 +406,7 @@ fn batch_prefill_and_assign(
     eos_id: u32,
     rng: &mut SmallRng,
     metrics: &Metrics,
+    sample_scratch: &mut Vec<(u32, f32)>,
 ) {
     let seqs: Vec<Vec<u32>> = pending.iter().map(|p| p.token_ids.clone()).collect();
     let mut kv_caches: Vec<SlotKvCache> = (0..seqs.len())
@@ -391,10 +430,13 @@ fn batch_prefill_and_assign(
     #[cfg(feature = "opentelemetry")]
     metrics.prefill_ms.record(_pf.elapsed().as_millis() as f64, &[]);
 
-    // Transfer all logits to CPU in one call.
+    // Transfer all logits to CPU with temperature pre-scaling (consistent with decode path).
     let all_logits_cpu = match all_logits_t
         .to_dtype(DType::F32)
-        .and_then(|t| t.to_vec2::<f32>())
+        .and_then(|t| {
+            let t = (t * (1.0 / TEMPERATURE as f64))?;
+            t.to_vec2::<f32>()
+        })
     {
         Ok(v) => v,
         Err(e) => {
@@ -412,7 +454,7 @@ fn batch_prefill_and_assign(
 
         apply_decoding_filters(&mut logits, &[]);
         apply_length_bias(&mut logits, eos_id, 0, pb.expected_len);
-        let first_token = sample_token(&mut logits, rng);
+        let first_token = sample_token(&mut logits, rng, sample_scratch);
 
         if first_token == eos_id {
             let _ = pb.reply_tx.send(Ok(String::new()));

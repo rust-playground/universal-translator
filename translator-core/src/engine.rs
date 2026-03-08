@@ -156,7 +156,7 @@ pub struct TranslationEngine {
     worker: Arc<OnceLock<crossbeam_channel::Sender<InferRequest>>>,
     /// Number of parallel decode slots.
     n_slots: usize,
-    /// Bounded channel capacity (n_slots * 4).
+    /// Bounded channel capacity — respects QUEUE_CAPACITY env var.
     queue_capacity: usize,
     #[cfg(feature = "opentelemetry")]
     requests: opentelemetry::metrics::Counter<u64>,
@@ -172,7 +172,12 @@ impl TranslationEngine {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(24);
-        let queue_capacity = n_slots * 4;
+        // Default: max(n_slots*4, 512) so that "all" language batches
+        // (e.g. 9 texts × 55 languages = 495 items) don't instant-reject.
+        let queue_capacity: usize = std::env::var("QUEUE_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| (n_slots * 4).max(512));
 
         #[cfg(feature = "opentelemetry")]
         let meter = opentelemetry::global::meter("translator");
