@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -148,14 +148,8 @@ pub fn supported_languages() -> Vec<&'static str> {
 /// The central translation engine. Cheap to clone — all heavy state is reference-counted.
 #[derive(Clone)]
 pub struct TranslationEngine {
-    models_dir: PathBuf,
-    /// Cached model reference — populated on first use.
-    model_cache: Arc<OnceLock<Arc<LoadedGemmaModel>>>,
+    worker_tx: crossbeam_channel::Sender<InferRequest>,
     detector: Arc<Detector>,
-    /// Scheduler channel sender — initialised on first use.
-    worker: Arc<OnceLock<crossbeam_channel::Sender<InferRequest>>>,
-    /// Number of parallel decode slots.
-    n_slots: usize,
     /// Bounded channel capacity — respects QUEUE_CAPACITY env var.
     queue_capacity: usize,
     #[cfg(feature = "opentelemetry")]
@@ -167,7 +161,7 @@ pub struct TranslationEngine {
 }
 
 impl TranslationEngine {
-    pub fn new(models_dir: impl AsRef<Path>) -> Self {
+    pub fn new(models_dir: impl AsRef<Path>) -> Result<Self, TranslatorError> {
         let n_slots: usize = std::env::var("MAX_DECODE_SLOTS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -179,14 +173,21 @@ impl TranslationEngine {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| (n_slots * 4).max(512));
 
+        let model_dir = models_dir.as_ref().join("translategemma-4b");
+        tracing::info!(?model_dir, "Loading TranslateGemma model");
+        let model = Arc::new(LoadedGemmaModel::load(&model_dir)?);
+
+        let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
+        std::thread::Builder::new()
+            .name("translator-scheduler".into())
+            .spawn(move || ContinuousScheduler::new(model, rx, n_slots).run())
+            .expect("failed to spawn translator-scheduler thread");
+
         #[cfg(feature = "opentelemetry")]
         let meter = opentelemetry::global::meter("translator");
-        Self {
-            models_dir: models_dir.as_ref().to_path_buf(),
-            model_cache: Arc::new(OnceLock::new()),
+        Ok(Self {
+            worker_tx: tx,
             detector: Arc::new(Detector::new()),
-            worker: Arc::new(OnceLock::new()),
-            n_slots,
             queue_capacity,
             #[cfg(feature = "opentelemetry")]
             requests: meter.u64_counter("translator.translation.requests").build(),
@@ -199,7 +200,7 @@ impl TranslationEngine {
                     100., 250., 500., 1000., 2000., 5000., 10000., 30000., 60000., 120000.,
                 ])
                 .build(),
-        }
+        })
     }
 
     /// Detect the language of `text`, returning a lowercase ISO 639-1 code.
@@ -305,7 +306,7 @@ impl TranslationEngine {
         // Phase 3 — dispatch work items to the continuous scheduler.
         if !work_texts.is_empty() {
             let work_item_count = work_texts.len();
-            let tx = self.get_or_start_worker();
+            let tx = &self.worker_tx;
 
             // Backpressure check: reject entire batch if insufficient queue capacity.
             let available = self.queue_capacity - tx.len();
@@ -315,26 +316,36 @@ impl TranslationEngine {
                 )));
             }
 
-            let mut reply_rxs = Vec::with_capacity(work_item_count);
-            for (text, expected_output_len) in work_texts.into_iter().zip(work_expected_lens) {
-                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-                tx.try_send(InferRequest { text, expected_output_len, reply_tx })
-                    .map_err(|_| TranslatorError::ServiceUnavailable(
-                        "translation queue full".into()
-                    ))?;
-                reply_rxs.push(reply_rx);
+            // Single shared reply channel — all N slots reply into one receiver.
+            // Each reply carries its index so results can be placed in order.
+            let (reply_tx, reply_rx) =
+                std::sync::mpsc::channel::<(usize, Result<String, TranslatorError>)>();
+            let mut enqueued = 0usize;
+            for (idx, (text, expected_output_len)) in
+                work_texts.into_iter().zip(work_expected_lens).enumerate()
+            {
+                tx.try_send(InferRequest {
+                    text,
+                    expected_output_len,
+                    index: idx,
+                    reply_tx: reply_tx.clone(),
+                })
+                .map_err(|_| TranslatorError::ServiceUnavailable("translation queue full".into()))?;
+                enqueued += 1;
+            }
+            drop(reply_tx); // close our copy so channel ends after N replies
+
+            let mut translated: Vec<Option<String>> = vec![None; work_item_count];
+            for _ in 0..enqueued {
+                let (idx, result) = reply_rx
+                    .recv()
+                    .map_err(|_| TranslatorError::TranslationFailed("scheduler dropped reply".into()))?;
+                translated[idx] = Some(result?);
             }
 
-            let mut translated = Vec::with_capacity(work_item_count);
-            for rx in reply_rxs {
-                translated.push(
-                    rx.recv()
-                        .map_err(|_| TranslatorError::TranslationFailed("scheduler dropped reply".into()))
-                        .and_then(|r| r)?
-                );
-            }
-
-            for ((text_idx, target_lang), result) in work_indices.iter().zip(translated) {
+            for ((text_idx, target_lang), result) in
+                work_indices.iter().zip(translated.into_iter().map(|o| o.unwrap()))
+            {
                 all_translations[*text_idx].insert(target_lang.clone(), result);
             }
         }
@@ -361,30 +372,4 @@ impl TranslationEngine {
         Ok(TranslationResultSet { results })
     }
 
-    /// Returns the scheduler channel sender, starting the scheduler on first call.
-    fn get_or_start_worker(&self) -> &crossbeam_channel::Sender<InferRequest> {
-        let n_slots = self.n_slots;
-        let queue_capacity = self.queue_capacity;
-        self.worker.get_or_init(|| {
-            let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
-            let model_cache = self.model_cache.clone();
-            let model_dir = self.models_dir.join("translategemma-4b");
-            std::thread::Builder::new()
-                .name("translator-scheduler".into())
-                .spawn(move || {
-                    tracing::info!("Continuous scheduler starting, loading model…");
-                    let model = match LoadedGemmaModel::load(&model_dir) {
-                        Ok(m) => Arc::new(m),
-                        Err(e) => {
-                            tracing::error!("Scheduler failed to load model: {e}");
-                            return;
-                        }
-                    };
-                    let _ = model_cache.set(model.clone());
-                    ContinuousScheduler::new(model, rx, n_slots).run();
-                })
-                .expect("failed to spawn translator-scheduler thread");
-            tx
-        })
-    }
 }

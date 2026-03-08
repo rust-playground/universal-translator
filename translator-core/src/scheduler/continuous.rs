@@ -95,7 +95,9 @@ pub struct InferRequest {
     /// Expected number of output tokens, used to calibrate EOS bias.
     /// Computed by the engine from the original text length (not the prompt length).
     pub expected_output_len: usize,
-    pub reply_tx: mpsc::Sender<Result<String, TranslatorError>>,
+    /// Position of this request in the caller's work list — echoed back in the reply.
+    pub index: usize,
+    pub reply_tx: mpsc::Sender<(usize, Result<String, TranslatorError>)>,
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -104,7 +106,8 @@ pub struct InferRequest {
 struct PendingPrefill {
     token_ids: Vec<u32>,
     expected_len: usize,
-    reply_tx: mpsc::Sender<Result<String, TranslatorError>>,
+    index: usize,
+    reply_tx: mpsc::Sender<(usize, Result<String, TranslatorError>)>,
 }
 
 struct Slot {
@@ -115,7 +118,8 @@ struct Slot {
     output_ids: Vec<u32>,
     /// Predicted natural endpoint for EOS bias (decoupled from SLOT_CAPACITY).
     expected_len: usize,
-    reply_tx: mpsc::Sender<Result<String, TranslatorError>>,
+    index: usize,
+    reply_tx: mpsc::Sender<(usize, Result<String, TranslatorError>)>,
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -240,7 +244,7 @@ fn run_loop(
                 let msg = e.to_string();
                 for &si in &active_indices {
                     let finished = slots[si].take().unwrap();
-                    let _ = finished.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
+                    let _ = finished.reply_tx.send((finished.index, Err(TranslatorError::Model(msg.clone()))));
                 }
                 continue;
             }
@@ -273,7 +277,7 @@ fn run_loop(
                 let msg = e.to_string();
                 for &si in &active_indices {
                     let finished = slots[si].take().unwrap();
-                    let _ = finished.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
+                    let _ = finished.reply_tx.send((finished.index, Err(TranslatorError::Model(msg.clone()))));
                 }
                 continue;
             }
@@ -298,7 +302,7 @@ fn run_loop(
                 let msg = e.to_string();
                 for &si in &active_indices {
                     if let Some(finished) = slots[si].take() {
-                        let _ = finished.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
+                        let _ = finished.reply_tx.send((finished.index, Err(TranslatorError::Model(msg.clone()))));
                     }
                 }
                 continue;
@@ -336,7 +340,7 @@ fn run_loop(
                     metrics.tokens_generated.add(finished.output_ids.len() as u64, &[]);
                 }
                 let text = model.decode_output_ids(&finished.output_ids);
-                let _ = finished.reply_tx.send(text);
+                let _ = finished.reply_tx.send((finished.index, text));
             } else {
                 slot.output_ids.push(tok);
                 slot.current_token = tok;
@@ -380,11 +384,12 @@ fn tokenize_into_pending(
             pending.push(PendingPrefill {
                 token_ids,
                 expected_len: req.expected_output_len,
+                index: req.index,
                 reply_tx: req.reply_tx,
             });
         }
         Err(e) => {
-            let _ = req.reply_tx.send(Err(e));
+            let _ = req.reply_tx.send((req.index, Err(e)));
         }
     }
 }
@@ -417,7 +422,7 @@ fn batch_prefill_and_assign(
         Err(e) => {
             let msg = e.to_string();
             for pb in pending.drain(..) {
-                let _ = pb.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
+                let _ = pb.reply_tx.send((pb.index, Err(TranslatorError::Model(msg.clone()))));
             }
             return;
         }
@@ -435,7 +440,7 @@ fn batch_prefill_and_assign(
         Err(e) => {
             let msg = e.to_string();
             for pb in pending.drain(..) {
-                let _ = pb.reply_tx.send(Err(TranslatorError::Model(msg.clone())));
+                let _ = pb.reply_tx.send((pb.index, Err(TranslatorError::Model(msg.clone()))));
             }
             return;
         }
@@ -450,7 +455,7 @@ fn batch_prefill_and_assign(
         let first_token = sample_token(&mut logits, rng, sample_scratch);
 
         if first_token == eos_id {
-            let _ = pb.reply_tx.send(Ok(String::new()));
+            let _ = pb.reply_tx.send((pb.index, Ok(String::new())));
             continue;
         }
 
@@ -464,6 +469,7 @@ fn batch_prefill_and_assign(
                     current_token: first_token,
                     output_ids: vec![first_token],
                     expected_len: pb.expected_len,
+                    index: pb.index,
                     reply_tx: pb.reply_tx,
                 });
                 break;

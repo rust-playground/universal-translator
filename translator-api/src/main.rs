@@ -116,7 +116,10 @@ async fn main() {
 
     tracing::info!(?models_dir, "Loading translation engine");
 
-    let engine = TranslationEngine::new(&models_dir);
+    let engine = TranslationEngine::new(&models_dir).unwrap_or_else(|e| {
+        tracing::error!("Failed to load model: {e}");
+        std::process::exit(1);
+    });
     let state = AppState {
         engine,
         #[cfg(feature = "opentelemetry")]

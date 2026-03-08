@@ -2,7 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
-use translator_core::engine::TranslationEngine;
+use translator_core::detector::Detector;
+use translator_core::engine::supported_target_languages;
 
 #[derive(Clone, ValueEnum)]
 pub enum OutputFormat {
@@ -20,19 +21,28 @@ pub struct DetectLanguageArgs {
 }
 
 impl DetectLanguageArgs {
-    pub fn run(self, models_dir: &Path) -> Result<()> {
-        let engine = TranslationEngine::new(models_dir);
-        let result = engine.detect_language_full(&self.text)?;
+    pub fn run(self, _models_dir: &Path) -> Result<()> {
+        let detector = Detector::new();
+        let (code, language_name, confidence) = detector.detect_with_confidence(&self.text)?;
+        let translation_supported = supported_target_languages().contains(&code.as_str());
 
         match self.output {
-            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+            OutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "language_code": code,
+                    "language": language_name,
+                    "confidence": confidence,
+                    "translation_supported": translation_supported,
+                }))?
+            ),
             OutputFormat::Pretty => {
-                let supported = if result.translation_supported { "yes" } else { "no" };
+                let supported = if translation_supported { "yes" } else { "no" };
                 println!(
                     "Language: {} ({}) — confidence: {:.1}% — translation supported: {}",
-                    result.language,
-                    result.language_code,
-                    result.confidence * 100.0,
+                    language_name,
+                    code,
+                    confidence * 100.0,
                     supported,
                 );
             }
