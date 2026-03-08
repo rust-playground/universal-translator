@@ -19,7 +19,10 @@ pub async fn translate(
     let engine = state.engine.clone();
     let result = tokio::task::spawn_blocking(move || engine.translate_batch(batch))
         .await
-        .map_err(|_| ApiError(TranslatorError::TranslationFailed("scheduler panicked".into())))?
+        .map_err(|e| {
+            tracing::error!(panic = %e, "translator-scheduler panicked");
+            ApiError(TranslatorError::TranslationFailed("scheduler panicked".into()))
+        })?
         .map_err(|e| {
             #[cfg(feature = "opentelemetry")]
             {
