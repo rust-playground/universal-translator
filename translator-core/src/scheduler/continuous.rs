@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, mpsc};
 
-use candle_core::{D, DType, Tensor};
+use candle_core::{DType, Tensor};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
@@ -22,7 +22,7 @@ use crate::model::LoadedGemmaModel;
 use crate::model_batched::SlotKvCache;
 use crate::scheduler::decoder::GemmaSlotDecoder;
 use crate::scheduler::sampling::{
-    apply_decoding_filters, apply_length_bias, check_tail_repeat, sample_token,
+    apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token,
 };
 
 struct Metrics {
@@ -339,64 +339,12 @@ fn run_loop(
                 std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
         }
 
+        // Transfer full logits to CPU for sampling with decoding filters.
         let _t_cpu = std::time::Instant::now();
-
-        // CPU: classify slots that need forced EOS regardless of model logits.
-        let force_eos_flags: Vec<bool> = active_indices
-            .iter()
-            .map(|&si| check_tail_repeat(&slots[si].as_ref().unwrap().output_ids))
-            .collect();
-        let at_budget_flags: Vec<bool> = active_indices
-            .iter()
-            .map(|&si| {
-                let slot = slots[si].as_ref().unwrap();
-                slot.output_ids.len() >= (slot.expected_len * 4).clamp(32, 512)
-            })
-            .collect();
-
-        // GPU: single argmax over [N, vocab] → [N] token IDs.
-        // No new MTLBuffer allocations — operates on existing all_logits_t tensor.
-        let _t_argmax_issue = std::time::Instant::now();
-        let argmax_result: Result<Vec<u32>, TranslatorError> = (|| {
-            let tok_ids_t = all_logits_t.argmax(D::Minus1).map_err(cerr)?;
-            let argmax_issue_us = _t_argmax_issue.elapsed().as_micros(); // Metal command queue time
-
-            let _t_sync = std::time::Instant::now();
-            let mut tok_ids: Vec<u32> = tok_ids_t.to_vec1::<u32>().map_err(cerr)?;
-            let sync_us = _t_sync.elapsed().as_micros(); // actual GPU execution (forward + argmax)
-
-            for (bi, tok) in tok_ids.iter_mut().enumerate() {
-                if force_eos_flags[bi] || at_budget_flags[bi] {
-                    *tok = eos_id;
-                }
-            }
-            let cpu_us = _t_cpu.elapsed().as_micros();
-            tracing::info!(
-                n_active,
-                fw_us,
-                argmax_issue_us,
-                sync_us,
-                cpu_us,
-                total_us = _t_step.elapsed().as_micros(),
-                "decode step"
-            );
-            Ok(tok_ids)
-        })();
-
-        if argmax_result.is_err() {
-            let cpu_us = _t_cpu.elapsed().as_micros();
-            tracing::info!(
-                n_active,
-                fw_us,
-                argmax_issue_us = _t_argmax_issue.elapsed().as_micros(),
-                sync_us = 0u128,
-                cpu_us,
-                total_us = _t_step.elapsed().as_micros(),
-                "decode step (error)"
-            );
-        }
-
-        let tok_ids = match argmax_result {
+        let all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
+            .to_dtype(DType::F32)
+            .and_then(|t| t.to_vec2::<f32>())
+        {
             Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
@@ -412,17 +360,43 @@ fn run_loop(
             }
         };
 
-        // ── Retire slots that emitted EOS or hit capacity; update the rest ─
+        // Per-slot filtering and sampling on CPU.
+        let mut tok_ids: Vec<u32> = Vec::with_capacity(n_active);
+        for (batch_idx, &slot_idx) in active_indices.iter().enumerate() {
+            let mut logits = all_logits_cpu[batch_idx].clone();
+            let slot = slots[slot_idx].as_ref().unwrap();
+
+            apply_decoding_filters(&mut logits, &slot.output_ids);
+            apply_length_bias(&mut logits, eos_id, slot.output_ids.len(), slot.expected_len);
+            force_eos_on_tail_repeat(&mut logits, eos_id, &slot.output_ids);
+
+            // Hard ceiling at SLOT_CAPACITY.
+            if slot.output_ids.len() + 1 >= SLOT_CAPACITY {
+                for (i, v) in logits.iter_mut().enumerate() {
+                    if i != eos_id as usize {
+                        *v = f32::NEG_INFINITY;
+                    }
+                }
+            }
+
+            tok_ids.push(sample_token(&mut logits, &mut rng));
+        }
+
+        let cpu_us = _t_cpu.elapsed().as_micros();
+        tracing::info!(
+            n_active,
+            fw_us,
+            cpu_us,
+            total_us = _t_step.elapsed().as_micros(),
+            "decode step"
+        );
+
+        // ── Retire slots that emitted EOS; update the rest ─────────────────
         for (i, tok) in tok_ids.into_iter().enumerate() {
             let slot_idx = active_indices[i];
-            let at_capacity = {
-                let slot = slots[slot_idx].as_ref().unwrap();
-                let budget = (slot.expected_len * 4).clamp(32, 512);
-                slot.output_ids.len() >= budget
-            };
-            if tok == eos_id || at_capacity {
+            if tok == eos_id {
                 let finished = slots[slot_idx].take().unwrap();
-                let cause = if tok == eos_id { "eos" } else { "capacity" };
+                let cause = if finished.output_ids.len() + 1 >= SLOT_CAPACITY { "capacity" } else { "eos" };
                 let slot_ms = finished.assigned_at.elapsed().as_millis();
                 tracing::info!(tokens = finished.output_ids.len(), cause, slot_ms, "slot retired");
                 #[cfg(feature = "opentelemetry")]
