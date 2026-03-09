@@ -22,8 +22,7 @@ use crate::model::LoadedGemmaModel;
 use crate::model_batched::SlotKvCache;
 use crate::scheduler::decoder::GemmaSlotDecoder;
 use crate::scheduler::sampling::{
-    apply_decoding_filters, apply_length_bias, check_tail_repeat, compute_length_bias,
-    sample_token, REPETITION_PENALTY,
+    apply_decoding_filters, apply_length_bias, check_tail_repeat, sample_token,
 };
 
 struct Metrics {
@@ -333,101 +332,29 @@ fn run_loop(
 
         let _t_cpu = std::time::Instant::now();
 
-        // Extract per-slot data for building GPU filter tensors.
-        let n = n_active;
-        let slot_data: Vec<(Vec<u32>, usize)> = active_indices
+        // CPU: classify slots that need forced EOS regardless of model logits.
+        let force_eos_flags: Vec<bool> = active_indices
+            .iter()
+            .map(|&si| check_tail_repeat(&slots[si].as_ref().unwrap().output_ids))
+            .collect();
+        let at_budget_flags: Vec<bool> = active_indices
             .iter()
             .map(|&si| {
                 let slot = slots[si].as_ref().unwrap();
-                (slot.output_ids.clone(), slot.expected_len)
+                slot.output_ids.len() >= (slot.expected_len * 4).clamp(32, 512)
             })
             .collect();
 
-        // Classify slots: force_eos or at_budget slots bypass GPU filtering.
-        let force_eos_flags: Vec<bool> = slot_data
-            .iter()
-            .map(|(output_ids, _)| check_tail_repeat(output_ids))
-            .collect();
-        let at_budget_flags: Vec<bool> = slot_data
-            .iter()
-            .map(|(output_ids, expected_len)| {
-                output_ids.len() >= (expected_len * 4).clamp(32, 512)
-            })
-            .collect();
-
-        // GPU-side filtering: repetition penalty → EOS bias → argmax.
-        // Errors here are broadcast to all active slots (same pattern as forward errors).
-        let filter_result: Result<Vec<u32>, TranslatorError> = (|| {
-            let vocab = all_logits_t.dim(1).map_err(cerr)?;
-
-            // 1. Repetition penalty via gather + scatter_add.
-            //    Build padded [N, max_hist] index and active-mask tensors.
-            let max_hist = slot_data.iter().map(|(ids, _)| ids.len()).max().unwrap_or(1).max(1);
-            let mut penalty_idx = vec![0u32; n * max_hist];
-            let mut penalty_active = vec![0.0f32; n * max_hist];
-
-            for (bi, (output_ids, _)) in slot_data.iter().enumerate() {
-                if force_eos_flags[bi] || at_budget_flags[bi] {
-                    continue;
-                }
-                for (j, &tok) in output_ids.iter().enumerate().take(max_hist) {
-                    let clamped = (tok as usize).min(vocab - 1) as u32;
-                    penalty_idx[bi * max_hist + j] = clamped;
-                    penalty_active[bi * max_hist + j] = 1.0;
-                }
-            }
-
-            let pi_t = Tensor::from_slice(&penalty_idx, (n, max_hist), model.device())
-                .map_err(cerr)?;
-            let pa_t = Tensor::from_slice(&penalty_active, (n, max_hist), model.device())
-                .map_err(cerr)?;
-
-            // Gather logits at penalty positions, compute multiplicative diff, scatter back.
-            let gathered = all_logits_t.gather(&pi_t, 1).map_err(cerr)?;
-            let pos_mask = gathered.ge(0.0f64).map_err(cerr)?;
-            let factor_pos = 1.0_f32 / REPETITION_PENALTY;
-            let factor_neg = REPETITION_PENALTY;
-            let penalty_mul = pos_mask
-                .where_cond(
-                    &Tensor::full(factor_pos, (n, max_hist), model.device()).map_err(cerr)?,
-                    &Tensor::full(factor_neg, (n, max_hist), model.device()).map_err(cerr)?,
-                )
-                .map_err(cerr)?;
-            // diff = new_val - old_val; zero out padded slots; scatter-add into logits.
-            let adjusted = (gathered.mul(&penalty_mul).map_err(cerr)? - &gathered).map_err(cerr)?;
-            let adjusted_masked = adjusted.mul(&pa_t).map_err(cerr)?;
-            let filtered = all_logits_t.scatter_add(&pi_t, &adjusted_masked, 1).map_err(cerr)?;
-
-            // 2. EOS logit bias via scatter_add on [N, 1] bias tensor.
-            let eos_biases: Vec<f32> = slot_data
-                .iter()
-                .enumerate()
-                .map(|(bi, (output_ids, expected_len))| {
-                    if force_eos_flags[bi] || at_budget_flags[bi] {
-                        0.0
-                    } else {
-                        compute_length_bias(output_ids.len(), *expected_len)
-                    }
-                })
-                .collect();
-            let eos_cols: Vec<u32> = (0..n).map(|_| eos_id).collect();
-            let eos_bias_t =
-                Tensor::from_slice(&eos_biases, (n, 1), model.device()).map_err(cerr)?;
-            let eos_col_t =
-                Tensor::from_slice(&eos_cols, (n, 1), model.device()).map_err(cerr)?;
-            let filtered = filtered.scatter_add(&eos_col_t, &eos_bias_t, 1).map_err(cerr)?;
-
-            // 3. GPU argmax → [N] token IDs (transfers 4*N bytes, not 4*N*vocab bytes).
-            let tok_ids_t = filtered.argmax(D::Minus1).map_err(cerr)?;
+        // GPU: single argmax over [N, vocab] → [N] token IDs.
+        // No new MTLBuffer allocations — operates on existing all_logits_t tensor.
+        let argmax_result: Result<Vec<u32>, TranslatorError> = (|| {
+            let tok_ids_t = all_logits_t.argmax(D::Minus1).map_err(cerr)?;
             let mut tok_ids: Vec<u32> = tok_ids_t.to_vec1::<u32>().map_err(cerr)?;
-
-            // 4. Override force-EOS and at-budget slots with EOS directly.
             for (bi, tok) in tok_ids.iter_mut().enumerate() {
                 if force_eos_flags[bi] || at_budget_flags[bi] {
                     *tok = eos_id;
                 }
             }
-
             Ok(tok_ids)
         })();
 
@@ -440,7 +367,7 @@ fn run_loop(
             "decode step"
         );
 
-        let tok_ids = match filter_result {
+        let tok_ids = match argmax_result {
             Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
@@ -466,10 +393,11 @@ fn run_loop(
             };
             if tok == eos_id || at_capacity {
                 let finished = slots[slot_idx].take().unwrap();
+                let cause = if tok == eos_id { "eos" } else { "capacity" };
+                tracing::debug!(tokens = finished.output_ids.len(), cause, "slot retired");
                 #[cfg(feature = "opentelemetry")]
                 {
                     use opentelemetry::KeyValue;
-                    let cause = if tok == eos_id { "eos" } else { "capacity" };
                     metrics.slots_completed.add(1, &[KeyValue::new("cause", cause)]);
                     metrics.tokens_generated.add(finished.output_ids.len() as u64, &[]);
                 }
