@@ -175,13 +175,13 @@ pub fn compute_length_bias(step: usize, expected_len: usize) -> f32 {
         return 0.0;
     }
     let progress = (step as f32) / (expected_len as f32);
-    if progress >= LENGTH_PENALTY_START {
-        let fraction =
-            ((progress - LENGTH_PENALTY_START) / (1.0 - LENGTH_PENALTY_START)).min(1.0);
-        fraction * EOS_LOGIT_BIAS
-    } else {
-        0.0
+    if progress < LENGTH_PENALTY_START {
+        return 0.0;
     }
+    // Ramp from LENGTH_PENALTY_START to 1.0: 0 → EOS_LOGIT_BIAS
+    // Past 1.0: continue at double rate (steeper ramp) up to 2× EOS_LOGIT_BIAS
+    let fraction = (progress - LENGTH_PENALTY_START) / (1.0 - LENGTH_PENALTY_START);
+    fraction.min(2.0) * EOS_LOGIT_BIAS
 }
 
 // ── Temperature / top-K / top-P sampling ─────────────────────────────────────

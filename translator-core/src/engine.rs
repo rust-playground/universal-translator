@@ -160,6 +160,15 @@ pub struct TranslationEngine {
     duration_ms: opentelemetry::metrics::Histogram<f64>,
 }
 
+/// Default cap on concurrent decode slots for latency-sensitive deployments.
+///
+/// Metal Q4 decode step time scales ~linearly with batch size; capping at 8
+/// keeps step_time ≤ 360ms so a 24-token output completes in ~8.6s instead
+/// of ~21.6s with 20 concurrent items. Throughput (tokens/sec) is unchanged.
+/// Override with MAX_DECODE_SLOTS env var.
+#[allow(dead_code)]
+const DEFAULT_MAX_DECODE_SLOTS: usize = 8;
+
 fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
     // Env var always wins — allows manual tuning.
     if let Some(n) = std::env::var("MAX_DECODE_SLOTS").ok().and_then(|v| v.parse().ok()) {
@@ -188,7 +197,7 @@ fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
             let free = budget.saturating_sub(used);
             // Reserve 15% for forward-pass activation tensors and Metal driver overhead.
             let usable = free * 17 / 20;
-            let n = (usable / kv_per_slot.max(1)).clamp(4, 512);
+            let n = (usable / kv_per_slot.max(1)).clamp(4, DEFAULT_MAX_DECODE_SLOTS);
             tracing::info!(
                 budget_mb = budget / 1_048_576,
                 used_mb = used / 1_048_576,
@@ -207,7 +216,7 @@ fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
             if let Ok((free, _total)) = cudarc::driver::result::mem_get_info() {
                 // Reserve 15% headroom for activations and CUDA driver overhead.
                 let usable = free * 17 / 20;
-                let n = (usable / kv_per_slot.max(1)).clamp(4, 512);
+                let n = (usable / kv_per_slot.max(1)).clamp(4, DEFAULT_MAX_DECODE_SLOTS);
                 tracing::info!(
                     free_mb = free / 1_048_576,
                     kv_slot_mb = kv_per_slot / 1_048_576,
@@ -327,6 +336,7 @@ impl TranslationEngine {
         }
 
         // Phase 1 — resolve source languages: use caller hint or detect in parallel via rayon.
+        let t0 = std::time::Instant::now();
         let source_langs: Vec<String> = if let Some(ref src) = batch.source_language {
             let normalized = normalize_lang_code(src).to_string();
             vec![normalized; n]
@@ -337,6 +347,7 @@ impl TranslationEngine {
                 .map(|text| self.detector.detect(text))
                 .collect::<Result<Vec<String>, TranslatorError>>()?
         };
+        tracing::info!(detection_ms = t0.elapsed().as_millis(), "phase 1 done");
 
         let mut all_translations: Vec<HashMap<String, String>> =
             (0..n).map(|_| HashMap::new()).collect();
@@ -393,11 +404,19 @@ impl TranslationEngine {
                 )));
             }
 
+            tracing::info!(
+                work_items = work_item_count,
+                queue_len = tx.len(),
+                queue_capacity = self.queue_capacity,
+                "dispatching to scheduler"
+            );
+
             // Single shared reply channel — all N slots reply into one receiver.
             // Each reply carries its index so results can be placed in order.
             let (reply_tx, reply_rx) =
                 std::sync::mpsc::channel::<(usize, Result<String, TranslatorError>)>();
             let mut enqueued = 0usize;
+            let t1 = std::time::Instant::now();
             for (idx, (text, expected_output_len)) in
                 work_texts.into_iter().zip(work_expected_lens).enumerate()
             {
@@ -411,7 +430,9 @@ impl TranslationEngine {
                 enqueued += 1;
             }
             drop(reply_tx); // close our copy so channel ends after N replies
+            tracing::info!(enqueue_ms = t1.elapsed().as_millis(), "phase 3 done");
 
+            let t2 = std::time::Instant::now();
             let mut translated: Vec<Option<String>> = vec![None; work_item_count];
             for _ in 0..enqueued {
                 let (idx, result) = reply_rx
@@ -419,6 +440,7 @@ impl TranslationEngine {
                     .map_err(|_| TranslatorError::TranslationFailed("scheduler dropped reply".into()))?;
                 translated[idx] = Some(result?);
             }
+            tracing::info!(reply_wait_ms = t2.elapsed().as_millis(), "phase 4 done (replies received)");
 
             for ((text_idx, target_lang), result) in
                 work_indices.iter().zip(translated.into_iter().map(|o| o.unwrap()))
