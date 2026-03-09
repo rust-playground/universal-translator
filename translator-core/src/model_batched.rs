@@ -33,11 +33,50 @@ pub struct SlotKvCache {
     pub layers: Vec<Option<(Tensor, Tensor)>>,
     /// Tokens consumed so far — `index_pos` for the next forward call.
     pub seq_len: usize,
+    /// Pre-allocated capacity along the sequence dimension.
+    /// KV tensors are `[1, n_kv_head, capacity, head_dim]` with real data in
+    /// `0..seq_len` and zeros in `seq_len..capacity`.
+    pub capacity: usize,
 }
 
 impl SlotKvCache {
     pub fn new(n_layers: usize) -> Self {
-        Self { layers: vec![None; n_layers], seq_len: 0 }
+        Self { layers: vec![None; n_layers], seq_len: 0, capacity: 0 }
+    }
+
+    /// Ensure all layer buffers can hold at least `needed` tokens along the
+    /// sequence dimension.  Uses a doubling strategy (next power of two, min 64)
+    /// so growth is amortised to O(1) per token.
+    pub fn ensure_capacity(
+        &mut self,
+        needed: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<()> {
+        if needed <= self.capacity {
+            return Ok(());
+        }
+        let new_cap = needed.next_power_of_two().max(64);
+        for layer in self.layers.iter_mut() {
+            match layer {
+                None => {
+                    let k = Tensor::zeros((1, n_kv_heads, new_cap, head_dim), dtype, device)?;
+                    let v = Tensor::zeros((1, n_kv_heads, new_cap, head_dim), dtype, device)?;
+                    *layer = Some((k, v));
+                }
+                Some((k_old, v_old)) => {
+                    let k_new = Tensor::zeros((1, n_kv_heads, new_cap, head_dim), dtype, device)?;
+                    let v_new = Tensor::zeros((1, n_kv_heads, new_cap, head_dim), dtype, device)?;
+                    k_new.slice_set(&k_old.narrow(2, 0, self.seq_len)?.contiguous()?, 2, 0)?;
+                    v_new.slice_set(&v_old.narrow(2, 0, self.seq_len)?.contiguous()?, 2, 0)?;
+                    *layer = Some((k_new, v_new));
+                }
+            }
+        }
+        self.capacity = new_cap;
+        Ok(())
     }
 }
 
@@ -404,34 +443,31 @@ impl LayerWeights {
             let pos_i = positions[i]; // = seq_len BEFORE this step
 
             // Extract new K/V for slot i: [1, n_kv_head, 1, head_dim]
-            let k_new_i = k_new.i(i)?.unsqueeze(0)?;
-            let v_new_i = v_new.i(i)?.unsqueeze(0)?;
+            let k_new_i = k_new.i(i)?.unsqueeze(0)?.contiguous()?;
+            let v_new_i = v_new.i(i)?.unsqueeze(0)?.contiguous()?;
 
-            // Cat with existing cache
-            let (k_updated, v_updated) = match &kv_caches[i].layers[layer_idx] {
-                None => (k_new_i, v_new_i),
-                Some((k_cache, v_cache)) => {
-                    let k_c = Tensor::cat(&[k_cache, &k_new_i], 2)?;
-                    let v_c = Tensor::cat(&[v_cache, &v_new_i], 2)?;
-                    (k_c, v_c)
-                }
-            };
-            // k_updated: [1, n_kv_head, pos_i+1, head_dim]
+            let (k_buf, v_buf) = kv_caches[i].layers[layer_idx].as_ref().unwrap();
 
-            // Pad to total_kv_len so we can stack across the batch
-            let cur_kv_len = pos_i + 1;
-            let pad_len = total_kv_len - cur_kv_len;
-            let (k_padded, v_padded) = if pad_len > 0 {
+            // In-place write of new token at position pos_i — O(1) bandwidth
+            k_buf.slice_set(&k_new_i, 2, pos_i)?;
+            v_buf.slice_set(&v_new_i, 2, pos_i)?;
+
+            // Extract [1, n_kv_head, total_kv_len, head_dim] for batching.
+            // Pre-allocated zeros beyond seq_len serve as padding.
+            let (k_padded, v_padded) = if kv_caches[i].capacity >= total_kv_len {
                 (
-                    k_updated.pad_with_zeros(2, 0, pad_len)?,
-                    v_updated.pad_with_zeros(2, 0, pad_len)?,
+                    k_buf.narrow(2, 0, total_kv_len)?.contiguous()?,
+                    v_buf.narrow(2, 0, total_kv_len)?.contiguous()?,
                 )
             } else {
-                (k_updated.clone(), v_updated.clone())
+                // Defensive fallback (shouldn't happen after ensure_capacity)
+                let k_valid = k_buf.narrow(2, 0, pos_i + 1)?.contiguous()?;
+                let v_valid = v_buf.narrow(2, 0, pos_i + 1)?.contiguous()?;
+                (
+                    k_valid.pad_with_zeros(2, 0, total_kv_len - pos_i - 1)?,
+                    v_valid.pad_with_zeros(2, 0, total_kv_len - pos_i - 1)?,
+                )
             };
-
-            // Store unpadded KV in the cache
-            kv_caches[i].layers[layer_idx] = Some((k_updated, v_updated));
 
             k_list.push(k_padded);
             v_list.push(v_padded);
@@ -574,16 +610,20 @@ impl LayerWeights {
         let attn_output = attn_output.transpose(1, 2)?.reshape((n, max_len, self.q_dim))?;
         let out = self.attention_wo.forward(&attn_output)?;
 
-        // Store unpadded K/V slices into per-slot caches.
+        // Store unpadded K/V slices into pre-allocated buffers.
         // Correctness invariant: only real token KV (0..real_lens[b]) is stored.
         for b in 0..n {
             let real_len = real_lens[b];
-            // k_for_cache.i(b): [n_kv_head, max_len, head_dim]
-            // narrow(dim=1, 0, real_len): [n_kv_head, real_len, head_dim]
-            // unsqueeze(0):               [1, n_kv_head, real_len, head_dim]
-            let k_b = k_for_cache.i(b)?.narrow(1, 0, real_len)?.unsqueeze(0)?;
-            let v_b = v_for_cache.i(b)?.narrow(1, 0, real_len)?.unsqueeze(0)?;
-            kv_caches[b].layers[layer_idx] = Some((k_b, v_b));
+            let k_b = k_for_cache.i(b)?.narrow(1, 0, real_len)?.unsqueeze(0)?.contiguous()?;
+            let v_b = v_for_cache.i(b)?.narrow(1, 0, real_len)?.unsqueeze(0)?.contiguous()?;
+
+            let cap = (real_len * 2).next_power_of_two().max(64);
+            let k_buf = Tensor::zeros((1, self.n_kv_head, cap, self.head_dim), k_b.dtype(), device)?;
+            let v_buf = Tensor::zeros((1, self.n_kv_head, cap, self.head_dim), v_b.dtype(), device)?;
+            k_buf.slice_set(&k_b, 2, 0)?;
+            v_buf.slice_set(&v_b, 2, 0)?;
+
+            kv_caches[b].layers[layer_idx] = Some((k_buf, v_buf));
         }
 
         Ok(out)
@@ -851,9 +891,10 @@ impl ModelWeights {
             layer_in = x;
         }
 
-        // Set seq_len on all caches.
+        // Set seq_len and capacity on all caches.
         for (b, kv) in kv_caches.iter_mut().enumerate() {
             kv.seq_len = real_lens[b];
+            kv.capacity = (real_lens[b] * 2).next_power_of_two().max(64);
         }
 
         // Extract last real token hidden state per sequence, stack → [N, dim].
@@ -940,6 +981,17 @@ impl ModelWeights {
         let _enter = self.span.enter();
         let positions: Vec<usize> = kv_caches.iter().map(|kv| kv.seq_len).collect();
         let max_kv_len = positions.iter().copied().max().unwrap_or(0);
+
+        // Ensure all KV caches can hold one more token without reallocation.
+        let n_kv_heads = self.n_kv_heads();
+        let head_dim = self.head_dim();
+        #[cfg(feature = "cuda")]
+        let kv_dtype = DType::F16;
+        #[cfg(not(feature = "cuda"))]
+        let kv_dtype = DType::F32;
+        for kv in kv_caches.iter_mut() {
+            kv.ensure_capacity(kv.seq_len + 1, n_kv_heads, head_dim, kv_dtype, &self.device)?;
+        }
 
         let mut layer_in = self.tok_embeddings.forward(tokens)?;
         layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;

@@ -306,7 +306,7 @@ fn run_loop(
             .map(|&i| {
                 std::mem::replace(
                     &mut slots[i].as_mut().unwrap().decoder.kv_cache,
-                    SlotKvCache { layers: Vec::new(), seq_len: 0 },
+                    SlotKvCache { layers: Vec::new(), seq_len: 0, capacity: 0 },
                 )
             })
             .collect();
@@ -322,7 +322,7 @@ fn run_loop(
             Err(e) => {
                 for (bi, &si) in active_indices.iter().enumerate() {
                     slots[si].as_mut().unwrap().decoder.kv_cache =
-                        std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
+                        std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0, capacity: 0 });
                 }
                 let msg = e.to_string();
                 for &si in &active_indices {
@@ -336,7 +336,7 @@ fn run_loop(
         // ── Restore KV caches ─────────────────────────────────────────────
         for (bi, &si) in active_indices.iter().enumerate() {
             slots[si].as_mut().unwrap().decoder.kv_cache =
-                std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
+                std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0, capacity: 0 });
         }
 
         // Transfer full logits to CPU for sampling with decoding filters.
