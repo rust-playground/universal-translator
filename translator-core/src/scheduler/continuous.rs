@@ -340,8 +340,8 @@ fn run_loop(
         }
 
         // Transfer full logits to CPU for sampling with decoding filters.
-        let _t_cpu = std::time::Instant::now();
-        let all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
+        let _t_sync = std::time::Instant::now();
+        let mut all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
             .to_dtype(DType::F32)
             .and_then(|t| t.to_vec2::<f32>())
         {
@@ -359,11 +359,13 @@ fn run_loop(
                 continue;
             }
         };
+        let sync_us = _t_sync.elapsed().as_micros();
 
         // Per-slot filtering and sampling on CPU.
+        // Drain rows from the logits vec to avoid cloning ~1MB per slot.
+        let _t_sample = std::time::Instant::now();
         let mut tok_ids: Vec<u32> = Vec::with_capacity(n_active);
-        for (batch_idx, &slot_idx) in active_indices.iter().enumerate() {
-            let mut logits = all_logits_cpu[batch_idx].clone();
+        for (&slot_idx, mut logits) in active_indices.iter().zip(all_logits_cpu.drain(..)) {
             let slot = slots[slot_idx].as_ref().unwrap();
 
             apply_decoding_filters(&mut logits, &slot.output_ids);
@@ -381,12 +383,13 @@ fn run_loop(
 
             tok_ids.push(sample_token(&mut logits, &mut rng));
         }
+        let sample_us = _t_sample.elapsed().as_micros();
 
-        let cpu_us = _t_cpu.elapsed().as_micros();
         tracing::info!(
             n_active,
             fw_us,
-            cpu_us,
+            sync_us,
+            sample_us,
             total_us = _t_step.elapsed().as_micros(),
             "decode step"
         );
