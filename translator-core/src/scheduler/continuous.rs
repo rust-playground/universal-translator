@@ -23,7 +23,7 @@ use crate::model::LoadedGemmaModel;
 use crate::model_batched::SlotKvCache;
 use crate::scheduler::decoder::GemmaSlotDecoder;
 use crate::scheduler::sampling::{
-    apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token, TOP_K,
+    apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token,
 };
 
 struct Metrics {
@@ -126,6 +126,9 @@ struct Slot {
     output_ids: Vec<u32>,
     /// Predicted natural endpoint for EOS bias (decoupled from SLOT_CAPACITY).
     expected_len: usize,
+    /// Per-slot RNG — seeded from the master RNG at slot creation.
+    /// Allows sampling to run in the rayon parallel map without shared state.
+    rng: SmallRng,
     index: usize,
     reply_tx: mpsc::Sender<(usize, Result<String, TranslatorError>)>,
 }
@@ -178,8 +181,6 @@ fn run_loop(
     // Pre-allocated arena buffers — reused every iteration to avoid hot-path allocs.
     let mut active_indices: Vec<usize> = Vec::with_capacity(n_slots);
     let mut tokens_vec: Vec<u32> = Vec::with_capacity(n_slots);
-    // Scratch buffer for sample_token.
-    let mut sample_scratch: Vec<(u32, f32)> = Vec::with_capacity(TOP_K + 1);
 
     // Items that couldn't fit in the last prefill batch (batch_size > n_slots).
     // Drained before pulling new items from the channel, preserving FIFO order.
@@ -200,7 +201,7 @@ fn run_loop(
 
             if !pending.is_empty() {
                 batch_prefill_and_assign(
-                    model, &mut pending, &mut slots, eos_id, &mut rng, metrics, &mut sample_scratch,
+                    model, &mut pending, &mut slots, eos_id, &mut rng, metrics,
                 );
             }
         }
@@ -264,7 +265,6 @@ fn run_loop(
                             eos_id,
                             &mut rng,
                             metrics,
-                            &mut sample_scratch,
                         );
                     }
                 }
@@ -273,6 +273,7 @@ fn run_loop(
         }
 
         tracing::debug!(active_slots = n_active, "batched decode pass");
+        let _t_step = std::time::Instant::now();
 
         // ── Build [N, 1] token tensor (reuse pre-allocated vec) ──────────
         tokens_vec.clear();
@@ -305,11 +306,11 @@ fn run_loop(
             })
             .collect();
 
-        #[cfg(feature = "opentelemetry")]
-        let _fw = std::time::Instant::now();
+        let _t_fw = std::time::Instant::now();
         let forward_result = model.forward_batched(&tokens_t, &mut batch_kv);
+        let fw_us = _t_fw.elapsed().as_micros();
         #[cfg(feature = "opentelemetry")]
-        metrics.decode_forward_ms.record(_fw.elapsed().as_millis() as f64, &[]);
+        metrics.decode_forward_ms.record(fw_us as f64 / 1000.0, &[]);
 
         let all_logits_t = match forward_result {
             Ok(t) => t,
@@ -334,6 +335,7 @@ fn run_loop(
         }
 
         // Transfer logits to CPU. On Metal UMA there is no PCIe copy — just a sync barrier.
+        let _t_xfer = std::time::Instant::now();
         let all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
             .to_vec2::<f32>()
             .map_err(cerr)
@@ -352,6 +354,9 @@ fn run_loop(
                 continue;
             }
         };
+        let xfer_us = _t_xfer.elapsed().as_micros();
+
+        let _t_cpu = std::time::Instant::now();
 
         // Extract per-slot immutable inputs before parallelising.
         let slot_data: Vec<(Vec<u32>, usize)> = active_indices
@@ -362,11 +367,23 @@ fn run_loop(
             })
             .collect();
 
-        // Apply decoding filters in parallel (rayon).
-        let mut filtered: Vec<Vec<f32>> = slot_data
+        // Extract per-slot RNGs (mem::replace with a placeholder — restored below).
+        let mut slot_rngs: Vec<SmallRng> = active_indices
+            .iter()
+            .map(|&si| {
+                std::mem::replace(
+                    &mut slots[si].as_mut().unwrap().rng,
+                    SmallRng::seed_from_u64(0), // placeholder — replaced immediately after
+                )
+            })
+            .collect();
+
+        // Combined filter + sample in parallel (rayon).
+        let tok_ids: Vec<u32> = slot_data
             .par_iter()
             .zip(all_logits_cpu.into_par_iter())
-            .map(|((output_ids, expected_len), mut logits)| {
+            .zip(slot_rngs.par_iter_mut())
+            .map(|(((output_ids, expected_len), mut logits), slot_rng)| {
                 let token_budget = (expected_len * 4).clamp(32, 512);
                 if output_ids.len() >= token_budget {
                     logits.fill(f32::NEG_INFINITY);
@@ -376,15 +393,25 @@ fn run_loop(
                     apply_decoding_filters(&mut logits, output_ids);
                     apply_length_bias(&mut logits, eos_id, output_ids.len(), *expected_len);
                 }
-                logits
+                sample_token(&mut logits, slot_rng)
             })
             .collect();
 
-        // Sample one token per slot (sequential: shared rng + scratch buffer).
-        let tok_ids: Vec<u32> = filtered
-            .iter_mut()
-            .map(|logits| sample_token(logits, &mut rng, &mut sample_scratch))
-            .collect();
+        let cpu_us = _t_cpu.elapsed().as_micros();
+        tracing::debug!(
+            n_active,
+            fw_us,
+            xfer_us,
+            cpu_us,
+            total_us = _t_step.elapsed().as_micros(),
+            "decode step"
+        );
+
+        // Restore per-slot RNGs.
+        for (bi, &si) in active_indices.iter().enumerate() {
+            slots[si].as_mut().unwrap().rng =
+                std::mem::replace(&mut slot_rngs[bi], SmallRng::seed_from_u64(0));
+        }
 
         // ── Retire slots that emitted EOS or hit capacity; update the rest ─
         for (i, tok) in tok_ids.into_iter().enumerate() {
@@ -471,7 +498,6 @@ fn batch_prefill_and_assign(
     eos_id: u32,
     rng: &mut SmallRng,
     metrics: &Metrics,
-    sample_scratch: &mut Vec<(u32, f32)>,
 ) {
     let empty_slot_count = slots.iter().filter(|s| s.is_none()).count();
     tracing::info!(batch_size = pending.len(), empty_slots = empty_slot_count, "prefill batch");
@@ -518,7 +544,7 @@ fn batch_prefill_and_assign(
 
         apply_decoding_filters(&mut logits, &[]);
         apply_length_bias(&mut logits, eos_id, 0, pb.expected_len);
-        let first_token = sample_token(&mut logits, rng, sample_scratch);
+        let first_token = sample_token(&mut logits, rng);
 
         if first_token == eos_id {
             let _ = pb.reply_tx.send((pb.index, Ok(String::new())));
@@ -535,6 +561,7 @@ fn batch_prefill_and_assign(
                     current_token: first_token,
                     output_ids: vec![first_token],
                     expected_len: pb.expected_len,
+                    rng: SmallRng::from_rng(&mut *rng).unwrap_or_else(|_| SmallRng::from_entropy()),
                     index: pb.index,
                     reply_tx: pb.reply_tx,
                 });

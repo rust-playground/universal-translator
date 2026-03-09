@@ -196,80 +196,111 @@ pub const TOP_K: usize = 40;
 /// probability reaches this threshold.
 pub const TOP_P: f32 = 0.90;
 
+/// Sift down in a min-heap ordered by the f32 value of `(u32, f32)` elements.
+#[inline]
+fn min_heap_sift_down(heap: &mut [(u32, f32)], mut i: usize, len: usize) {
+    loop {
+        let left = 2 * i + 1;
+        let right = 2 * i + 2;
+        let mut smallest = i;
+        if left < len && heap[left].1 < heap[smallest].1 {
+            smallest = left;
+        }
+        if right < len && heap[right].1 < heap[smallest].1 {
+            smallest = right;
+        }
+        if smallest == i {
+            break;
+        }
+        heap.swap(i, smallest);
+        i = smallest;
+    }
+}
+
 /// Sample the next token from `logits` using top-K / top-P / temperature.
 ///
 /// Temperature is applied to the ≤K candidates AFTER top-K selection —
 /// since temperature is a positive constant it doesn't change rank order,
 /// so top-K can run on raw logits (saving ~262 K divisions per call).
 ///
-/// `scratch` is a caller-supplied reusable buffer for the candidates vec.
-/// Pre-allocate once with `Vec::with_capacity(TOP_K + 1)` and pass on every call
-/// to avoid per-token heap allocation.
+/// Top-K uses a stack-allocated min-heap of size TOP_K=40 (320 bytes, L1-resident)
+/// for an O(vocab) single pass with zero heap allocation.
 ///
 /// Call AFTER `apply_decoding_filters` and `apply_length_bias`.
-pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng, scratch: &mut Vec<(u32, f32)>) -> u32 {
+pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
     let vocab = logits.len();
 
-    // 1. Top-K: collect finite logits by raw value (temperature preserves rank order).
+    // 1. Top-K via stack-allocated min-heap: O(vocab) scan, zero heap allocation.
+    //    TOP_K=40 → 320 bytes on the stack; stays in L1 cache for the full vocab scan.
     let k = TOP_K.min(vocab);
-    scratch.clear();
-    scratch.extend(
-        logits
-            .iter()
-            .enumerate()
-            .filter(|&(_, &v)| v.is_finite())
-            .map(|(i, &v)| (i as u32, v)),
-    );
-    if scratch.len() > k {
-        scratch.select_nth_unstable_by(k, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scratch.truncate(k);
+    let mut heap = [(0u32, f32::NEG_INFINITY); TOP_K];
+    let mut heap_len = 0usize;
+
+    for (i, &v) in logits.iter().enumerate() {
+        if !v.is_finite() {
+            continue;
+        }
+        if heap_len < k {
+            heap[heap_len] = (i as u32, v);
+            heap_len += 1;
+            if heap_len == k {
+                // Build min-heap in O(K) once we have K candidates.
+                for j in (0..k / 2).rev() {
+                    min_heap_sift_down(&mut heap, j, k);
+                }
+            }
+        } else if v > heap[0].1 {
+            // New candidate beats current heap-min → replace root and restore heap.
+            heap[0] = (i as u32, v);
+            min_heap_sift_down(&mut heap, 0, heap_len);
+        }
     }
 
-    if scratch.is_empty() {
+    let candidates = &mut heap[..heap_len];
+
+    if candidates.is_empty() {
         return 0;
     }
 
     // 2. Apply temperature to the ≤K candidates only (~40 divisions instead of 262K).
-    for (_, v) in scratch.iter_mut() {
+    for (_, v) in candidates.iter_mut() {
         *v /= TEMPERATURE;
     }
 
     // 3. Softmax over the ≤K candidates only.
-    let max = scratch.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
-    for (_, v) in scratch.iter_mut() {
+    let max = candidates.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+    for (_, v) in candidates.iter_mut() {
         *v = (*v - max).exp();
     }
-    let sum: f32 = scratch.iter().map(|(_, v)| v).sum();
+    let sum: f32 = candidates.iter().map(|(_, v)| v).sum();
     if sum > 0.0 {
-        for (_, v) in scratch.iter_mut() {
+        for (_, v) in candidates.iter_mut() {
             *v /= sum;
         }
     }
 
-    // 4. Top-P (nucleus): sort the small K-element vec by probability, then
+    // 4. Top-P (nucleus): sort the small K-element slice by probability, then
     //    truncate once cumulative mass >= TOP_P.
-    scratch.sort_unstable_by(|a, b| {
+    candidates.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut cumsum = 0.0_f32;
-    let mut cutoff = scratch.len();
-    for (i, (_, p)) in scratch.iter().enumerate() {
+    let mut cutoff = candidates.len();
+    for (i, (_, p)) in candidates.iter().enumerate() {
         cumsum += p;
         if cumsum >= TOP_P {
             cutoff = i + 1;
             break;
         }
     }
-    scratch.truncate(cutoff);
+    let candidates = &mut candidates[..cutoff];
 
     // 5. Renormalise & weighted draw.
-    let sum: f32 = scratch.iter().map(|(_, v)| v).sum();
+    let sum: f32 = candidates.iter().map(|(_, v)| v).sum();
     let draw: f32 = Standard.sample(rng);
     let threshold = draw * sum;
     let mut cumsum = 0.0_f32;
-    for &(idx, p) in scratch.iter() {
+    for &(idx, p) in candidates.iter() {
         cumsum += p;
         if cumsum >= threshold {
             return idx;
@@ -277,7 +308,7 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng, scratch: &mut Vec<(u
     }
 
     // Fallback (should be rare — floating-point rounding at the tail).
-    scratch[0].0
+    candidates[0].0
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -435,8 +466,7 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
         let mut logits = vec![1.0f32; 100];
         logits[7] = 10.0; // heavily favour token 7
-        let mut scratch = Vec::with_capacity(TOP_K + 1);
-        let tok = sample_token(&mut logits, &mut rng, &mut scratch);
+        let tok = sample_token(&mut logits, &mut rng);
         assert!((tok as usize) < 100);
     }
 
@@ -447,8 +477,7 @@ mod tests {
         // Only EOS is non-neg-inf.
         let mut logits = vec![f32::NEG_INFINITY; 100];
         logits[1] = 0.0; // EOS = 1
-        let mut scratch = Vec::with_capacity(TOP_K + 1);
-        let tok = sample_token(&mut logits, &mut rng, &mut scratch);
+        let tok = sample_token(&mut logits, &mut rng);
         assert_eq!(tok, 1);
     }
 }
