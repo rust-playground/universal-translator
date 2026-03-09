@@ -113,6 +113,14 @@ impl LoadedGemmaModel {
         self.model_weights.n_layers()
     }
 
+    pub fn n_kv_heads(&self) -> usize {
+        self.model_weights.n_kv_heads()
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.model_weights.head_dim()
+    }
+
     /// Create a fresh per-slot decoder backed by an empty [`SlotKvCache`].
     ///
     /// The weights themselves are not cloned — the decoder only holds a KV cache

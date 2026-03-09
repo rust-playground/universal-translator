@@ -23,7 +23,8 @@ use crate::model::LoadedGemmaModel;
 use crate::model_batched::SlotKvCache;
 use crate::scheduler::decoder::GemmaSlotDecoder;
 use crate::scheduler::sampling::{
-    apply_decoding_filters, apply_length_bias, force_eos_on_tail_repeat, sample_token, TOP_K,
+    apply_decoding_filters, apply_length_bias, check_tail_repeat, compute_ban_indices,
+    compute_length_bias, sample_token, REPETITION_PENALTY, TOP_K,
 };
 
 struct Metrics {
@@ -84,6 +85,13 @@ fn cerr(e: candle_core::Error) -> TranslatorError {
 
 /// Maximum output tokens per slot (prompt tokens + generated tokens combined).
 pub const SLOT_CAPACITY: usize = 4096;
+
+/// How long to wait for additional requests after the first one arrives when
+/// the scheduler is idle.  This lets staggered `spawn_blocking` threads (which
+/// start with ~1–5ms jitter) all reach the channel before prefill fires.
+/// 10ms adds at most 10ms to first-batch latency but can multiply throughput
+/// when many requests arrive "simultaneously".
+const PREFILL_ACCUMULATION_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 // ── Public request type ───────────────────────────────────────────────────────
 
@@ -171,8 +179,23 @@ fn run_loop(
     // Pre-allocated arena buffers — reused every iteration to avoid hot-path allocs.
     let mut active_indices: Vec<usize> = Vec::with_capacity(n_slots);
     let mut tokens_vec: Vec<u32> = Vec::with_capacity(n_slots);
-    // Scratch buffer for sample_token — avoids one Vec alloc per token generated.
+    // Scratch buffer for sample_token (prefill path only).
     let mut sample_scratch: Vec<(u32, f32)> = Vec::with_capacity(TOP_K + 1);
+
+    // ── GPU filter pipeline constants (Phase 2) ───────────────────────────
+    // log(PENALTY) subtracted from penalised-token logits — equivalent to
+    // dividing probability by PENALTY in probability space.
+    let log_rep_delta: f32 = -(REPETITION_PENALTY.ln());
+    // Maximum n-gram ban tokens per slot (padded with token 0 for unused slots).
+    const MAX_BAN: usize = 32;
+    // Pre-allocated flat CPU buffers for GPU scatter tensors — resized each step.
+    let mut add_idx_flat: Vec<u32> = Vec::new();
+    let mut add_val_flat: Vec<f32> = Vec::new();
+    let mut ban_idx_flat: Vec<u32> = Vec::new();
+    let mut force_eos_flags: Vec<u8> = Vec::new();
+    // Lazily initialised [1, vocab_size] tensor: -inf everywhere, 0 at eos_id.
+    // Built on the first decode step when vocab_size is known from logit shape.
+    let mut eos_only_logits: Option<Tensor> = None;
 
     'scheduler: loop {
         // ── Fill empty slots via batched prefill ──────────────────────────
@@ -210,8 +233,20 @@ fn run_loop(
                 Ok(req) => {
                     let mut pending = Vec::new();
                     tokenize_into_pending(model, req, &mut pending, metrics);
-                    while let Ok(r) = work_rx.try_recv() {
-                        tokenize_into_pending(model, r, &mut pending, metrics);
+                    // Accumulation window: collect additional items arriving within
+                    // PREFILL_ACCUMULATION_DELAY so concurrent requests aren't split
+                    // across separate prefill batches due to spawn_blocking thread
+                    // startup jitter (~1–5ms between threads).
+                    let deadline = std::time::Instant::now() + PREFILL_ACCUMULATION_DELAY;
+                    loop {
+                        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match work_rx.recv_timeout(remaining) {
+                            Ok(r) => tokenize_into_pending(model, r, &mut pending, metrics),
+                            Err(_) => break,
+                        }
                     }
                     if !pending.is_empty() {
                         batch_prefill_and_assign(
@@ -290,14 +325,147 @@ fn run_loop(
                 std::mem::replace(&mut batch_kv[bi], SlotKvCache { layers: Vec::new(), seq_len: 0 });
         }
 
-        // ── GPU→CPU transfer ─────────────────────────────────────────────
-        // Temperature is applied CPU-side after top-K selection (only ≤40
-        // candidates), avoiding a full-vocab GPU kernel every step.
-        let all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
-            .to_dtype(DType::F32)
-            .and_then(|t| t.to_vec2::<f32>())
-            .map_err(cerr)
-        {
+        // ── GPU filter pipeline (Phase 2) ────────────────────────────────
+        // Cast logits to F32 (may be BF16 on some backends). Creates a new
+        // contiguous tensor suitable for in-place scatter mutation.
+        let all_logits_t = match all_logits_t.to_dtype(DType::F32).map_err(cerr) {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = e.to_string();
+                for &si in &active_indices {
+                    if let Some(finished) = slots[si].take() {
+                        let _ = finished.reply_tx.send((finished.index, Err(TranslatorError::Model(msg.clone()))));
+                    }
+                }
+                continue;
+            }
+        };
+
+        // Derive vocab_size from logit tensor shape; initialise eos_only_logits once.
+        let vocab_size = match all_logits_t.dim(1).map_err(cerr) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                for &si in &active_indices {
+                    if let Some(finished) = slots[si].take() {
+                        let _ = finished.reply_tx.send((finished.index, Err(TranslatorError::Model(msg.clone()))));
+                    }
+                }
+                continue;
+            }
+        };
+        let eos_only = match eos_only_logits {
+            Some(ref t) => t,
+            None => {
+                let mut v = vec![f32::NEG_INFINITY; vocab_size];
+                v[eos_id as usize] = 0.0;
+                match Tensor::from_slice(&v, (1, vocab_size), model.device()).map_err(cerr) {
+                    Ok(t) => eos_only_logits.insert(t),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        for &si in &active_indices {
+                            if let Some(finished) = slots[si].take() {
+                                let _ = finished.reply_tx.send((
+                                    finished.index,
+                                    Err(TranslatorError::Model(msg.clone())),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+
+        // Build per-slot filter data in parallel (CPU work while GPU is idle).
+        // Each element: (slot_idx, output_ids, eos_bias, ban_ids, force_eos_flag)
+        type SlotFilterData = (usize, Vec<u32>, f32, Vec<u32>, bool);
+        let per_slot: Vec<SlotFilterData> = active_indices
+            .par_iter()
+            .map(|&slot_idx| {
+                let slot = slots[slot_idx].as_ref().unwrap();
+                let output_ids = slot.output_ids.clone();
+                let eos_bias = compute_length_bias(output_ids.len(), slot.expected_len);
+                let ban_ids = compute_ban_indices(&output_ids);
+                let force_eos =
+                    check_tail_repeat(&output_ids) || output_ids.len() + 1 >= SLOT_CAPACITY;
+                (slot_idx, output_ids, eos_bias, ban_ids, force_eos)
+            })
+            .collect();
+
+        // Flatten into rectangular CPU tensors:
+        //   add_idx/val [N, max_seq_len + 1] — rep penalty + EOS bias (one scatter call)
+        //   ban_idx     [N, MAX_BAN]          — n-gram banned tokens
+        //   force_eos   [N]                   — force-EOS flag
+        // Extra "+1" column holds the EOS index with its per-slot length-bias value.
+        let max_seq_len = per_slot.iter().map(|(_, ids, _, _, _)| ids.len()).max().unwrap_or(0);
+        let col_width = max_seq_len + 1; // last column = EOS length bias
+
+        add_idx_flat.clear();
+        add_val_flat.clear();
+        ban_idx_flat.clear();
+        force_eos_flags.clear();
+
+        for (_, output_ids, eos_bias, ban_ids, force_eos) in &per_slot {
+            // Rep penalty columns (pad short seqs with token 0 and value 0.0).
+            for &tok in output_ids.iter() {
+                add_idx_flat.push(tok);
+                add_val_flat.push(log_rep_delta);
+            }
+            for _ in output_ids.len()..max_seq_len {
+                add_idx_flat.push(0);
+                add_val_flat.push(0.0);
+            }
+            // EOS length bias (last column).
+            add_idx_flat.push(eos_id);
+            add_val_flat.push(*eos_bias);
+
+            // N-gram ban columns (pad with token 0 and -inf for unused entries).
+            let n_bans = ban_ids.len().min(MAX_BAN);
+            for &tok in ban_ids.iter().take(n_bans) {
+                ban_idx_flat.push(tok);
+            }
+            ban_idx_flat.extend(std::iter::repeat_n(0u32, MAX_BAN - n_bans));
+
+            force_eos_flags.push(*force_eos as u8);
+        }
+
+        // Upload small index/value tensors to GPU and apply filters in-place.
+        let gpu_result = (|| -> Result<Vec<u32>, TranslatorError> {
+            let add_idx_t =
+                Tensor::from_slice(&add_idx_flat, (n_active, col_width), model.device())
+                    .map_err(cerr)?;
+            let add_val_t =
+                Tensor::from_slice(&add_val_flat, (n_active, col_width), model.device())
+                    .map_err(cerr)?;
+            let ban_idx_t =
+                Tensor::from_slice(&ban_idx_flat, (n_active, MAX_BAN), model.device())
+                    .map_err(cerr)?;
+            let neg_inf_t =
+                Tensor::full(f32::NEG_INFINITY, (n_active, MAX_BAN), model.device())
+                    .map_err(cerr)?;
+
+            // In-place: rep penalty + EOS length bias.
+            all_logits_t.scatter_add_set(&add_idx_t, &add_val_t, 1).map_err(cerr)?;
+            // In-place: n-gram bans (set banned positions to -inf).
+            all_logits_t.scatter_set(&ban_idx_t, &neg_inf_t, 1).map_err(cerr)?;
+
+            // Force EOS for tail-repeat / capacity-exceeded slots.
+            let flags_t =
+                Tensor::from_slice(&force_eos_flags, (n_active, 1usize), model.device())
+                    .map_err(cerr)?
+                    .broadcast_as((n_active, vocab_size))
+                    .map_err(cerr)?;
+            let eos_only_broadcast =
+                eos_only.broadcast_as((n_active, vocab_size)).map_err(cerr)?;
+            let filtered_logits_t =
+                flags_t.where_cond(&eos_only_broadcast, &all_logits_t).map_err(cerr)?;
+
+            // GPU argmax → [N] u32 token IDs (only N×4 bytes transferred).
+            filtered_logits_t.argmax(1).map_err(cerr)?.to_vec1::<u32>().map_err(cerr)
+        })();
+
+        let tok_ids = match gpu_result {
             Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
@@ -310,47 +478,9 @@ fn run_loop(
             }
         };
 
-        // ── Per-slot: apply filters, sample, retire if EOS ────────────────
-        // Collect per-slot read-only data needed for the parallel sampling step.
-        // Cloning output_ids (typically a few hundred tokens) is far cheaper
-        // than the 25 MB logit transfer we just did.
-        let slot_data: Vec<(Vec<u32>, usize)> = active_indices
-            .iter()
-            .map(|&i| {
-                let slot = slots[i].as_ref().unwrap();
-                (slot.output_ids.clone(), slot.expected_len)
-            })
-            .collect();
-
-        // Parallel filter + sample — each task owns its own rng and scratch buffer.
-        // Rayon parallelises across active slots; serial retire loop follows.
-        let sampling_results: Vec<(usize, u32)> = all_logits_cpu
-            .into_par_iter()
-            .zip(active_indices.par_iter().copied())
-            .zip(slot_data.into_par_iter())
-            .map(|((mut logits, slot_idx), (output_ids, expected_len))| {
-                apply_decoding_filters(&mut logits, &output_ids);
-                apply_length_bias(&mut logits, eos_id, output_ids.len(), expected_len);
-                force_eos_on_tail_repeat(&mut logits, eos_id, &output_ids);
-
-                // Hard ceiling: force EOS when approaching capacity.
-                if output_ids.len() + 1 >= SLOT_CAPACITY {
-                    for (i, v) in logits.iter_mut().enumerate() {
-                        if i != eos_id as usize {
-                            *v = f32::NEG_INFINITY;
-                        }
-                    }
-                }
-
-                let mut local_rng = SmallRng::from_entropy();
-                let mut local_scratch = Vec::with_capacity(TOP_K + 1);
-                let tok = sample_token(&mut logits, &mut local_rng, &mut local_scratch);
-                (slot_idx, tok)
-            })
-            .collect();
-
-        // Serial retire/update — mutates slots[], cheap.
-        for (slot_idx, tok) in sampling_results {
+        // ── Serial retire/update — mutates slots[], cheap ─────────────────
+        for (i, tok) in tok_ids.into_iter().enumerate() {
+            let slot_idx = per_slot[i].0;
             let at_capacity = slots[slot_idx].as_ref().unwrap().output_ids.len() + 1 >= SLOT_CAPACITY;
             if tok == eos_id || at_capacity {
                 let finished = slots[slot_idx].take().unwrap();

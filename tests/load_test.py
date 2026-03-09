@@ -204,9 +204,9 @@ def print_results(
 # Language count helper
 # ---------------------------------------------------------------------------
 
-# The API expands "all" server-side. We report 61 (all non-English languages).
-# The engine applies the same-language shortcut for en→en, so fan-out is 61.
-EN_ALL_LANGUAGE_COUNT = 61
+# The engine supports 55 languages total. The same-language shortcut removes
+# en→en, so fan-out for an English source is 54.
+EN_ALL_LANGUAGE_COUNT = 54
 
 
 # ---------------------------------------------------------------------------

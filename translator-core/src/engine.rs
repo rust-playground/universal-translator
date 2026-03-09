@@ -160,12 +160,78 @@ pub struct TranslationEngine {
     duration_ms: opentelemetry::metrics::Histogram<f64>,
 }
 
+fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
+    // Env var always wins — allows manual tuning.
+    if let Some(n) = std::env::var("MAX_DECODE_SLOTS").ok().and_then(|v| v.parse().ok()) {
+        tracing::info!(n_slots = n, "n_slots from MAX_DECODE_SLOTS env var");
+        return n;
+    }
+
+    // Conservative estimate: F32 (4 bytes) even if BF16 is used at runtime.
+    // 200 tokens is a generous average for translation outputs.
+    // These are only consumed by the GPU feature branches below; allow unused on CPU builds.
+    #[allow(unused_variables)]
+    let kv_per_slot: usize = {
+        let n_layers = model.n_layers();
+        let n_kv_heads = model.n_kv_heads();
+        let head_dim = model.head_dim();
+        const AVG_OUTPUT_TOKENS: usize = 200;
+        n_layers * 2 * AVG_OUTPUT_TOKENS * n_kv_heads * head_dim * 4
+    };
+
+    #[cfg(feature = "metal")]
+    {
+        if let Ok(metal_dev) = model.device().as_metal_device() {
+            let raw = metal_dev.metal_device();
+            let budget = raw.recommended_max_working_set_size() as usize;
+            let used = raw.current_allocated_size() as usize;
+            let free = budget.saturating_sub(used);
+            // Reserve 15% for forward-pass activation tensors and Metal driver overhead.
+            let usable = free * 17 / 20;
+            let n = (usable / kv_per_slot.max(1)).clamp(4, 512);
+            tracing::info!(
+                budget_mb = budget / 1_048_576,
+                used_mb = used / 1_048_576,
+                free_mb = free / 1_048_576,
+                kv_slot_mb = kv_per_slot / 1_048_576,
+                n_slots = n,
+                "auto n_slots (Metal)"
+            );
+            return n;
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        if model.device().is_cuda() {
+            if let Ok((free, _total)) = cudarc::driver::result::mem_get_info() {
+                // Reserve 15% headroom for activations and CUDA driver overhead.
+                let usable = free * 17 / 20;
+                let n = (usable / kv_per_slot.max(1)).clamp(4, 512);
+                tracing::info!(
+                    free_mb = free / 1_048_576,
+                    kv_slot_mb = kv_per_slot / 1_048_576,
+                    n_slots = n,
+                    "auto n_slots (CUDA)"
+                );
+                return n;
+            }
+        }
+    }
+
+    // CPU fallback: decode throughput is memory-bandwidth-bound not slot-count-bound;
+    // 4 slots is enough to overlap prefill of new requests with ongoing decode steps.
+    tracing::info!(n_slots = 4, "auto n_slots (CPU)");
+    4
+}
+
 impl TranslationEngine {
     pub fn new(models_dir: impl AsRef<Path>) -> Result<Self, TranslatorError> {
-        let n_slots: usize = std::env::var("MAX_DECODE_SLOTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(24);
+        let model_dir = models_dir.as_ref().join("translategemma-4b");
+        tracing::info!(?model_dir, "Loading TranslateGemma model");
+        let model = Arc::new(LoadedGemmaModel::load(&model_dir)?);
+
+        let n_slots = auto_n_slots(&model);
         // Default: max(n_slots*4, 512) so that "all" language batches
         // (e.g. 9 texts × 55 languages = 495 items) don't instant-reject.
         let queue_capacity: usize = std::env::var("QUEUE_CAPACITY")
@@ -173,14 +239,25 @@ impl TranslationEngine {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| (n_slots * 4).max(512));
 
-        let model_dir = models_dir.as_ref().join("translategemma-4b");
-        tracing::info!(?model_dir, "Loading TranslateGemma model");
-        let model = Arc::new(LoadedGemmaModel::load(&model_dir)?);
-
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
         std::thread::Builder::new()
             .name("translator-scheduler".into())
-            .spawn(move || ContinuousScheduler::new(model, rx, n_slots).run())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ContinuousScheduler::new(model, rx, n_slots).run()
+                }));
+                if let Err(panic) = result {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("unknown panic");
+                    tracing::error!(
+                        panic = msg,
+                        "translator-scheduler thread panicked — service is down until restart"
+                    );
+                }
+            })
             .expect("failed to spawn translator-scheduler thread");
 
         #[cfg(feature = "opentelemetry")]

@@ -123,6 +123,67 @@ pub fn force_eos_on_tail_repeat(logits: &mut [f32], eos_token_id: u32, output_id
     }
 }
 
+// ── GPU filter index helpers ──────────────────────────────────────────────────
+
+/// Returns the list of token IDs banned by the no-repeat-n-gram filter.
+///
+/// Returns an empty vec when `output_ids` is too short to trigger the filter.
+/// Used to build the GPU ban-index tensor instead of mutating logits CPU-side.
+pub fn compute_ban_indices(output_ids: &[u32]) -> Vec<u32> {
+    let n = NO_REPEAT_NGRAM_SIZE;
+    if output_ids.len() < n - 1 {
+        return Vec::new();
+    }
+    let suffix = &output_ids[output_ids.len() - (n - 1)..];
+    let mut banned = Vec::new();
+    for window in output_ids.windows(n) {
+        if &window[..n - 1] == suffix {
+            banned.push(window[n - 1]);
+        }
+    }
+    banned
+}
+
+/// Returns `true` if a tail repeat was detected and EOS should be forced.
+///
+/// Mirrors the logic in [`force_eos_on_tail_repeat`] but returns a bool instead
+/// of mutating logits — for building the GPU force-EOS flag tensor.
+pub fn check_tail_repeat(output_ids: &[u32]) -> bool {
+    let n = TAIL_REPEAT_NGRAM;
+    let tail_len = TAIL_REPEAT_CHECK_LEN;
+
+    if output_ids.len() < tail_len + n {
+        return false;
+    }
+
+    let tail_start = output_ids.len() - tail_len;
+    for i in tail_start..=output_ids.len().saturating_sub(n) {
+        let ngram = &output_ids[i..i + n];
+        if output_ids[..tail_start].windows(n).any(|w| w == ngram) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Computes the additive EOS logit bias for the length penalty at the given step.
+///
+/// Returns 0.0 if `step / expected_len` is below [`LENGTH_PENALTY_START`].
+/// Used to populate the GPU EOS-bias scatter tensor instead of mutating logits.
+pub fn compute_length_bias(step: usize, expected_len: usize) -> f32 {
+    if expected_len == 0 {
+        return 0.0;
+    }
+    let progress = (step as f32) / (expected_len as f32);
+    if progress >= LENGTH_PENALTY_START {
+        let fraction =
+            ((progress - LENGTH_PENALTY_START) / (1.0 - LENGTH_PENALTY_START)).min(1.0);
+        fraction * EOS_LOGIT_BIAS
+    } else {
+        0.0
+    }
+}
+
 // ── Temperature / top-K / top-P sampling ─────────────────────────────────────
 
 /// Sampling temperature — lower = more peaked distribution.

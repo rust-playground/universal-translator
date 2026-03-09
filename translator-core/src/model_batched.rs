@@ -735,6 +735,18 @@ impl ModelWeights {
         self.layers.len()
     }
 
+    /// Return the number of KV heads (GQA key/value heads) from the first layer.
+    pub fn n_kv_heads(&self) -> usize {
+        debug_assert!(!self.layers.is_empty(), "ModelWeights has no layers");
+        self.layers[0].n_kv_head
+    }
+
+    /// Return the head dimension from the first layer.
+    pub fn head_dim(&self) -> usize {
+        debug_assert!(!self.layers.is_empty(), "ModelWeights has no layers");
+        self.layers[0].head_dim
+    }
+
     /// Return the device the model weights are on.
     pub fn device(&self) -> &Device {
         &self.device
