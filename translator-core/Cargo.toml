@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = []
 metal          = ["candle-core/metal", "candle-transformers/metal", "candle-nn/metal", "dep:metal"]
-cuda           = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda", "dep:cudarc"]
+cuda           = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-flash-attn"]
 opentelemetry  = ["dep:opentelemetry"]
 
 [dependencies]
@@ -26,3 +26,4 @@ rayon               = "1"
 opentelemetry       = { workspace = true, optional = true }
 metal              = { version = "0.29", optional = true }
 cudarc             = { version = "0.19", optional = true, default-features = false, features = ["driver"] }
+candle-flash-attn  = { version = "0.9", optional = true }

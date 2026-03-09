@@ -127,6 +127,8 @@ struct Slot {
     expected_len: usize,
     index: usize,
     reply_tx: mpsc::Sender<(usize, Result<String, TranslatorError>)>,
+    /// When this slot was assigned (after prefill). Used to measure decode latency.
+    assigned_at: std::time::Instant,
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -203,12 +205,19 @@ fn run_loop(
         }
 
         // ── Collect active slot indices (reuse pre-allocated vec) ─────────
+        // Sort by KV length descending so that shorter slots (more padding) are
+        // contiguous at the tail of the batch — reduces wasted attention compute.
         active_indices.clear();
         for (i, s) in slots.iter().enumerate() {
             if s.is_some() {
                 active_indices.push(i);
             }
         }
+        active_indices.sort_unstable_by(|&a, &b| {
+            let len_a = slots[a].as_ref().unwrap().decoder.kv_cache.seq_len;
+            let len_b = slots[b].as_ref().unwrap().decoder.kv_cache.seq_len;
+            len_b.cmp(&len_a) // descending
+        });
 
         let n_active = active_indices.len();
 
@@ -347,25 +356,45 @@ fn run_loop(
 
         // GPU: single argmax over [N, vocab] → [N] token IDs.
         // No new MTLBuffer allocations — operates on existing all_logits_t tensor.
+        let _t_argmax_issue = std::time::Instant::now();
         let argmax_result: Result<Vec<u32>, TranslatorError> = (|| {
             let tok_ids_t = all_logits_t.argmax(D::Minus1).map_err(cerr)?;
+            let argmax_issue_us = _t_argmax_issue.elapsed().as_micros(); // Metal command queue time
+
+            let _t_sync = std::time::Instant::now();
             let mut tok_ids: Vec<u32> = tok_ids_t.to_vec1::<u32>().map_err(cerr)?;
+            let sync_us = _t_sync.elapsed().as_micros(); // actual GPU execution (forward + argmax)
+
             for (bi, tok) in tok_ids.iter_mut().enumerate() {
                 if force_eos_flags[bi] || at_budget_flags[bi] {
                     *tok = eos_id;
                 }
             }
+            let cpu_us = _t_cpu.elapsed().as_micros();
+            tracing::info!(
+                n_active,
+                fw_us,
+                argmax_issue_us,
+                sync_us,
+                cpu_us,
+                total_us = _t_step.elapsed().as_micros(),
+                "decode step"
+            );
             Ok(tok_ids)
         })();
 
-        let cpu_us = _t_cpu.elapsed().as_micros();
-        tracing::debug!(
-            n_active,
-            fw_us,
-            cpu_us,
-            total_us = _t_step.elapsed().as_micros(),
-            "decode step"
-        );
+        if argmax_result.is_err() {
+            let cpu_us = _t_cpu.elapsed().as_micros();
+            tracing::info!(
+                n_active,
+                fw_us,
+                argmax_issue_us = _t_argmax_issue.elapsed().as_micros(),
+                sync_us = 0u128,
+                cpu_us,
+                total_us = _t_step.elapsed().as_micros(),
+                "decode step (error)"
+            );
+        }
 
         let tok_ids = match argmax_result {
             Ok(v) => v,
@@ -394,7 +423,8 @@ fn run_loop(
             if tok == eos_id || at_capacity {
                 let finished = slots[slot_idx].take().unwrap();
                 let cause = if tok == eos_id { "eos" } else { "capacity" };
-                tracing::debug!(tokens = finished.output_ids.len(), cause, "slot retired");
+                let slot_ms = finished.assigned_at.elapsed().as_millis();
+                tracing::info!(tokens = finished.output_ids.len(), cause, slot_ms, "slot retired");
                 #[cfg(feature = "opentelemetry")]
                 {
                     use opentelemetry::KeyValue;
@@ -407,6 +437,26 @@ fn run_loop(
                 let slot = slots[slot_idx].as_mut().unwrap();
                 slot.output_ids.push(tok);
                 slot.current_token = tok;
+            }
+        }
+
+        // ── Overlap: fill freed slots immediately ────────────────────────
+        // Under sustained load, new requests may be waiting in the channel.
+        // Prefilling into freed slots here avoids wasting decode steps with
+        // empty slots.
+        let n_empty_after = slots.iter().filter(|s| s.is_none()).count();
+        if n_empty_after > 0 {
+            // Drain carry_over first, then channel.
+            let from_carry = carry_over.len().min(n_empty_after);
+            let mut pending: Vec<PendingPrefill> = carry_over.drain(..from_carry).collect();
+            let remaining = n_empty_after - pending.len();
+            if remaining > 0 {
+                pending.extend(collect_pending(model, work_rx, remaining, metrics));
+            }
+            if !pending.is_empty() {
+                batch_prefill_and_assign(
+                    model, &mut pending, &mut slots, eos_id, &mut rng, metrics,
+                );
             }
         }
     }
@@ -480,6 +530,7 @@ fn batch_prefill_and_assign(
     #[cfg(feature = "opentelemetry")]
     let _pf = std::time::Instant::now();
 
+    let _t_pf_fw = std::time::Instant::now();
     let all_logits_t = match model.forward_prefill_batched(&seqs, &mut kv_caches) {
         Ok(t) => t,
         Err(e) => {
@@ -490,11 +541,13 @@ fn batch_prefill_and_assign(
             return;
         }
     };
+    let prefill_fw_ms = _t_pf_fw.elapsed().as_millis();
 
     #[cfg(feature = "opentelemetry")]
     metrics.prefill_ms.record(_pf.elapsed().as_millis() as f64, &[]);
 
     // Transfer all logits to CPU. Temperature is applied CPU-side after top-K.
+    let _t_pf_sync = std::time::Instant::now();
     let all_logits_cpu = match all_logits_t
         .to_dtype(DType::F32)
         .and_then(|t| t.to_vec2::<f32>())
@@ -508,6 +561,13 @@ fn batch_prefill_and_assign(
             return;
         }
     };
+    let prefill_sync_ms = _t_pf_sync.elapsed().as_millis();
+    tracing::info!(
+        batch = seqs.len(),
+        prefill_fw_ms,
+        prefill_sync_ms,
+        "prefill done"
+    );
 
     let mut kv_iter = kv_caches.into_iter();
     for (pb, mut logits) in pending.drain(..).zip(all_logits_cpu) {
@@ -534,6 +594,7 @@ fn batch_prefill_and_assign(
                     expected_len: pb.expected_len,
                     index: pb.index,
                     reply_tx: pb.reply_tx,
+                    assigned_at: std::time::Instant::now(),
                 });
                 break;
             }

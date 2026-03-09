@@ -160,14 +160,14 @@ pub struct TranslationEngine {
     duration_ms: opentelemetry::metrics::Histogram<f64>,
 }
 
-/// Default cap on concurrent decode slots for latency-sensitive deployments.
-///
-/// Metal Q4 decode step time scales ~linearly with batch size; capping at 8
-/// keeps step_time ≤ 360ms so a 24-token output completes in ~8.6s instead
-/// of ~21.6s with 20 concurrent items. Throughput (tokens/sec) is unchanged.
-/// Override with MAX_DECODE_SLOTS env var.
+/// Metal: 32 slots — Metal GPU scales sub-linearly above ~10 active slots.
 #[allow(dead_code)]
-const DEFAULT_MAX_DECODE_SLOTS: usize = 8;
+const DEFAULT_MAX_DECODE_SLOTS_METAL: usize = 32;
+
+/// CUDA: 128 slots — NVIDIA GPUs have higher compute throughput and memory bandwidth.
+/// With flash attention, scaling remains efficient well beyond 32 active slots.
+#[allow(dead_code)]
+const DEFAULT_MAX_DECODE_SLOTS_CUDA: usize = 128;
 
 fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
     // Env var always wins — allows manual tuning.
@@ -176,7 +176,7 @@ fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
         return n;
     }
 
-    // Conservative estimate: F32 (4 bytes) even if BF16 is used at runtime.
+    // KV cache bytes per element: F16 on CUDA (flash attention), F32 on Metal/CPU.
     // 200 tokens is a generous average for translation outputs.
     // These are only consumed by the GPU feature branches below; allow unused on CPU builds.
     #[allow(unused_variables)]
@@ -185,19 +185,25 @@ fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
         let n_kv_heads = model.n_kv_heads();
         let head_dim = model.head_dim();
         const AVG_OUTPUT_TOKENS: usize = 200;
-        n_layers * 2 * AVG_OUTPUT_TOKENS * n_kv_heads * head_dim * 4
+
+        #[cfg(feature = "cuda")]
+        const BYTES_PER_ELEMENT: usize = 2; // F16 KV cache
+        #[cfg(not(feature = "cuda"))]
+        const BYTES_PER_ELEMENT: usize = 4; // F32 KV cache
+
+        n_layers * 2 * AVG_OUTPUT_TOKENS * n_kv_heads * head_dim * BYTES_PER_ELEMENT
     };
 
     #[cfg(feature = "metal")]
     {
         if let Ok(metal_dev) = model.device().as_metal_device() {
             let raw = metal_dev.metal_device();
-            let budget = raw.recommended_max_working_set_size() as usize;
-            let used = raw.current_allocated_size() as usize;
+            let budget = raw.recommended_max_working_set_size();
+            let used = raw.current_allocated_size();
             let free = budget.saturating_sub(used);
             // Reserve 15% for forward-pass activation tensors and Metal driver overhead.
             let usable = free * 17 / 20;
-            let n = (usable / kv_per_slot.max(1)).clamp(4, DEFAULT_MAX_DECODE_SLOTS);
+            let n = (usable / kv_per_slot.max(1)).clamp(4, DEFAULT_MAX_DECODE_SLOTS_METAL);
             tracing::info!(
                 budget_mb = budget / 1_048_576,
                 used_mb = used / 1_048_576,
@@ -216,7 +222,7 @@ fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
             if let Ok((free, _total)) = cudarc::driver::result::mem_get_info() {
                 // Reserve 15% headroom for activations and CUDA driver overhead.
                 let usable = free * 17 / 20;
-                let n = (usable / kv_per_slot.max(1)).clamp(4, DEFAULT_MAX_DECODE_SLOTS);
+                let n = (usable / kv_per_slot.max(1)).clamp(4, DEFAULT_MAX_DECODE_SLOTS_CUDA);
                 tracing::info!(
                     free_mb = free / 1_048_576,
                     kv_slot_mb = kv_per_slot / 1_048_576,
@@ -433,14 +439,23 @@ impl TranslationEngine {
             tracing::info!(enqueue_ms = t1.elapsed().as_millis(), "phase 3 done");
 
             let t2 = std::time::Instant::now();
+            let mut first_reply_ms: Option<u128> = None;
             let mut translated: Vec<Option<String>> = vec![None; work_item_count];
-            for _ in 0..enqueued {
+            for n_recv in 0..enqueued {
                 let (idx, result) = reply_rx
                     .recv()
                     .map_err(|_| TranslatorError::TranslationFailed("scheduler dropped reply".into()))?;
+                if n_recv == 0 {
+                    first_reply_ms = Some(t2.elapsed().as_millis());
+                }
                 translated[idx] = Some(result?);
             }
-            tracing::info!(reply_wait_ms = t2.elapsed().as_millis(), "phase 4 done (replies received)");
+            tracing::info!(
+                first_reply_ms = first_reply_ms.unwrap_or(0),
+                all_replies_ms = t2.elapsed().as_millis(),
+                work_items = enqueued,
+                "phase 4 done (replies received)"
+            );
 
             for ((text_idx, target_lang), result) in
                 work_indices.iter().zip(translated.into_iter().map(|o| o.unwrap()))

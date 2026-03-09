@@ -287,19 +287,45 @@ impl LayerWeights {
 
         let (q, k) = self.rotary_embedding.apply_rotary_emb_qkv(&q, &k, index_pos)?;
 
-        let (k, v) = match kv.as_ref() {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
-                if index_pos == 0 {
-                    (k, v)
-                } else {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?;
-                    let v = Tensor::cat(&[v_cache, &v], 2)?;
-                    (k, v)
+        // CUDA: store KV in F16 (flash attention operates natively on F16).
+        // Metal/CPU: store KV in F32 (avoids 4 dtype conversions × 26 layers overhead).
+        #[cfg(feature = "cuda")]
+        let (k, v) = {
+            let k_f16 = k.to_dtype(DType::F16)?;
+            let v_f16 = v.to_dtype(DType::F16)?;
+            let (k_cached, v_cached) = match kv.as_ref() {
+                None => (k_f16, v_f16),
+                Some((k_cache, v_cache)) => {
+                    if index_pos == 0 {
+                        (k_f16, v_f16)
+                    } else {
+                        let k_c = Tensor::cat(&[k_cache, &k_f16], 2)?;
+                        let v_c = Tensor::cat(&[v_cache, &v_f16], 2)?;
+                        (k_c, v_c)
+                    }
                 }
-            }
+            };
+            *kv = Some((k_cached.clone(), v_cached.clone()));
+            (k_cached.to_dtype(DType::F32)?, v_cached.to_dtype(DType::F32)?)
         };
-        *kv = Some((k.clone(), v.clone()));
+
+        #[cfg(not(feature = "cuda"))]
+        let (k, v) = {
+            let (k_cached, v_cached) = match kv.as_ref() {
+                None => (k, v),
+                Some((k_cache, v_cache)) => {
+                    if index_pos == 0 {
+                        (k, v)
+                    } else {
+                        let k_c = Tensor::cat(&[k_cache, &k], 2)?;
+                        let v_c = Tensor::cat(&[v_cache, &v], 2)?;
+                        (k_c, v_c)
+                    }
+                }
+            };
+            *kv = Some((k_cached.clone(), v_cached.clone()));
+            (k_cached, v_cached)
+        };
 
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
@@ -359,6 +385,13 @@ impl LayerWeights {
 
         let (q, k) = self.rotary_embedding.apply_rotary_emb_batched(&q, &k, positions)?;
 
+        // CUDA: store KV in F16 (flash attention operates natively on F16).
+        // Metal/CPU: store KV in F32 (avoids dtype conversion overhead).
+        #[cfg(feature = "cuda")]
+        let (k_new, v_new) = (k.to_dtype(DType::F16)?, v.to_dtype(DType::F16)?);
+        #[cfg(not(feature = "cuda"))]
+        let (k_new, v_new) = (k, v);
+
         // Build per-slot padded KV tensors and attention masks
         let total_kv_len = max_kv_len + 1;
         let device = x.device();
@@ -374,8 +407,8 @@ impl LayerWeights {
             let pos_i = positions[i]; // = seq_len BEFORE this step
 
             // Extract new K/V for slot i: [1, n_kv_head, 1, head_dim]
-            let k_new_i = k.i(i)?.unsqueeze(0)?;
-            let v_new_i = v.i(i)?.unsqueeze(0)?;
+            let k_new_i = k_new.i(i)?.unsqueeze(0)?;
+            let v_new_i = v_new.i(i)?.unsqueeze(0)?;
 
             // Cat with existing cache
             let (k_updated, v_updated) = match &kv_caches[i].layers[layer_idx] {
@@ -421,28 +454,42 @@ impl LayerWeights {
         // Stack across batch
         let k_all = Tensor::cat(&k_list, 0)?; // [N, n_kv_head, total_kv_len, head_dim]
         let v_all = Tensor::cat(&v_list, 0)?;
-        // Upload the single flat mask buffer as one tensor — no per-slot alloc or cat.
-        let mask_all = Tensor::from_slice(mask_buf, (n, 1usize, 1usize, total_kv_len), device)?; // [N, 1, 1, total_kv_len]
 
-        // GQA: expand kv heads to match query head count
-        let k_all = repeat_kv(k_all, self.n_head / self.n_kv_head)?;
-        let v_all = repeat_kv(v_all, self.n_head / self.n_kv_head)?;
+        #[cfg(feature = "cuda")]
+        let attn_output = {
+            // Flash attention: operates on F16 natively, no padding masks needed.
+            // Expects (batch, seqlen, heads, dim) layout.
+            let q_fa = q.to_dtype(DType::F16)?.transpose(1, 2)?; // [N, 1, n_head, head_dim]
+            let k_fa = repeat_kv(k_all, self.n_head / self.n_kv_head)?.transpose(1, 2)?;
+            let v_fa = repeat_kv(v_all, self.n_head / self.n_kv_head)?.transpose(1, 2)?;
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            let attn = candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale as f32, false)?;
+            // attn: [N, 1, n_head, head_dim] → [N, 1, q_dim]
+            attn.to_dtype(DType::F32)?.reshape((n, seq_len, self.q_dim))?
+        };
 
-        // Scaled dot-product attention
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut attn_weights = (q.matmul(&k_all.transpose(2, 3)?)? * scale)?;
-        // attn_weights: [N, n_head, 1, total_kv_len]
+        #[cfg(not(feature = "cuda"))]
+        let attn_output = {
+            // Upload the single flat mask buffer as one tensor — no per-slot alloc or cat.
+            let mask_all = Tensor::from_slice(mask_buf, (n, 1usize, 1usize, total_kv_len), device)?;
 
-        let mask_bc = mask_all.broadcast_as(attn_weights.shape())?;
-        let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
-        attn_weights = mask_bc.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
+            // GQA: expand kv heads to match query head count
+            let k_all = repeat_kv(k_all, self.n_head / self.n_kv_head)?;
+            let v_all = repeat_kv(v_all, self.n_head / self.n_kv_head)?;
 
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v_all)?;
-        // attn_output: [N, n_head, 1, head_dim]
+            // Scaled dot-product attention
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            let mut attn_weights = (q.matmul(&k_all.transpose(2, 3)?)? * scale)?;
 
-        let attn_output =
-            attn_output.transpose(1, 2)?.reshape((n, seq_len, self.q_dim))?;
+            let mask_bc = mask_all.broadcast_as(attn_weights.shape())?;
+            let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
+            attn_weights = mask_bc.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
+
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_out = attn_weights.matmul(&v_all)?;
+            attn_out.transpose(1, 2)?.reshape((n, seq_len, self.q_dim))?
+        };
+
         self.attention_wo.forward(&attn_output)
     }
 
@@ -480,9 +527,12 @@ impl LayerWeights {
 
         let (q, k) = self.rotary_embedding.apply_rotary_emb_prefill(&q, &k, max_len)?;
 
-        // Clone K/V before GQA expansion — needed for cache storage (without extra head copies).
-        let k_for_cache = k.clone();
-        let v_for_cache = v.clone();
+        // CUDA: F16 cache (flash attention uses F16 natively).
+        // Metal/CPU: F32 cache (no dtype conversion overhead).
+        #[cfg(feature = "cuda")]
+        let (k_for_cache, v_for_cache) = (k.to_dtype(DType::F16)?, v.to_dtype(DType::F16)?);
+        #[cfg(not(feature = "cuda"))]
+        let (k_for_cache, v_for_cache) = (k.clone(), v.clone());
 
         // GQA: expand kv heads to full head count
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
