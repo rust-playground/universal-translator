@@ -26,9 +26,15 @@ bash models/download.sh   # requires: pip install huggingface_hub[cli] && hf aut
 ```
 
 Downloads TranslateGemma 4B. Required files in `${MODELS_DIR}/translategemma-4b/`:
-- `model-q4k.gguf` (~2.6 GB, GGUF Q4_K_M quantised weights)
+- `model-q4k.gguf` (~2.6 GB, GGUF Q4_K_M quantised weights — default, 22% higher throughput)
 - `config.json`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`
 
+Optional higher-precision weights:
+```bash
+bash models/download.sh --q8   # also downloads Q8_0 (~4.1 GB)
+```
+
+Select model file at runtime: `--model-file model-q8_0.gguf` flag or `MODEL_FILE=model-q8_0.gguf` env var.
 Default `MODELS_DIR`: platform cache directory (via `dirs` crate). Override with `--models-dir` flag or `MODELS_DIR` env var.
 
 ## Running
@@ -43,8 +49,8 @@ cargo run -p translator-cli -- detect -t "Bonjour"
 cargo run -p translator-api
 ```
 
-Key CLI flags: `--models-dir`, `--output json`.
-Key API env vars: `MODELS_DIR`, `RUST_LOG`.
+Key CLI flags: `--models-dir`, `--model-file`, `--output json`.
+Key API env vars: `MODELS_DIR`, `MODEL_FILE`, `RUST_LOG`.
 
 ## Architecture
 

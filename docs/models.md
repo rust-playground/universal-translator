@@ -50,7 +50,8 @@ From [`mradermacher/translategemma-4b-it-GGUF`](https://huggingface.co/mradermac
 
 | File | Size | Description |
 |------|------|-------------|
-| `model-q4k.gguf` | ~2.6 GB | Q4_K_M quantised GGUF weights |
+| `model-q4k.gguf` | ~2.6 GB | Q4_K_M quantised GGUF weights (default) |
+| `model-q8_0.gguf` | ~4.1 GB | Q8_0 quantised GGUF weights (optional, `--q8` flag) |
 
 **Phase 2 — Tokenizer + config (gated — requires HF login and Gemma license acceptance)**
 From [`google/translategemma-4b-it`](https://huggingface.co/google/translategemma-4b-it):
@@ -74,14 +75,44 @@ After running `download.sh`, the model directory should look like this:
 
 ```
 ${MODELS_DIR}/translategemma-4b/
-├── model-q4k.gguf          # ~2.6 GB — Q4_K_M quantised GGUF weights
+├── model-q4k.gguf          # ~2.6 GB — Q4_K_M quantised GGUF weights (default)
+├── model-q8_0.gguf         # ~4.1 GB — Q8_0 quantised GGUF weights (optional)
 ├── config.json
 ├── tokenizer.json
 ├── tokenizer_config.json
 └── special_tokens_map.json
 ```
 
-If any of these files are missing the engine will fail to load the model at startup.
+Only `model-q4k.gguf` is required. `model-q8_0.gguf` is optional (download with `--q8` flag).
+
+---
+
+## Runtime model selection
+
+The engine auto-detects the GGUF file with this priority:
+
+1. `--model-file` CLI/API flag (highest priority)
+2. `MODEL_FILE` environment variable
+3. `model-q4k.gguf` (preferred default — ~22% higher throughput)
+4. `model-q8_0.gguf` (fallback if Q4_K not present)
+5. Any `*.gguf` in the directory (last resort)
+
+```bash
+# Use Q8_0 via CLI flag
+ut --model-file model-q8_0.gguf translate -t "Hello" -l fr
+
+# Use Q8_0 via env var
+MODEL_FILE=model-q8_0.gguf cargo run -p translator-cli -- translate -t "Hello" -l fr
+
+# API server with Q8_0
+cargo run -p translator-api -- --model-file model-q8_0.gguf
+MODEL_FILE=model-q8_0.gguf cargo run -p translator-api
+```
+
+| Format | File | Size | Throughput | Quality |
+|--------|------|------|------------|---------|
+| Q4_K_M | `model-q4k.gguf` | ~2.6 GB | ~22% faster | Excellent — imperceptible difference from Q8_0 |
+| Q8_0 | `model-q8_0.gguf` | ~4.1 GB | Baseline | Highest precision among quantised formats |
 
 ---
 

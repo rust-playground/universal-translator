@@ -17,9 +17,9 @@ pub enum Commands {
 }
 
 impl Commands {
-    pub fn run(self, models_dir: &Path) -> Result<()> {
+    pub fn run(self, models_dir: &Path, model_file: Option<&str>) -> Result<()> {
         match self {
-            Commands::Translate(args) => args.run(models_dir),
+            Commands::Translate(args) => args.run(models_dir, model_file),
             Commands::Detect(args) => args.run(models_dir),
             Commands::DetectLanguage(args) => args.run(models_dir),
             Commands::Languages(args) => args.run(),

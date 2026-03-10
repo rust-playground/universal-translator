@@ -30,8 +30,8 @@ pub struct TranslateArgs {
 }
 
 impl TranslateArgs {
-    pub fn run(self, models_dir: &Path) -> Result<()> {
-        let engine = TranslationEngine::new(models_dir)?;
+    pub fn run(self, models_dir: &Path, model_file: Option<&str>) -> Result<()> {
+        let engine = TranslationEngine::new(models_dir, model_file)?;
         let batch = TranslationBatch {
             texts: self.texts,
             target_languages: self.languages,

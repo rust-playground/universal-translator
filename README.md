@@ -84,7 +84,13 @@ bash models/download.sh
 
 This downloads TranslateGemma 4B (~2.6 GB, Q4_K_M quantised, gated — requires HF login and
 [Gemma license acceptance](https://huggingface.co/google/translategemma-4b-it)) into the
-default model directory.
+default model directory. For higher-precision Q8_0 weights (~4.1 GB):
+
+```bash
+bash models/download.sh --q8
+```
+
+Use `--model-file model-q8_0.gguf` to select Q8_0 at runtime. Q4_K_M is the default (higher throughput, imperceptible quality difference).
 See [docs/models.md](docs/models.md) for details, directory layout, and alternative hosting options.
 
 ### Run the API server

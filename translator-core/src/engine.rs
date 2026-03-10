@@ -242,10 +242,10 @@ fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
 }
 
 impl TranslationEngine {
-    pub fn new(models_dir: impl AsRef<Path>) -> Result<Self, TranslatorError> {
+    pub fn new(models_dir: impl AsRef<Path>, model_file: Option<&str>) -> Result<Self, TranslatorError> {
         let model_dir = models_dir.as_ref().join("translategemma-4b");
         tracing::info!(?model_dir, "Loading TranslateGemma model");
-        let model = Arc::new(LoadedGemmaModel::load(&model_dir)?);
+        let model = Arc::new(LoadedGemmaModel::load(&model_dir, model_file)?);
 
         let n_slots = auto_n_slots(&model);
         // Default: max(n_slots*4, 512) so that "all" language batches

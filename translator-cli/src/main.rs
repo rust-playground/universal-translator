@@ -19,6 +19,11 @@ struct Cli {
     #[arg(long)]
     models_dir: Option<PathBuf>,
 
+    /// GGUF model file name within the model directory (e.g. "model-q8_0.gguf").
+    /// Overrides MODEL_FILE env var and auto-detection.
+    #[arg(long)]
+    model_file: Option<String>,
+
     #[command(subcommand)]
     command: commands::Commands,
 }
@@ -31,5 +36,5 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let models_dir = cli.models_dir.unwrap_or_else(default_models_dir);
-    cli.command.run(&models_dir)
+    cli.command.run(&models_dir, cli.model_file.as_deref())
 }

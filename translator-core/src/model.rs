@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use candle_core::quantized::gguf_file;
@@ -38,11 +38,77 @@ fn select_device() -> Result<Device, TranslatorError> {
     Ok(Device::Cpu)
 }
 
+/// Find the first `*.gguf` file in a directory.
+fn find_gguf_file(dir: &Path) -> Result<PathBuf, TranslatorError> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(TranslatorError::Io)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "gguf"))
+        .collect();
+    entries.sort();
+    entries.into_iter().next().ok_or_else(|| {
+        TranslatorError::ModelNotFound(format!(
+            "no .gguf file found in {} — run models/download.sh",
+            dir.display()
+        ))
+    })
+}
+
+/// Resolve the GGUF model file path.
+///
+/// Priority:
+/// 1. Explicit `model_file` param (from `--model-file` flag)
+/// 2. `MODEL_FILE` env var
+/// 3. `model-q4k.gguf` (preferred default — higher throughput)
+/// 4. `model-q8_0.gguf` (fallback if Q4_K not present)
+/// 5. Any `*.gguf` in directory (last resort)
+fn resolve_gguf_path(model_dir: &Path, model_file: Option<&str>) -> Result<PathBuf, TranslatorError> {
+    // 1. Explicit --model-file flag
+    if let Some(name) = model_file {
+        let path = model_dir.join(name);
+        if !path.exists() {
+            return Err(TranslatorError::ModelNotFound(format!(
+                "--model-file {name} not found at {}",
+                path.display()
+            )));
+        }
+        return Ok(path);
+    }
+
+    // 2. MODEL_FILE env var
+    if let Ok(name) = std::env::var("MODEL_FILE") {
+        let path = model_dir.join(&name);
+        if !path.exists() {
+            return Err(TranslatorError::ModelNotFound(format!(
+                "MODEL_FILE={name} not found at {}",
+                path.display()
+            )));
+        }
+        return Ok(path);
+    }
+
+    // 3. Q4_K_M default (preferred — higher throughput)
+    let q4k = model_dir.join("model-q4k.gguf");
+    if q4k.exists() {
+        return Ok(q4k);
+    }
+
+    // 4. Q8_0 fallback
+    let q8 = model_dir.join("model-q8_0.gguf");
+    if q8.exists() {
+        return Ok(q8);
+    }
+
+    // 5. Any *.gguf in directory
+    find_gguf_file(model_dir)
+}
+
 /// A loaded TranslateGemma 4B model with its HuggingFace tokenizer.
 ///
 /// Loaded from a directory containing:
-///   model-q4k.gguf   — quantized weights (Q4_K, ~2.5 GB)
-///   tokenizer.json   — HuggingFace fast tokenizer
+///   *.gguf            — quantized weights (Q4_K_M, Q8_0, etc.)
+///   tokenizer.json    — HuggingFace fast tokenizer
 ///
 /// Weights are Arc-shared inside the local `ModelWeights` type.  KV cache is
 /// stored externally in per-slot [`SlotKvCache`] structs, so this struct is
@@ -62,16 +128,12 @@ unsafe impl Sync for LoadedGemmaModel {}
 
 impl LoadedGemmaModel {
     /// Load the model directory.
-    pub fn load(model_dir: &Path) -> Result<Self, TranslatorError> {
+    ///
+    /// `model_file` overrides automatic GGUF file selection (e.g. `"model-q8_0.gguf"`).
+    pub fn load(model_dir: &Path, model_file: Option<&str>) -> Result<Self, TranslatorError> {
         let device = select_device()?;
 
-        let gguf_path = model_dir.join("model-q4k.gguf");
-        if !gguf_path.exists() {
-            return Err(TranslatorError::ModelNotFound(format!(
-                "{} not found — run models/download.sh",
-                gguf_path.display()
-            )));
-        }
+        let gguf_path = resolve_gguf_path(model_dir, model_file)?;
 
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| TranslatorError::Model(format!("tokenizer load: {e}")))?;
@@ -89,7 +151,11 @@ impl LoadedGemmaModel {
         let model_weights = ModelWeights::from_gguf(content, &mut reader, &device)
             .map_err(|e| TranslatorError::Model(format!("model init: {e}")))?;
 
-        tracing::info!("TranslateGemma model loaded from {}", model_dir.display());
+        tracing::info!(
+            "TranslateGemma model loaded: {} (from {})",
+            gguf_path.file_name().unwrap_or_default().to_string_lossy(),
+            model_dir.display()
+        );
 
         Ok(Self {
             model_weights,

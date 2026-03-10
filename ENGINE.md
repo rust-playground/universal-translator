@@ -26,7 +26,10 @@ a single initialisation with a lock-free read path afterwards.
 **TranslateGemma 4B** — Gemma 3 4B instruction-tuned, decoder-only, fine-tuned for
 translation across 55 languages.
 
-- Weights: Q4_K_M quantised GGUF, ~2.6 GB
+- Weights: GGUF quantised — two formats supported:
+  - **Q4_K_M** (`model-q4k.gguf`, ~2.6 GB) — default, ~22% higher decode throughput
+  - **Q8_0** (`model-q8_0.gguf`, ~4.1 GB) — opt-in, higher precision, imperceptible quality difference for most use cases
+- Selection: `--model-file` flag or `MODEL_FILE` env var. Default auto-detects Q4_K_M → Q8_0 → any `*.gguf`.
 - Framework: [Candle](https://github.com/huggingface/candle) (`candle-core`,
   `candle-transformers`, `candle-nn`)
 - Tokenizer: HuggingFace fast tokenizer (`tokenizers` crate, `tokenizer.json`)

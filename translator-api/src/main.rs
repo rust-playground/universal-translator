@@ -29,6 +29,11 @@ struct Args {
     #[arg(long, env = "MODELS_DIR")]
     models_dir: Option<PathBuf>,
 
+    /// GGUF model file name (e.g. "model-q8_0.gguf").
+    /// Overrides auto-detection. Also settable via MODEL_FILE env var.
+    #[arg(long, env = "MODEL_FILE")]
+    model_file: Option<String>,
+
     /// TCP port to listen on.
     #[arg(long, default_value_t = 3000)]
     port: u16,
@@ -116,7 +121,7 @@ async fn main() {
 
     tracing::info!(?models_dir, "Loading translation engine");
 
-    let engine = TranslationEngine::new(&models_dir).unwrap_or_else(|e| {
+    let engine = TranslationEngine::new(&models_dir, args.model_file.as_deref()).unwrap_or_else(|e| {
         tracing::error!("Failed to load model: {e}");
         std::process::exit(1);
     });
