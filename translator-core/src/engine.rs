@@ -74,14 +74,14 @@ fn lang_full_name(code: &str) -> &str {
     }
 }
 
-/// Build the variable suffix of a Gemma instruct-format translation prompt.
-///
-/// The static system prefix is pre-tokenized in `LoadedGemmaModel::system_prefix_ids`.
-/// This returns only the variable part (user turn + model turn start) that gets
-/// tokenized separately and concatenated with the cached prefix IDs.
-fn translate_gemma_suffix(src_lang: &str, tgt_lang: &str, text: &str) -> String {
+/// Build a full Gemma instruct-format translation prompt.
+fn translate_gemma_prompt(src_lang: &str, tgt_lang: &str, text: &str) -> String {
     format!(
-        "Translate from {} to {}:\n{}<end_of_turn>\n\
+        "<bos><start_of_turn>system\n\
+         You are a translation engine. Output only the translated text. \
+         Do not add explanations, alternatives, notes, or any other text.<end_of_turn>\n\
+         <start_of_turn>user\n\
+         Translate from {} to {}:\n{}<end_of_turn>\n\
          <start_of_turn>model\n",
         lang_full_name(src_lang),
         lang_full_name(tgt_lang),
@@ -136,8 +136,6 @@ pub fn supported_languages() -> Vec<&'static str> {
 pub struct TranslationEngine {
     worker_tx: crossbeam_channel::Sender<InferRequest>,
     detector: Arc<Detector>,
-    /// Shared model reference — used for tokenization on the engine thread.
-    model: Arc<LoadedGemmaModel>,
     /// Bounded channel capacity — respects QUEUE_CAPACITY env var.
     queue_capacity: usize,
     #[cfg(feature = "opentelemetry")]
@@ -244,12 +242,11 @@ impl TranslationEngine {
             .unwrap_or_else(|| (n_slots * 4).max(512));
 
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
-        let model_for_scheduler = Arc::clone(&model);
         std::thread::Builder::new()
             .name("translator-scheduler".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    ContinuousScheduler::new(model_for_scheduler, rx, n_slots).run()
+                    ContinuousScheduler::new(model, rx, n_slots).run()
                 }));
                 if let Err(panic) = result {
                     let msg = panic
@@ -270,7 +267,6 @@ impl TranslationEngine {
         Ok(Self {
             worker_tx: tx,
             detector: Arc::new(Detector::new()),
-            model,
             queue_capacity,
             #[cfg(feature = "opentelemetry")]
             requests: meter.u64_counter("translator.translation.requests").build(),
@@ -351,9 +347,8 @@ impl TranslationEngine {
         let mut all_errors: Vec<HashMap<String, String>> = (0..n).map(|_| HashMap::new()).collect();
 
         // Phase 2 — build flat list of work items for all texts × target languages.
-        // Tokenization happens here (engine thread) to keep the scheduler thread
-        // free for decode steps.
-        let mut work_items: Vec<(Vec<u32>, usize)> = vec![];
+        let mut work_texts: Vec<String> = vec![];
+        let mut work_expected_lens: Vec<usize> = vec![];
         let mut work_indices: Vec<(usize, String)> = vec![];
 
         for i in 0..n {
@@ -382,16 +377,16 @@ impl TranslationEngine {
                 let text = &batch.texts[i];
                 // chars / 3 ≈ 1.5 tokens (UTF-8 bytes / 3 ≈ tokens), +15 slack.
                 let expected_output_len = (text.len() / 3 + 15).clamp(15, SLOT_CAPACITY);
-                let suffix = translate_gemma_suffix(src, norm_lang, text);
-                let token_ids = self.model.tokenize_translation(&suffix)?;
-                work_items.push((token_ids, expected_output_len));
+                let prompt = translate_gemma_prompt(src, norm_lang, text);
+                work_texts.push(prompt);
+                work_expected_lens.push(expected_output_len);
                 work_indices.push((i, target_lang.clone()));
             }
         }
 
         // Phase 3 — dispatch work items to the continuous scheduler.
-        if !work_items.is_empty() {
-            let work_item_count = work_items.len();
+        if !work_texts.is_empty() {
+            let work_item_count = work_texts.len();
             let tx = &self.worker_tx;
 
             // Backpressure check: reject entire batch if insufficient queue capacity.
@@ -415,11 +410,11 @@ impl TranslationEngine {
                 std::sync::mpsc::channel::<(usize, Result<String, TranslatorError>)>();
             let mut enqueued = 0usize;
             let t1 = std::time::Instant::now();
-            for (idx, (token_ids, expected_output_len)) in
-                work_items.into_iter().enumerate()
+            for (idx, (text, expected_output_len)) in
+                work_texts.into_iter().zip(work_expected_lens).enumerate()
             {
                 tx.try_send(InferRequest {
-                    token_ids,
+                    text,
                     expected_output_len,
                     index: idx,
                     reply_tx: reply_tx.clone(),

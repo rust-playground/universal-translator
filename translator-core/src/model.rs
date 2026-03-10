@@ -119,9 +119,6 @@ pub struct LoadedGemmaModel {
     tokenizer: Arc<Tokenizer>,
     device: Device,
     pub(crate) eos_token_id: u32,
-    /// Pre-tokenized system prompt prefix (everything before the variable part).
-    /// Avoids re-tokenizing ~55 static tokens on every request.
-    system_prefix_ids: Vec<u32>,
 }
 
 // SAFETY: ModelWeights weights are Arc-backed; no mutable state lives here after
@@ -154,52 +151,7 @@ impl LoadedGemmaModel {
         let model_weights = ModelWeights::from_gguf(content, &mut reader, &device)
             .map_err(|e| TranslatorError::Model(format!("model init: {e}")))?;
 
-        // Pre-tokenize the static system prompt prefix once.
-        let system_prefix = "<bos><start_of_turn>system\n\
-            You are a translation engine. Output only the translated text. \
-            Do not add explanations, alternatives, notes, or any other text.<end_of_turn>\n\
-            <start_of_turn>user\n";
-        let system_prefix_ids = tokenizer
-            .encode(system_prefix, false)
-            .map_err(|e| TranslatorError::Model(format!("tokenize system prefix: {e}")))?
-            .get_ids()
-            .to_vec();
-
-        // Debug assertion: verify that split tokenization produces the same result
-        // as tokenizing the full prompt at once (guard against subword boundary issues).
-        {
-            let sample_suffix = "Translate from English to French:\nHello world<end_of_turn>\n<start_of_turn>model\n";
-            let suffix_ids = tokenizer
-                .encode(sample_suffix, false)
-                .map_err(|e| TranslatorError::Model(format!("tokenize sample suffix: {e}")))?
-                .get_ids()
-                .to_vec();
-            let split_ids: Vec<u32> = system_prefix_ids.iter().copied().chain(suffix_ids.iter().copied()).collect();
-
-            let full_prompt = format!("{system_prefix}{sample_suffix}");
-            let full_ids = tokenizer
-                .encode(full_prompt.as_str(), false)
-                .map_err(|e| TranslatorError::Model(format!("tokenize full prompt: {e}")))?
-                .get_ids()
-                .to_vec();
-
-            debug_assert_eq!(
-                split_ids, full_ids,
-                "split tokenization differs from full-prompt tokenization — \
-                 system prefix split point falls on a subword boundary"
-            );
-            if split_ids != full_ids {
-                tracing::warn!(
-                    "split tokenization differs from full-prompt tokenization \
-                     ({} vs {} tokens) — falling back to full-prompt tokenization",
-                    split_ids.len(),
-                    full_ids.len()
-                );
-            }
-        }
-
         tracing::info!(
-            system_prefix_tokens = system_prefix_ids.len(),
             "TranslateGemma model loaded: {} (from {})",
             gguf_path.file_name().unwrap_or_default().to_string_lossy(),
             model_dir.display()
@@ -210,7 +162,6 @@ impl LoadedGemmaModel {
             tokenizer: Arc::new(tokenizer),
             device,
             eos_token_id,
-            system_prefix_ids,
         })
     }
 
@@ -290,22 +241,6 @@ impl LoadedGemmaModel {
             .encode(text, false)
             .map_err(|e| TranslatorError::Model(format!("tokenize: {e}")))?;
         Ok(enc.get_ids().to_vec())
-    }
-
-    /// Tokenize a translation prompt by concatenating the pre-tokenized system
-    /// prefix with the freshly-tokenized variable suffix.
-    ///
-    /// `suffix` is the variable part: `"Translate from X to Y:\n{text}<end_of_turn>\n<start_of_turn>model\n"`
-    pub fn tokenize_translation(&self, suffix: &str) -> Result<Vec<u32>, TranslatorError> {
-        let suffix_enc = self
-            .tokenizer
-            .encode(suffix, false)
-            .map_err(|e| TranslatorError::Model(format!("tokenize suffix: {e}")))?;
-        let suffix_ids = suffix_enc.get_ids();
-        let mut ids = Vec::with_capacity(self.system_prefix_ids.len() + suffix_ids.len());
-        ids.extend_from_slice(&self.system_prefix_ids);
-        ids.extend_from_slice(suffix_ids);
-        Ok(ids)
     }
 
     /// Decode a sequence of token IDs to a UTF-8 string, skipping special tokens.

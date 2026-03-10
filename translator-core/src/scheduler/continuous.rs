@@ -95,10 +95,10 @@ const PREFILL_ACCUMULATION_DELAY: std::time::Duration = std::time::Duration::fro
 
 /// A single translation request dispatched to the continuous scheduler.
 ///
-/// `token_ids` must be pre-tokenized token IDs for the complete Gemma instruct prompt.
-/// Tokenization is performed on the engine thread to keep the scheduler thread free for decode.
+/// `text` is the full Gemma instruct-format prompt string.
+/// Tokenization is performed on the scheduler thread.
 pub struct InferRequest {
-    pub token_ids: Vec<u32>,
+    pub text: String,
     /// Expected number of output tokens, used to calibrate EOS bias.
     /// Computed by the engine from the original text length (not the prompt length).
     pub expected_output_len: usize,
@@ -194,7 +194,7 @@ fn run_loop(
 
             let remaining_capacity = n_empty - pending.len();
             if remaining_capacity > 0 {
-                pending.extend(collect_pending(work_rx, remaining_capacity, metrics));
+                pending.extend(collect_pending(model, work_rx, remaining_capacity, metrics));
             }
 
             if !pending.is_empty() {
@@ -234,14 +234,11 @@ fn run_loop(
                 Err(_) => break 'scheduler, // all senders dropped → clean shutdown
                 Ok(req) => {
                     let mut pending = Vec::new();
-                    #[cfg(feature = "opentelemetry")]
-                    metrics.prompt_tokens.record(req.token_ids.len() as u64, &[]);
-                    pending.push(PendingPrefill {
-                        token_ids: req.token_ids,
-                        expected_len: req.expected_output_len,
-                        index: req.index,
-                        reply_tx: req.reply_tx,
-                    });
+                    if let Some(pp) = tokenize_into_pending(model, req) {
+                        #[cfg(feature = "opentelemetry")]
+                        metrics.prompt_tokens.record(pp.token_ids.len() as u64, &[]);
+                        pending.push(pp);
+                    }
                     // Accumulation window: collect additional items arriving within
                     // PREFILL_ACCUMULATION_DELAY so concurrent requests aren't split
                     // across separate prefill batches due to spawn_blocking thread
@@ -255,14 +252,11 @@ fn run_loop(
                         }
                         match work_rx.recv_timeout(remaining) {
                             Ok(r) => {
-                                #[cfg(feature = "opentelemetry")]
-                                metrics.prompt_tokens.record(r.token_ids.len() as u64, &[]);
-                                pending.push(PendingPrefill {
-                                    token_ids: r.token_ids,
-                                    expected_len: r.expected_output_len,
-                                    index: r.index,
-                                    reply_tx: r.reply_tx,
-                                });
+                                if let Some(pp) = tokenize_into_pending(model, r) {
+                                    #[cfg(feature = "opentelemetry")]
+                                    metrics.prompt_tokens.record(pp.token_ids.len() as u64, &[]);
+                                    pending.push(pp);
+                                }
                             }
                             Err(_) => break,
                         }
@@ -444,7 +438,7 @@ fn run_loop(
             let mut pending: Vec<PendingPrefill> = carry_over.drain(..from_carry).collect();
             let remaining = n_empty_after - pending.len();
             if remaining > 0 {
-                pending.extend(collect_pending(work_rx, remaining, metrics));
+                pending.extend(collect_pending(model, work_rx, remaining, metrics));
             }
             if !pending.is_empty() {
                 batch_prefill_and_assign(
@@ -457,10 +451,33 @@ fn run_loop(
 
 // ── Helper: collect pending prefill items ────────────────────────────────────
 
+/// Tokenize an [`InferRequest`] into a [`PendingPrefill`].
+///
+/// On tokenization failure the error is sent back to the caller immediately
+/// and `None` is returned so the scheduler can skip the request.
+fn tokenize_into_pending(
+    model: &LoadedGemmaModel,
+    req: InferRequest,
+) -> Option<PendingPrefill> {
+    match model.tokenize(&req.text) {
+        Ok(token_ids) => Some(PendingPrefill {
+            token_ids,
+            expected_len: req.expected_output_len,
+            index: req.index,
+            reply_tx: req.reply_tx,
+        }),
+        Err(e) => {
+            let _ = req.reply_tx.send((req.index, Err(e)));
+            None
+        }
+    }
+}
+
 /// Non-blocking drain of up to `limit` items from the work queue.
-/// Requests arrive pre-tokenized from the engine thread.
+/// Tokenizes each request on the scheduler thread.
 #[cfg_attr(not(feature = "opentelemetry"), allow(unused_variables))]
 fn collect_pending(
+    model: &LoadedGemmaModel,
     work_rx: &crossbeam_channel::Receiver<InferRequest>,
     limit: usize,
     metrics: &Metrics,
@@ -469,14 +486,11 @@ fn collect_pending(
     for _ in 0..limit {
         match work_rx.try_recv() {
             Ok(req) => {
-                #[cfg(feature = "opentelemetry")]
-                metrics.prompt_tokens.record(req.token_ids.len() as u64, &[]);
-                pending.push(PendingPrefill {
-                    token_ids: req.token_ids,
-                    expected_len: req.expected_output_len,
-                    index: req.index,
-                    reply_tx: req.reply_tx,
-                });
+                if let Some(pp) = tokenize_into_pending(model, req) {
+                    #[cfg(feature = "opentelemetry")]
+                    metrics.prompt_tokens.record(pp.token_ids.len() as u64, &[]);
+                    pending.push(pp);
+                }
             }
             Err(_) => break,
         }
