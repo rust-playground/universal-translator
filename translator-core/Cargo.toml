@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-metal          = ["candle-core/metal", "candle-transformers/metal", "candle-nn/metal", "dep:metal"]
+metal          = ["candle-core/metal", "candle-core/accelerate", "candle-transformers/metal", "candle-nn/metal", "dep:metal"]
 cuda           = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-flash-attn"]
 opentelemetry  = ["dep:opentelemetry"]
 

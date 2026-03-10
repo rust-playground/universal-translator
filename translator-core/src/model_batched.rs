@@ -610,20 +610,28 @@ impl LayerWeights {
         let attn_output = attn_output.transpose(1, 2)?.reshape((n, max_len, self.q_dim))?;
         let out = self.attention_wo.forward(&attn_output)?;
 
-        // Store unpadded K/V slices into pre-allocated buffers.
+        // Store unpadded K/V slices into buffers.
+        // Reuse pre-allocated buffers when available (from ensure_capacity before prefill),
+        // otherwise allocate inline as a fallback.
         // Correctness invariant: only real token KV (0..real_lens[b]) is stored.
         for b in 0..n {
             let real_len = real_lens[b];
             let k_b = k_for_cache.i(b)?.narrow(1, 0, real_len)?.unsqueeze(0)?.contiguous()?;
             let v_b = v_for_cache.i(b)?.narrow(1, 0, real_len)?.unsqueeze(0)?.contiguous()?;
 
-            let cap = (real_len * 2).next_power_of_two().max(64);
-            let k_buf = Tensor::zeros((1, self.n_kv_head, cap, self.head_dim), k_b.dtype(), device)?;
-            let v_buf = Tensor::zeros((1, self.n_kv_head, cap, self.head_dim), v_b.dtype(), device)?;
-            k_buf.slice_set(&k_b, 2, 0)?;
-            v_buf.slice_set(&v_b, 2, 0)?;
-
-            kv_caches[b].layers[layer_idx] = Some((k_buf, v_buf));
+            if let Some((ref k_buf, ref v_buf)) = kv_caches[b].layers[layer_idx] {
+                // Reuse pre-allocated buffer — O(1) slice_set, no GPU alloc.
+                k_buf.slice_set(&k_b, 2, 0)?;
+                v_buf.slice_set(&v_b, 2, 0)?;
+            } else {
+                // Fallback: allocate if not pre-allocated.
+                let cap = (real_len * 2).next_power_of_two().max(64);
+                let k_buf = Tensor::zeros((1, self.n_kv_head, cap, self.head_dim), k_b.dtype(), device)?;
+                let v_buf = Tensor::zeros((1, self.n_kv_head, cap, self.head_dim), v_b.dtype(), device)?;
+                k_buf.slice_set(&k_b, 2, 0)?;
+                v_buf.slice_set(&v_b, 2, 0)?;
+                kv_caches[b].layers[layer_idx] = Some((k_buf, v_buf));
+            }
         }
 
         Ok(out)
@@ -891,10 +899,13 @@ impl ModelWeights {
             layer_in = x;
         }
 
-        // Set seq_len and capacity on all caches.
+        // Set seq_len on all caches. Only update capacity if it wasn't pre-allocated
+        // (i.e. capacity == 0 means the fallback path allocated inline).
         for (b, kv) in kv_caches.iter_mut().enumerate() {
             kv.seq_len = real_lens[b];
-            kv.capacity = (real_lens[b] * 2).next_power_of_two().max(64);
+            if kv.capacity == 0 {
+                kv.capacity = (real_lens[b] * 2).next_power_of_two().max(64);
+            }
         }
 
         // Extract last real token hidden state per sequence, stack → [N, dim].

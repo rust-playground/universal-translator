@@ -95,10 +95,10 @@ const PREFILL_ACCUMULATION_DELAY: std::time::Duration = std::time::Duration::fro
 
 /// A single translation request dispatched to the continuous scheduler.
 ///
-/// `text` must already be formatted as a complete Gemma instruct prompt
-/// (e.g. the output of `translate_gemma_prompt()`).
+/// `token_ids` must be pre-tokenized token IDs for the complete Gemma instruct prompt.
+/// Tokenization is performed on the engine thread to keep the scheduler thread free for decode.
 pub struct InferRequest {
-    pub text: String,
+    pub token_ids: Vec<u32>,
     /// Expected number of output tokens, used to calibrate EOS bias.
     /// Computed by the engine from the original text length (not the prompt length).
     pub expected_output_len: usize,
@@ -194,7 +194,7 @@ fn run_loop(
 
             let remaining_capacity = n_empty - pending.len();
             if remaining_capacity > 0 {
-                pending.extend(collect_pending(model, work_rx, remaining_capacity, metrics));
+                pending.extend(collect_pending(work_rx, remaining_capacity, metrics));
             }
 
             if !pending.is_empty() {
@@ -234,7 +234,14 @@ fn run_loop(
                 Err(_) => break 'scheduler, // all senders dropped → clean shutdown
                 Ok(req) => {
                     let mut pending = Vec::new();
-                    tokenize_into_pending(model, req, &mut pending, metrics);
+                    #[cfg(feature = "opentelemetry")]
+                    metrics.prompt_tokens.record(req.token_ids.len() as u64, &[]);
+                    pending.push(PendingPrefill {
+                        token_ids: req.token_ids,
+                        expected_len: req.expected_output_len,
+                        index: req.index,
+                        reply_tx: req.reply_tx,
+                    });
                     // Accumulation window: collect additional items arriving within
                     // PREFILL_ACCUMULATION_DELAY so concurrent requests aren't split
                     // across separate prefill batches due to spawn_blocking thread
@@ -247,7 +254,16 @@ fn run_loop(
                             break;
                         }
                         match work_rx.recv_timeout(remaining) {
-                            Ok(r) => tokenize_into_pending(model, r, &mut pending, metrics),
+                            Ok(r) => {
+                                #[cfg(feature = "opentelemetry")]
+                                metrics.prompt_tokens.record(r.token_ids.len() as u64, &[]);
+                                pending.push(PendingPrefill {
+                                    token_ids: r.token_ids,
+                                    expected_len: r.expected_output_len,
+                                    index: r.index,
+                                    reply_tx: r.reply_tx,
+                                });
+                            }
                             Err(_) => break,
                         }
                     }
@@ -428,7 +444,7 @@ fn run_loop(
             let mut pending: Vec<PendingPrefill> = carry_over.drain(..from_carry).collect();
             let remaining = n_empty_after - pending.len();
             if remaining > 0 {
-                pending.extend(collect_pending(model, work_rx, remaining, metrics));
+                pending.extend(collect_pending(work_rx, remaining, metrics));
             }
             if !pending.is_empty() {
                 batch_prefill_and_assign(
@@ -442,9 +458,9 @@ fn run_loop(
 // ── Helper: collect pending prefill items ────────────────────────────────────
 
 /// Non-blocking drain of up to `limit` items from the work queue.
-/// Tokenizes each request; on tokenization failure, sends error and skips.
+/// Requests arrive pre-tokenized from the engine thread.
+#[cfg_attr(not(feature = "opentelemetry"), allow(unused_variables))]
 fn collect_pending(
-    model: &LoadedGemmaModel,
     work_rx: &crossbeam_channel::Receiver<InferRequest>,
     limit: usize,
     metrics: &Metrics,
@@ -452,36 +468,20 @@ fn collect_pending(
     let mut pending = Vec::new();
     for _ in 0..limit {
         match work_rx.try_recv() {
-            Ok(req) => tokenize_into_pending(model, req, &mut pending, metrics),
+            Ok(req) => {
+                #[cfg(feature = "opentelemetry")]
+                metrics.prompt_tokens.record(req.token_ids.len() as u64, &[]);
+                pending.push(PendingPrefill {
+                    token_ids: req.token_ids,
+                    expected_len: req.expected_output_len,
+                    index: req.index,
+                    reply_tx: req.reply_tx,
+                });
+            }
             Err(_) => break,
         }
     }
     pending
-}
-
-/// Tokenize a single request and push into `pending`, or send error on failure.
-#[cfg_attr(not(feature = "opentelemetry"), allow(unused_variables))]
-fn tokenize_into_pending(
-    model: &LoadedGemmaModel,
-    req: InferRequest,
-    pending: &mut Vec<PendingPrefill>,
-    metrics: &Metrics,
-) {
-    match model.tokenize(&req.text) {
-        Ok(token_ids) => {
-            #[cfg(feature = "opentelemetry")]
-            metrics.prompt_tokens.record(token_ids.len() as u64, &[]);
-            pending.push(PendingPrefill {
-                token_ids,
-                expected_len: req.expected_output_len,
-                index: req.index,
-                reply_tx: req.reply_tx,
-            });
-        }
-        Err(e) => {
-            let _ = req.reply_tx.send((req.index, Err(e)));
-        }
-    }
 }
 
 // ── Batched prefill ───────────────────────────────────────────────────────────
@@ -499,10 +499,30 @@ fn batch_prefill_and_assign(
 ) {
     let empty_slot_count = slots.iter().filter(|s| s.is_none()).count();
     tracing::info!(batch_size = pending.len(), empty_slots = empty_slot_count, "prefill batch");
-    let seqs: Vec<Vec<u32>> = pending.iter().map(|p| p.token_ids.clone()).collect();
+    let seqs: Vec<Vec<u32>> = pending.iter_mut().map(|p| std::mem::take(&mut p.token_ids)).collect();
     let mut kv_caches: Vec<SlotKvCache> = (0..seqs.len())
         .map(|_| SlotKvCache::new(model.n_layers()))
         .collect();
+
+    // Pre-allocate KV buffers to avoid 52×N GPU tensor allocations during prefill
+    // (2 tensors × 26 layers × N sequences).
+    let max_prompt_len = seqs.iter().map(|s| s.len()).max().unwrap_or(1);
+    let prefill_cap = (max_prompt_len * 2).next_power_of_two().max(64);
+    #[cfg(feature = "cuda")]
+    let kv_dtype = DType::F16;
+    #[cfg(not(feature = "cuda"))]
+    let kv_dtype = DType::F32;
+    for kv in kv_caches.iter_mut() {
+        if let Err(e) = kv.ensure_capacity(
+            prefill_cap, model.n_kv_heads(), model.head_dim(), kv_dtype, model.device()
+        ) {
+            let msg = e.to_string();
+            for pb in pending.drain(..) {
+                let _ = pb.reply_tx.send((pb.index, Err(TranslatorError::Model(msg.clone()))));
+            }
+            return;
+        }
+    }
 
     #[cfg(feature = "opentelemetry")]
     let _pf = std::time::Instant::now();
