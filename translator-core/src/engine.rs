@@ -340,7 +340,7 @@ impl TranslationEngine {
                 .map(|text| self.detector.detect(text))
                 .collect::<Result<Vec<String>, TranslatorError>>()?
         };
-        tracing::info!(detection_ms = t0.elapsed().as_millis(), "phase 1 done");
+        tracing::debug!(detection_ms = t0.elapsed().as_millis(), "phase 1 done");
 
         let mut all_translations: Vec<HashMap<String, String>> =
             (0..n).map(|_| HashMap::new()).collect();
@@ -397,7 +397,7 @@ impl TranslationEngine {
                 )));
             }
 
-            tracing::info!(
+            tracing::debug!(
                 work_items = work_item_count,
                 queue_len = tx.len(),
                 queue_capacity = self.queue_capacity,
@@ -409,7 +409,6 @@ impl TranslationEngine {
             let (reply_tx, reply_rx) =
                 std::sync::mpsc::channel::<(usize, Result<String, TranslatorError>)>();
             let mut enqueued = 0usize;
-            let t1 = std::time::Instant::now();
             for (idx, (text, expected_output_len)) in
                 work_texts.into_iter().zip(work_expected_lens).enumerate()
             {
@@ -423,7 +422,6 @@ impl TranslationEngine {
                 enqueued += 1;
             }
             drop(reply_tx); // close our copy so channel ends after N replies
-            tracing::info!(enqueue_ms = t1.elapsed().as_millis(), "phase 3 done");
 
             let t2 = std::time::Instant::now();
             let mut first_reply_ms: Option<u128> = None;
@@ -437,7 +435,7 @@ impl TranslationEngine {
                 }
                 translated[idx] = Some(result?);
             }
-            tracing::info!(
+            tracing::debug!(
                 first_reply_ms = first_reply_ms.unwrap_or(0),
                 all_replies_ms = t2.elapsed().as_millis(),
                 work_items = enqueued,

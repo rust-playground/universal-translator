@@ -261,7 +261,7 @@ fn run_loop(
                             Err(_) => break,
                         }
                     }
-                    tracing::info!(
+                    tracing::debug!(
                         items = pending.len(),
                         waited_ms = t_accum.elapsed().as_millis(),
                         "idle-path accumulation closed"
@@ -286,9 +286,6 @@ fn run_loop(
             }
             continue;
         }
-
-        tracing::debug!(active_slots = n_active, "batched decode pass");
-        let _t_step = std::time::Instant::now();
 
         // ── Build [N, 1] token tensor (reuse pre-allocated vec) ──────────
         tokens_vec.clear();
@@ -321,11 +318,11 @@ fn run_loop(
             })
             .collect();
 
+        #[cfg(feature = "opentelemetry")]
         let _t_fw = std::time::Instant::now();
         let forward_result = model.forward_batched(&tokens_t, &mut batch_kv);
-        let fw_us = _t_fw.elapsed().as_micros();
         #[cfg(feature = "opentelemetry")]
-        metrics.decode_forward_ms.record(fw_us as f64 / 1000.0, &[]);
+        metrics.decode_forward_ms.record(_t_fw.elapsed().as_micros() as f64 / 1000.0, &[]);
 
         let all_logits_t = match forward_result {
             Ok(t) => t,
@@ -350,7 +347,6 @@ fn run_loop(
         }
 
         // Transfer full logits to CPU for sampling with decoding filters.
-        let _t_sync = std::time::Instant::now();
         let mut all_logits_cpu: Vec<Vec<f32>> = match all_logits_t
             .to_dtype(DType::F32)
             .and_then(|t| t.to_vec2::<f32>())
@@ -369,11 +365,9 @@ fn run_loop(
                 continue;
             }
         };
-        let sync_us = _t_sync.elapsed().as_micros();
 
         // Per-slot filtering and sampling on CPU.
         // Drain rows from the logits vec to avoid cloning ~1MB per slot.
-        let _t_sample = std::time::Instant::now();
         let mut tok_ids: Vec<u32> = Vec::with_capacity(n_active);
         for (&slot_idx, mut logits) in active_indices.iter().zip(all_logits_cpu.drain(..)) {
             let slot = slots[slot_idx].as_ref().unwrap();
@@ -393,16 +387,6 @@ fn run_loop(
 
             tok_ids.push(sample_token(&mut logits, &mut rng));
         }
-        let sample_us = _t_sample.elapsed().as_micros();
-
-        tracing::info!(
-            n_active,
-            fw_us,
-            sync_us,
-            sample_us,
-            total_us = _t_step.elapsed().as_micros(),
-            "decode step"
-        );
 
         // ── Retire slots that emitted EOS; update the rest ─────────────────
         for (i, tok) in tok_ids.into_iter().enumerate() {
@@ -411,7 +395,7 @@ fn run_loop(
                 let finished = slots[slot_idx].take().unwrap();
                 let cause = if finished.output_ids.len() + 1 >= SLOT_CAPACITY { "capacity" } else { "eos" };
                 let slot_ms = finished.assigned_at.elapsed().as_millis();
-                tracing::info!(tokens = finished.output_ids.len(), cause, slot_ms, "slot retired");
+                tracing::debug!(tokens = finished.output_ids.len(), cause, slot_ms, "slot retired");
                 #[cfg(feature = "opentelemetry")]
                 {
                     use opentelemetry::KeyValue;
@@ -512,7 +496,7 @@ fn batch_prefill_and_assign(
     metrics: &Metrics,
 ) {
     let empty_slot_count = slots.iter().filter(|s| s.is_none()).count();
-    tracing::info!(batch_size = pending.len(), empty_slots = empty_slot_count, "prefill batch");
+    tracing::debug!(batch_size = pending.len(), empty_slots = empty_slot_count, "prefill batch");
     let seqs: Vec<Vec<u32>> = pending.iter_mut().map(|p| std::mem::take(&mut p.token_ids)).collect();
     let mut kv_caches: Vec<SlotKvCache> = (0..seqs.len())
         .map(|_| SlotKvCache::new(model.n_layers()))
@@ -541,7 +525,6 @@ fn batch_prefill_and_assign(
     #[cfg(feature = "opentelemetry")]
     let _pf = std::time::Instant::now();
 
-    let _t_pf_fw = std::time::Instant::now();
     let all_logits_t = match model.forward_prefill_batched(&seqs, &mut kv_caches) {
         Ok(t) => t,
         Err(e) => {
@@ -552,13 +535,11 @@ fn batch_prefill_and_assign(
             return;
         }
     };
-    let prefill_fw_ms = _t_pf_fw.elapsed().as_millis();
 
     #[cfg(feature = "opentelemetry")]
     metrics.prefill_ms.record(_pf.elapsed().as_millis() as f64, &[]);
 
     // Transfer all logits to CPU. Temperature is applied CPU-side after top-K.
-    let _t_pf_sync = std::time::Instant::now();
     let all_logits_cpu = match all_logits_t
         .to_dtype(DType::F32)
         .and_then(|t| t.to_vec2::<f32>())
@@ -572,13 +553,6 @@ fn batch_prefill_and_assign(
             return;
         }
     };
-    let prefill_sync_ms = _t_pf_sync.elapsed().as_millis();
-    tracing::info!(
-        batch = seqs.len(),
-        prefill_fw_ms,
-        prefill_sync_ms,
-        "prefill done"
-    );
 
     let mut kv_iter = kv_caches.into_iter();
     for (pb, mut logits) in pending.drain(..).zip(all_logits_cpu) {
