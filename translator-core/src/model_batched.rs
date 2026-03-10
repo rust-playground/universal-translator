@@ -443,8 +443,8 @@ impl LayerWeights {
             let pos_i = positions[i]; // = seq_len BEFORE this step
 
             // Extract new K/V for slot i: [1, n_kv_head, 1, head_dim]
-            let k_new_i = k_new.i(i)?.unsqueeze(0)?.contiguous()?;
-            let v_new_i = v_new.i(i)?.unsqueeze(0)?.contiguous()?;
+            let k_new_i = k_new.i(i)?.unsqueeze(0)?;
+            let v_new_i = v_new.i(i)?.unsqueeze(0)?;
 
             let (k_buf, v_buf) = kv_caches[i].layers[layer_idx].as_ref().unwrap();
 
@@ -456,8 +456,8 @@ impl LayerWeights {
             // Pre-allocated zeros beyond seq_len serve as padding.
             let (k_padded, v_padded) = if kv_caches[i].capacity >= total_kv_len {
                 (
-                    k_buf.narrow(2, 0, total_kv_len)?.contiguous()?,
-                    v_buf.narrow(2, 0, total_kv_len)?.contiguous()?,
+                    k_buf.narrow(2, 0, total_kv_len)?,
+                    v_buf.narrow(2, 0, total_kv_len)?,
                 )
             } else {
                 // Defensive fallback (shouldn't happen after ensure_capacity)

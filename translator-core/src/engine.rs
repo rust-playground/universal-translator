@@ -160,9 +160,10 @@ pub struct TranslationEngine {
     duration_ms: opentelemetry::metrics::Histogram<f64>,
 }
 
-/// Metal: 32 slots — Metal GPU scales sub-linearly above ~10 active slots.
+/// Metal: 64 slots — higher-end Apple Silicon (M3 Max, etc.) has enough GPU cores
+/// and bandwidth to scale well beyond 32. M1 will still land at ~32 via memory formula.
 #[allow(dead_code)]
-const DEFAULT_MAX_DECODE_SLOTS_METAL: usize = 32;
+const DEFAULT_MAX_DECODE_SLOTS_METAL: usize = 64;
 
 /// CUDA: 128 slots — NVIDIA GPUs have higher compute throughput and memory bandwidth.
 /// With flash attention, scaling remains efficient well beyond 32 active slots.
