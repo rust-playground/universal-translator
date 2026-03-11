@@ -61,6 +61,10 @@ universal-translator/
 ## Prerequisites
 
 - Rust toolchain (stable) — [rustup.rs](https://rustup.rs)
+- CMake ≥ 3.14 and a C++17 compiler (required to build vendored llama.cpp)
+  - macOS: `xcode-select --install` (provides both)
+  - Ubuntu/Debian: `sudo apt install cmake g++`
+  - Fedora: `sudo dnf install cmake gcc-c++`
 - Tested on Linux (x86_64, arm64) and macOS (Apple Silicon)
 - HuggingFace CLI for model download:
   ```bash
