@@ -2,8 +2,8 @@
 # Download TranslateGemma 4B GGUF weights and tokenizer from HuggingFace.
 #
 # Usage:
-#   bash models/download.sh                        # Q4_K_M only (default)
-#   bash models/download.sh --q8                   # also download Q8_0
+#   bash models/download.sh                        # Q8_0 only (default)
+#   bash models/download.sh --q4                   # also download Q4_K_M
 #   MODELS_DIR=/custom/path bash models/download.sh
 #
 # Prerequisites: hf CLI  (pip install huggingface_hub[cli])
@@ -13,21 +13,23 @@
 #
 # Phase 1 — GGUF weights (public, no auth):
 #   mradermacher/translategemma-4b-it-GGUF
-#   Q4_K_M: translategemma-4b-it.Q4_K_M.gguf → model-q4k.gguf  (~2.6 GB)
 #   Q8_0:   translategemma-4b-it.Q8_0.gguf   → model-q8_0.gguf  (~4.1 GB)
+#   Q4_K_M: translategemma-4b-it.Q4_K_M.gguf → model-q4k.gguf  (~2.6 GB)
 #
 # Phase 2 — tokenizer + config (GATED — requires HF login + license acceptance):
 #   google/translategemma-4b-it
 #   Accept the license at: https://huggingface.co/google/translategemma-4b-it
+#   NOTE: These files are optional — the GGUF embeds the tokenizer. Kept for
+#   reference and compatibility with external tooling (e.g. HF Transformers).
 #
-# To use Q8_0 at runtime: MODEL_FILE=model-q8_0.gguf cargo run ...
+# To use Q4_K_M at runtime: MODEL_FILE=model-q4k.gguf cargo run ...
 
 set -euo pipefail
 
-DOWNLOAD_Q8=false
+DOWNLOAD_Q4=false
 for arg in "$@"; do
   case "$arg" in
-    --q8) DOWNLOAD_Q8=true ;;
+    --q4) DOWNLOAD_Q4=true ;;
     *) echo "Unknown option: $arg"; exit 1 ;;
   esac
 done
@@ -59,41 +61,44 @@ fi
 
 GGUF_REPO="mradermacher/translategemma-4b-it-GGUF"
 
-# ── Phase 1a: Q4_K_M weights (public, no auth) ──────────────────────────────
-if [[ -f "${GEMMA_DIR}/model-q4k.gguf" ]]; then
-  echo "SKIP  model-q4k.gguf (already exists)"
+# ── Phase 1a: Q8_0 weights (public, no auth) ─────────────────────────────────
+if [[ -f "${GEMMA_DIR}/model-q8_0.gguf" ]]; then
+  echo "SKIP  model-q8_0.gguf (already exists)"
 else
-  echo "Phase 1a — Downloading Q4_K_M GGUF weights (~2.6 GB)…"
-  GGUF_FILE="translategemma-4b-it.Q4_K_M.gguf"
+  echo "Phase 1a — Downloading Q8_0 GGUF weights (~4.1 GB)…"
+  GGUF_FILE="translategemma-4b-it.Q8_0.gguf"
 
   ${HF_CLI} download "${GGUF_REPO}" \
     "${GGUF_FILE}" \
     --local-dir "${GEMMA_DIR}"
 
-  mv "${GEMMA_DIR}/${GGUF_FILE}" "${GEMMA_DIR}/model-q4k.gguf"
-  echo "OK    model-q4k.gguf"
+  mv "${GEMMA_DIR}/${GGUF_FILE}" "${GEMMA_DIR}/model-q8_0.gguf"
+  echo "OK    model-q8_0.gguf"
 fi
 echo ""
 
-# ── Phase 1b: Q8_0 weights (optional, public) ───────────────────────────────
-if [[ "${DOWNLOAD_Q8}" == "true" ]]; then
-  if [[ -f "${GEMMA_DIR}/model-q8_0.gguf" ]]; then
-    echo "SKIP  model-q8_0.gguf (already exists)"
+# ── Phase 1b: Q4_K_M weights (optional, public) ─────────────────────────────
+if [[ "${DOWNLOAD_Q4}" == "true" ]]; then
+  if [[ -f "${GEMMA_DIR}/model-q4k.gguf" ]]; then
+    echo "SKIP  model-q4k.gguf (already exists)"
   else
-    echo "Phase 1b — Downloading Q8_0 GGUF weights (~4.1 GB)…"
-    GGUF_FILE_Q8="translategemma-4b-it.Q8_0.gguf"
+    echo "Phase 1b — Downloading Q4_K_M GGUF weights (~2.6 GB)…"
+    GGUF_FILE_Q4="translategemma-4b-it.Q4_K_M.gguf"
 
     ${HF_CLI} download "${GGUF_REPO}" \
-      "${GGUF_FILE_Q8}" \
+      "${GGUF_FILE_Q4}" \
       --local-dir "${GEMMA_DIR}"
 
-    mv "${GEMMA_DIR}/${GGUF_FILE_Q8}" "${GEMMA_DIR}/model-q8_0.gguf"
-    echo "OK    model-q8_0.gguf"
+    mv "${GEMMA_DIR}/${GGUF_FILE_Q4}" "${GEMMA_DIR}/model-q4k.gguf"
+    echo "OK    model-q4k.gguf"
   fi
   echo ""
 fi
 
-# ── Phase 2: tokenizer + config (gated) ─────────────────────────────────────
+# ── Phase 2: tokenizer + config (gated, optional) ──────────────────────────
+# NOTE: The GGUF file embeds the tokenizer, so these files are NOT required at
+# runtime. They are downloaded for reference and compatibility with external
+# tooling (e.g. HF Transformers, tokenizer inspection scripts).
 if [[ -f "${GEMMA_DIR}/tokenizer.json" ]]; then
   echo "SKIP  tokenizer + config (already exists)"
 else

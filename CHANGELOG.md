@@ -9,10 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **TranslateGemma 4B inference engine** — Candle-based local inference using Q4_K_M GGUF
-  quantised weights (~2.6 GB); supports CPU, Metal (macOS), and CUDA (Linux/NVIDIA) backends
-- **Continuous-batching scheduler** — 24-slot batched decode via `forward_batched`; per-slot
-  external KV cache with sliding-window attention; EOS/length-penalty sampling
+- **TranslateGemma 4B inference engine** — llama.cpp-based (via `llama-cpp-2` Rust crate) local
+  inference using GGUF quantised weights (Q8_0 default ~4.1 GB, Q4_K_M opt-in ~2.6 GB); supports
+  CPU, Metal (macOS), and CUDA (Linux/NVIDIA) backends
+- **Continuous-batching scheduler** — 24-slot batched decode via `LlamaContext`; llama.cpp-managed
+  KV cache; EOS/length-penalty sampling
 - **55-language support** — full TranslateGemma language set with Lingua-based automatic
   language detection and script-based fallback for Malayalam
 - **CLI** (`ut` binary) — `translate`, `detect`, and `languages` subcommands; `--output json`

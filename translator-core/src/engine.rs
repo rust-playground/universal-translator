@@ -131,10 +131,28 @@ pub fn supported_languages() -> Vec<&'static str> {
 
 // ── Engine ───────────────────────────────────────────────────────────────────
 
+/// Joins the scheduler thread on drop, ensuring LlamaContext/LlamaModel are
+/// fully freed before process exit runs Metal/CUDA static destructors.
+struct SchedulerGuard(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for SchedulerGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// The central translation engine. Cheap to clone — all heavy state is reference-counted.
+///
+/// **Drop order matters:** `worker_tx` is declared before `_scheduler_guard` so
+/// that when the last clone drops, the channel closes first (signaling the
+/// scheduler to exit), then the `Arc<SchedulerGuard>` refcount hits zero and
+/// joins the thread — ensuring full cleanup before static destructors run.
 #[derive(Clone)]
 pub struct TranslationEngine {
     worker_tx: crossbeam_channel::Sender<InferRequest>,
+    _scheduler_guard: Arc<SchedulerGuard>,
     detector: Arc<Detector>,
     /// Bounded channel capacity — respects QUEUE_CAPACITY env var.
     queue_capacity: usize,
@@ -146,85 +164,41 @@ pub struct TranslationEngine {
     duration_ms: opentelemetry::metrics::Histogram<f64>,
 }
 
-/// Metal: 64 slots — higher-end Apple Silicon (M3 Max, etc.) has enough GPU cores
-/// and bandwidth to scale well beyond 32. M1 will still land at ~32 via memory formula.
-#[allow(dead_code)]
-const DEFAULT_MAX_DECODE_SLOTS_METAL: usize = 64;
+/// Default slot counts per backend.
+/// llama.cpp manages KV cache memory internally — no need for GPU memory queries.
+#[cfg(feature = "metal")]
+const DEFAULT_N_SLOTS_METAL: usize = 32;
+#[cfg(feature = "cuda")]
+const DEFAULT_N_SLOTS_CUDA: usize = 64;
+const DEFAULT_N_SLOTS_CPU: usize = 4;
 
-/// CUDA: 128 slots — NVIDIA GPUs have higher compute throughput and memory bandwidth.
-/// With flash attention, scaling remains efficient well beyond 32 active slots.
-#[allow(dead_code)]
-const DEFAULT_MAX_DECODE_SLOTS_CUDA: usize = 128;
-
-fn auto_n_slots(model: &LoadedGemmaModel) -> usize {
+fn auto_n_slots() -> usize {
     // Env var always wins — allows manual tuning.
-    if let Some(n) = std::env::var("MAX_DECODE_SLOTS").ok().and_then(|v| v.parse().ok()) {
+    if let Some(n) = std::env::var("MAX_DECODE_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         tracing::info!(n_slots = n, "n_slots from MAX_DECODE_SLOTS env var");
         return n;
     }
 
-    // KV cache bytes per element: F16 on CUDA (flash attention), F32 on Metal/CPU.
-    // 200 tokens is a generous average for translation outputs.
-    // These are only consumed by the GPU feature branches below; allow unused on CPU builds.
-    #[allow(unused_variables)]
-    let kv_per_slot: usize = {
-        let n_layers = model.n_layers();
-        let n_kv_heads = model.n_kv_heads();
-        let head_dim = model.head_dim();
-        const AVG_OUTPUT_TOKENS: usize = 200;
-
-        #[cfg(feature = "cuda")]
-        const BYTES_PER_ELEMENT: usize = 2; // F16 KV cache
-        #[cfg(not(feature = "cuda"))]
-        const BYTES_PER_ELEMENT: usize = 4; // F32 KV cache
-
-        n_layers * 2 * AVG_OUTPUT_TOKENS * n_kv_heads * head_dim * BYTES_PER_ELEMENT
-    };
-
     #[cfg(feature = "metal")]
     {
-        if let Ok(metal_dev) = model.device().as_metal_device() {
-            let raw = metal_dev.metal_device();
-            let budget = raw.recommended_max_working_set_size();
-            let used = raw.current_allocated_size();
-            let free = budget.saturating_sub(used);
-            // Reserve 15% for forward-pass activation tensors and Metal driver overhead.
-            let usable = free * 17 / 20;
-            let n = (usable / kv_per_slot.max(1)).clamp(4, DEFAULT_MAX_DECODE_SLOTS_METAL);
-            tracing::info!(
-                budget_mb = budget / 1_048_576,
-                used_mb = used / 1_048_576,
-                free_mb = free / 1_048_576,
-                kv_slot_mb = kv_per_slot / 1_048_576,
-                n_slots = n,
-                "auto n_slots (Metal)"
-            );
-            return n;
-        }
+        tracing::info!(n_slots = DEFAULT_N_SLOTS_METAL, "auto n_slots (Metal)");
+        return DEFAULT_N_SLOTS_METAL;
     }
 
     #[cfg(feature = "cuda")]
     {
-        if model.device().is_cuda() {
-            if let Ok((free, _total)) = cudarc::driver::result::mem_get_info() {
-                // Reserve 15% headroom for activations and CUDA driver overhead.
-                let usable = free * 17 / 20;
-                let n = (usable / kv_per_slot.max(1)).clamp(4, DEFAULT_MAX_DECODE_SLOTS_CUDA);
-                tracing::info!(
-                    free_mb = free / 1_048_576,
-                    kv_slot_mb = kv_per_slot / 1_048_576,
-                    n_slots = n,
-                    "auto n_slots (CUDA)"
-                );
-                return n;
-            }
-        }
+        tracing::info!(n_slots = DEFAULT_N_SLOTS_CUDA, "auto n_slots (CUDA)");
+        return DEFAULT_N_SLOTS_CUDA;
     }
 
-    // CPU fallback: decode throughput is memory-bandwidth-bound not slot-count-bound;
-    // 4 slots is enough to overlap prefill of new requests with ongoing decode steps.
-    tracing::info!(n_slots = 4, "auto n_slots (CPU)");
-    4
+    #[allow(unreachable_code)]
+    {
+        tracing::info!(n_slots = DEFAULT_N_SLOTS_CPU, "auto n_slots (CPU)");
+        DEFAULT_N_SLOTS_CPU
+    }
 }
 
 impl TranslationEngine {
@@ -233,7 +207,7 @@ impl TranslationEngine {
         tracing::info!(?model_dir, "Loading TranslateGemma model");
         let model = Arc::new(LoadedGemmaModel::load(&model_dir, model_file)?);
 
-        let n_slots = auto_n_slots(&model);
+        let n_slots = auto_n_slots();
         // Default: max(n_slots*4, 512) so that "all" language batches
         // (e.g. 9 texts × 55 languages = 495 items) don't instant-reject.
         let queue_capacity: usize = std::env::var("QUEUE_CAPACITY")
@@ -242,7 +216,7 @@ impl TranslationEngine {
             .unwrap_or_else(|| (n_slots * 4).max(512));
 
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("translator-scheduler".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -266,6 +240,7 @@ impl TranslationEngine {
         let meter = opentelemetry::global::meter("translator");
         Ok(Self {
             worker_tx: tx,
+            _scheduler_guard: Arc::new(SchedulerGuard(Some(handle))),
             detector: Arc::new(Detector::new()),
             queue_capacity,
             #[cfg(feature = "opentelemetry")]

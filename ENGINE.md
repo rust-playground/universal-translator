@@ -16,8 +16,8 @@ The workspace is split into three crates:
 | `translator-api` | Axum HTTP server |
 
 `TranslationEngine` is `Clone`-cheap (Arc-backed internals). The model is loaded
-once into an `Arc<OnceCell<Arc<LoadedGemmaModel>>>` — async `get_or_try_init` ensures
-a single initialisation with a lock-free read path afterwards.
+synchronously at startup into an `Arc<LoadedGemmaModel>` — shared read-only across
+the engine and scheduler.
 
 ---
 
@@ -27,16 +27,14 @@ a single initialisation with a lock-free read path afterwards.
 translation across 55 languages.
 
 - Weights: GGUF quantised — two formats supported:
-  - **Q4_K_M** (`model-q4k.gguf`, ~2.6 GB) — default, ~22% higher decode throughput
-  - **Q8_0** (`model-q8_0.gguf`, ~4.1 GB) — opt-in, higher precision, imperceptible quality difference for most use cases
-- Selection: `--model-file` flag or `MODEL_FILE` env var. Default auto-detects Q4_K_M → Q8_0 → any `*.gguf`.
-- Framework: [Candle](https://github.com/huggingface/candle) (`candle-core`,
-  `candle-transformers`, `candle-nn`)
-- Tokenizer: HuggingFace fast tokenizer (`tokenizers` crate, `tokenizer.json`)
+  - **Q8_0** (`model-q8_0.gguf`, ~4.1 GB) — default, higher precision
+  - **Q4_K_M** (`model-q4k.gguf`, ~2.6 GB) — opt-in, smaller footprint, comparable throughput under llama.cpp
+- Selection: `--model-file` flag or `MODEL_FILE` env var. Default auto-detects Q8_0 → Q4_K_M → any `*.gguf`.
+- Framework: [llama.cpp](https://github.com/ggerganov/llama.cpp) via the `llama-cpp-2` Rust crate
+- Tokenizer: embedded in the GGUF file (no separate `tokenizer.json` needed)
 
-The inference stack uses a local fork of `quantized_gemma3` (`model_batched.rs`)
-with an external KV cache so that weights are read-only and can be safely shared
-across concurrent decode slots.
+The inference stack uses `LlamaModel` for weight loading and `LlamaContext` for
+batched decode, with weights shared read-only across concurrent decode slots.
 
 ---
 

@@ -5,7 +5,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)]()
 
-A universal text translator built in Rust. Uses [Candle](https://github.com/huggingface/candle) for fast, fully local inference of [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) (Gemma 3 4B instruction-tuned), covering 55 languages, and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection.
+A universal text translator built in Rust. Uses [llama.cpp](https://github.com/ggerganov/llama.cpp) (via the `llama-cpp-2` Rust crate) for fast, fully local inference of [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) (Gemma 3 4B instruction-tuned), covering 55 languages, and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection.
 
 No API keys required. No network calls at runtime. Everything runs on your machine.
 
@@ -82,15 +82,15 @@ cargo build --release
 bash models/download.sh
 ```
 
-This downloads TranslateGemma 4B (~2.6 GB, Q4_K_M quantised, gated — requires HF login and
+This downloads TranslateGemma 4B (~4.1 GB, Q8_0 quantised, gated — requires HF login and
 [Gemma license acceptance](https://huggingface.co/google/translategemma-4b-it)) into the
-default model directory. For higher-precision Q8_0 weights (~4.1 GB):
+default model directory. For a smaller Q4_K_M variant (~2.6 GB):
 
 ```bash
-bash models/download.sh --q8
+bash models/download.sh --q4
 ```
 
-Use `--model-file model-q8_0.gguf` to select Q8_0 at runtime. Q4_K_M is the default (higher throughput, imperceptible quality difference).
+Use `--model-file model-q4k.gguf` to select Q4_K_M at runtime. Q8_0 is the default (higher precision, comparable throughput under llama.cpp).
 See [docs/models.md](docs/models.md) for details, directory layout, and alternative hosting options.
 
 ### Run the API server

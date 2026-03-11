@@ -1,42 +1,14 @@
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use candle_core::quantized::gguf_file;
-use candle_core::{Device, Tensor};
-use tokenizers::Tokenizer;
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::token::LlamaToken;
 
 use crate::error::TranslatorError;
-use crate::model_batched::{ModelWeights, SlotKvCache};
-use crate::scheduler::decoder::GemmaSlotDecoder;
-
-fn cerr(e: candle_core::Error) -> TranslatorError {
-    TranslatorError::Model(e.to_string())
-}
-
-/// Select the best available inference device in priority order:
-///   CUDA (if compiled in and device present) → Metal (macOS) → CPU
-fn select_device() -> Result<Device, TranslatorError> {
-    #[cfg(feature = "cuda")]
-    {
-        if candle_core::utils::cuda_is_available() {
-            tracing::info!("inference device: CUDA");
-            return Device::new_cuda(0)
-                .map_err(|e| TranslatorError::Model(format!("CUDA init: {e}")));
-        }
-    }
-
-    #[cfg(feature = "metal")]
-    {
-        if candle_core::utils::metal_is_available() {
-            tracing::info!("inference device: Metal");
-            return Device::new_metal(0)
-                .map_err(|e| TranslatorError::Model(format!("Metal init: {e}")));
-        }
-    }
-
-    tracing::info!("inference device: CPU");
-    Ok(Device::Cpu)
-}
 
 /// Find the first `*.gguf` file in a directory.
 fn find_gguf_file(dir: &Path) -> Result<PathBuf, TranslatorError> {
@@ -60,8 +32,8 @@ fn find_gguf_file(dir: &Path) -> Result<PathBuf, TranslatorError> {
 /// Priority:
 /// 1. Explicit `model_file` param (from `--model-file` flag)
 /// 2. `MODEL_FILE` env var
-/// 3. `model-q4k.gguf` (preferred default — higher throughput)
-/// 4. `model-q8_0.gguf` (fallback if Q4_K not present)
+/// 3. `model-q8_0.gguf` (preferred default — higher precision)
+/// 4. `model-q4k.gguf` (fallback if Q8_0 not present)
 /// 5. Any `*.gguf` in directory (last resort)
 fn resolve_gguf_path(model_dir: &Path, model_file: Option<&str>) -> Result<PathBuf, TranslatorError> {
     // 1. Explicit --model-file flag
@@ -88,68 +60,64 @@ fn resolve_gguf_path(model_dir: &Path, model_file: Option<&str>) -> Result<PathB
         return Ok(path);
     }
 
-    // 3. Q4_K_M default (preferred — higher throughput)
-    let q4k = model_dir.join("model-q4k.gguf");
-    if q4k.exists() {
-        return Ok(q4k);
-    }
-
-    // 4. Q8_0 fallback
+    // 3. Q8_0 default (higher precision, comparable throughput under llama.cpp)
     let q8 = model_dir.join("model-q8_0.gguf");
     if q8.exists() {
         return Ok(q8);
+    }
+
+    // 4. Q4_K_M fallback
+    let q4k = model_dir.join("model-q4k.gguf");
+    if q4k.exists() {
+        return Ok(q4k);
     }
 
     // 5. Any *.gguf in directory
     find_gguf_file(model_dir)
 }
 
-/// A loaded TranslateGemma 4B model with its HuggingFace tokenizer.
+/// A loaded TranslateGemma 4B model backed by llama.cpp.
 ///
-/// Loaded from a directory containing:
-///   *.gguf            — quantized weights (Q4_K_M, Q8_0, etc.)
-///   tokenizer.json    — HuggingFace fast tokenizer
+/// Loaded from a directory containing a `*.gguf` file with quantized weights.
+/// The GGUF file embeds the tokenizer, so no separate `tokenizer.json` is needed.
 ///
-/// Weights are Arc-shared inside the local `ModelWeights` type.  KV cache is
-/// stored externally in per-slot [`SlotKvCache`] structs, so this struct is
-/// entirely read-only after loading and can be shared across threads.
+/// `LlamaBackend` and `LlamaModel` are stored here; inference contexts
+/// (`LlamaContext`) are created on the scheduler thread since they are `!Send`.
 pub struct LoadedGemmaModel {
-    /// Stateless model weights — KV cache is external.
-    pub(crate) model_weights: ModelWeights,
-    tokenizer: Arc<Tokenizer>,
-    device: Device,
+    // Drop order matters: model must drop before backend (declaration order).
+    model: LlamaModel,
+    backend: LlamaBackend,
     pub(crate) eos_token_id: u32,
 }
 
-// SAFETY: ModelWeights weights are Arc-backed; no mutable state lives here after
-// loading. KV mutations happen in per-slot SlotKvCache values owned by the caller.
+// SAFETY: LlamaBackend is a process-wide singleton init guard.
+// LlamaModel holds read-only weights behind a raw pointer; llama.cpp
+// guarantees thread-safe read access to model weights after loading.
 unsafe impl Send for LoadedGemmaModel {}
 unsafe impl Sync for LoadedGemmaModel {}
 
 impl LoadedGemmaModel {
-    /// Load the model directory.
+    /// Load the model from a directory containing a GGUF file.
     ///
     /// `model_file` overrides automatic GGUF file selection (e.g. `"model-q8_0.gguf"`).
     pub fn load(model_dir: &Path, model_file: Option<&str>) -> Result<Self, TranslatorError> {
-        let device = select_device()?;
+        let mut backend = LlamaBackend::init()
+            .map_err(|e| TranslatorError::Model(format!("llama backend init: {e}")))?;
+
+        // Suppress verbose llama.cpp/ggml logs unless LLAMA_LOG is set.
+        if std::env::var("LLAMA_LOG").is_err() {
+            backend.void_logs();
+        }
 
         let gguf_path = resolve_gguf_path(model_dir, model_file)?;
 
-        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
-            .map_err(|e| TranslatorError::Model(format!("tokenizer load: {e}")))?;
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(999);
 
-        let eos_token_id = tokenizer
-            .token_to_id("<end_of_turn>")
-            .or_else(|| tokenizer.token_to_id("<eos>"))
-            .unwrap_or(1);
+        let model = LlamaModel::load_from_file(&backend, &gguf_path, &model_params)
+            .map_err(|e| TranslatorError::Model(format!("model load: {e}")))?;
+
+        let eos_token_id = model.token_eos().0 as u32;
         tracing::info!("eos_token_id={eos_token_id}");
-
-        let mut reader = std::fs::File::open(&gguf_path).map_err(TranslatorError::Io)?;
-        let content = gguf_file::Content::read(&mut reader)
-            .map_err(|e| TranslatorError::Model(format!("GGUF read: {e}")))?;
-
-        let model_weights = ModelWeights::from_gguf(content, &mut reader, &device)
-            .map_err(|e| TranslatorError::Model(format!("model init: {e}")))?;
 
         tracing::info!(
             "TranslateGemma model loaded: {} (from {})",
@@ -158,9 +126,8 @@ impl LoadedGemmaModel {
         );
 
         Ok(Self {
-            model_weights,
-            tokenizer: Arc::new(tokenizer),
-            device,
+            model,
+            backend,
             eos_token_id,
         })
     }
@@ -171,82 +138,53 @@ impl LoadedGemmaModel {
         self.eos_token_id
     }
 
-    pub fn device(&self) -> &Device {
-        &self.device
+    /// Check if a token is an end-of-generation token (covers both `<eos>` and
+    /// `<end_of_turn>` for Gemma models).
+    pub fn is_eog_token(&self, token_id: u32) -> bool {
+        self.model.is_eog_token(LlamaToken(token_id as i32))
     }
 
-    pub fn n_layers(&self) -> usize {
-        self.model_weights.n_layers()
-    }
-
-    pub fn n_kv_heads(&self) -> usize {
-        self.model_weights.n_kv_heads()
-    }
-
-    pub fn head_dim(&self) -> usize {
-        self.model_weights.head_dim()
-    }
-
-    /// Create a fresh per-slot decoder backed by an empty [`SlotKvCache`].
+    /// Create a new inference context on the current thread.
     ///
-    /// The weights themselves are not cloned — the decoder only holds a KV cache
-    /// and a reference to the device.
-    pub fn new_slot_decoder(&self) -> GemmaSlotDecoder {
-        GemmaSlotDecoder::new(
-            SlotKvCache::new(self.model_weights.n_layers()),
-            self.device.clone(),
-        )
-    }
-
-    /// Single-slot forward pass.
-    ///
-    /// Wraps [`ModelWeights::forward`] with `TranslatorError` mapping.
-    pub fn forward_single(
+    /// `LlamaContext` is `!Send` — must be created and used on the scheduler thread.
+    pub fn create_context(
         &self,
-        x: &Tensor,
-        index_pos: usize,
-        kv: &mut SlotKvCache,
-    ) -> Result<Tensor, TranslatorError> {
-        self.model_weights.forward(x, index_pos, kv).map_err(cerr)
+        n_ctx: u32,
+        n_seq_max: u32,
+    ) -> Result<LlamaContext<'_>, TranslatorError> {
+        let params = LlamaContextParams::default()
+            .with_n_ctx(Some(
+                NonZeroU32::new(n_ctx).expect("n_ctx must be > 0"),
+            ))
+            .with_n_batch(n_ctx)
+            .with_n_seq_max(n_seq_max);
+
+        self.model
+            .new_context(&self.backend, params)
+            .map_err(|e| TranslatorError::Model(format!("context creation: {e}")))
     }
 
-    /// N-slot batched decode step.
+    /// Tokenize a prompt string to token IDs.
     ///
-    /// Wraps [`ModelWeights::forward_batched`] with `TranslatorError` mapping.
-    pub fn forward_batched(
-        &self,
-        tokens: &Tensor,
-        kv_caches: &mut [SlotKvCache],
-    ) -> Result<Tensor, TranslatorError> {
-        self.model_weights.forward_batched(tokens, kv_caches).map_err(cerr)
-    }
-
-    /// Batched prefill: N variable-length prompts in one GPU pass.
-    ///
-    /// Wraps [`ModelWeights::forward_prefill_batched`] with `TranslatorError` mapping.
-    pub fn forward_prefill_batched(
-        &self,
-        sequences: &[Vec<u32>],
-        kv_caches: &mut [SlotKvCache],
-    ) -> Result<Tensor, TranslatorError> {
-        self.model_weights.forward_prefill_batched(sequences, kv_caches).map_err(cerr)
-    }
-
-    /// Tokenize a prompt string to token IDs.  Does NOT add special tokens —
-    /// the caller is responsible for including `<bos>` and chat template tokens
-    /// in the prompt string itself.
+    /// Does NOT add BOS — the caller includes `<bos>` in the prompt string.
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>, TranslatorError> {
-        let enc = self
-            .tokenizer
-            .encode(text, false)
-            .map_err(|e| TranslatorError::Model(format!("tokenize: {e}")))?;
-        Ok(enc.get_ids().to_vec())
+        self.model
+            .str_to_token(text, AddBos::Never)
+            .map(|tokens| tokens.into_iter().map(|t| t.0 as u32).collect())
+            .map_err(|e| TranslatorError::Model(format!("tokenize: {e}")))
     }
 
-    /// Decode a sequence of token IDs to a UTF-8 string, skipping special tokens.
+    /// Decode a sequence of token IDs to a UTF-8 string.
     pub fn decode_output_ids(&self, ids: &[u32]) -> Result<String, TranslatorError> {
-        self.tokenizer
-            .decode(ids, true)
-            .map_err(|e| TranslatorError::Model(format!("decode: {e}")))
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut result = String::new();
+        for &id in ids {
+            let piece = self
+                .model
+                .token_to_piece(LlamaToken(id as i32), &mut decoder, false, None)
+                .map_err(|e| TranslatorError::Model(format!("decode token {id}: {e}")))?;
+            result.push_str(&piece);
+        }
+        Ok(result)
     }
 }
