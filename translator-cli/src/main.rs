@@ -37,6 +37,16 @@ struct Cli {
     #[arg(long, env = "PREFILL_ACCUMULATION_MS")]
     prefill_delay_ms: Option<u64>,
 
+    /// Hard ceiling (in characters) for text chunks sent to the model.
+    /// Defaults to (KV budget − 100) × 4.
+    #[arg(long, env = "MAX_CHUNK_CHARS")]
+    max_chunk_chars: Option<usize>,
+
+    /// Target size (in characters) for paragraph-level chunk packing.
+    /// Shorter chunks improve translation quality. Defaults to ~60% of max-chunk-chars.
+    #[arg(long, env = "PARAGRAPH_TARGET_CHARS")]
+    paragraph_target_chars: Option<usize>,
+
     #[command(subcommand)]
     command: commands::Commands,
 }
@@ -55,6 +65,8 @@ fn main() -> anyhow::Result<()> {
         max_tokens: cli.max_tokens,
         queue_capacity: None,
         prefill_delay_ms: cli.prefill_delay_ms,
+        max_chunk_chars: cli.max_chunk_chars,
+        paragraph_target_chars: cli.paragraph_target_chars,
     };
     cli.command.run(config)
 }

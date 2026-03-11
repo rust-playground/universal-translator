@@ -28,6 +28,12 @@ pub struct EngineConfig {
     pub queue_capacity: Option<usize>,
     /// Prefill accumulation delay in milliseconds.
     pub prefill_delay_ms: Option<u64>,
+    /// Hard ceiling (in characters) for text chunks sent to the model.
+    /// Defaults to `(kv_budget_per_slot - 100) * 4`.
+    pub max_chunk_chars: Option<usize>,
+    /// Target size (in characters) for paragraph-level chunk packing.
+    /// Shorter chunks improve translation quality. Defaults to ~60% of `max_chunk_chars`.
+    pub paragraph_target_chars: Option<usize>,
 }
 
 // ── Language helpers ─────────────────────────────────────────────────────────
@@ -178,6 +184,10 @@ pub struct TranslationEngine {
     queue_capacity: usize,
     /// Resolved KV budget per slot (tokens).
     kv_budget_per_slot: u32,
+    /// Hard ceiling (in characters) for text chunks.
+    max_chunk_chars: usize,
+    /// Paragraph-level packing target (in characters).
+    paragraph_target_chars: usize,
     #[cfg(feature = "opentelemetry")]
     requests: opentelemetry::metrics::Counter<u64>,
     #[cfg(feature = "opentelemetry")]
@@ -227,7 +237,11 @@ impl TranslationEngine {
         let kv_budget_per_slot = config.max_tokens.unwrap_or(DEFAULT_KV_BUDGET_PER_SLOT);
         let queue_capacity = config.queue_capacity.unwrap_or_else(|| (n_slots * 4).max(512));
         let prefill_delay_ms = config.prefill_delay_ms.unwrap_or(DEFAULT_PREFILL_ACCUMULATION_MS);
-        tracing::info!(n_slots, kv_budget_per_slot, queue_capacity, prefill_delay_ms, "engine config resolved");
+        let max_chunk_chars = config.max_chunk_chars
+            .unwrap_or_else(|| (kv_budget_per_slot.saturating_sub(100) * 4) as usize);
+        let paragraph_target_chars = config.paragraph_target_chars
+            .unwrap_or_else(|| max_chunk_chars * 3 / 5);
+        tracing::info!(n_slots, kv_budget_per_slot, queue_capacity, prefill_delay_ms, max_chunk_chars, paragraph_target_chars, "engine config resolved");
 
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
         let handle = std::thread::Builder::new()
@@ -258,6 +272,8 @@ impl TranslationEngine {
             detector: Arc::new(Detector::new()),
             queue_capacity,
             kv_budget_per_slot,
+            max_chunk_chars,
+            paragraph_target_chars,
             #[cfg(feature = "opentelemetry")]
             requests: meter.u64_counter("translator.translation.requests").build(),
             #[cfg(feature = "opentelemetry")]
@@ -281,12 +297,107 @@ impl TranslationEngine {
             max_tokens: None,
             queue_capacity: None,
             prefill_delay_ms: None,
+            max_chunk_chars: None,
+            paragraph_target_chars: None,
         })
     }
 
     /// Resolved KV budget per slot (tokens) — for chunking thresholds.
     pub fn kv_budget_per_slot(&self) -> u32 {
         self.kv_budget_per_slot
+    }
+
+    /// Hard ceiling (in characters) for text chunks sent to the model.
+    pub fn max_chunk_chars(&self) -> usize {
+        self.max_chunk_chars
+    }
+
+    /// Paragraph-level packing target (in characters).
+    pub fn paragraph_target_chars(&self) -> usize {
+        self.paragraph_target_chars
+    }
+
+    /// Translate a batch, automatically chunking any texts that exceed
+    /// `max_chunk_chars`. Delegates to `translate_batch()` on the fast path.
+    pub fn translate_batch_chunked(
+        &self,
+        batch: TranslationBatch,
+    ) -> Result<TranslationResultSet, TranslatorError> {
+        use crate::chunking::chunk_text;
+
+        let max_chars = self.max_chunk_chars;
+        let paragraph_target = self.paragraph_target_chars;
+
+        // Fast path: no chunking needed.
+        if !batch.texts.iter().any(|t| t.len() > max_chars) {
+            return self.translate_batch(batch);
+        }
+
+        // Slow path: chunk long texts, translate, reassemble.
+        let mut chunked_texts: Vec<String> = Vec::new();
+        let mut chunk_separators: Vec<&'static str> = Vec::new();
+        // (original_idx, start_chunk_idx, chunk_count)
+        let mut chunk_map: Vec<(usize, usize, usize)> = Vec::new();
+
+        for (i, text) in batch.texts.iter().enumerate() {
+            let chunks = chunk_text(text, paragraph_target, max_chars);
+            let start = chunked_texts.len();
+            let count = chunks.len();
+            for chunk in chunks {
+                chunked_texts.push(chunk.text);
+                chunk_separators.push(chunk.join_separator);
+            }
+            chunk_map.push((i, start, count));
+        }
+
+        let chunked_batch = TranslationBatch {
+            texts: chunked_texts,
+            target_languages: batch.target_languages.clone(),
+            source_language: batch.source_language.clone(),
+        };
+
+        let chunked_result = self.translate_batch(chunked_batch)?;
+
+        // Reassemble: concatenate chunk translations per language for each original text.
+        let mut results = Vec::with_capacity(chunk_map.len());
+        for (orig_idx, start, count) in &chunk_map {
+            if *count == 1 {
+                let mut result = chunked_result.results[*start].clone();
+                result.source_text = batch.texts[*orig_idx].clone();
+                results.push(result);
+            } else {
+                let first = &chunked_result.results[*start];
+                let mut merged_translations = first.translations.clone();
+                let mut merged_errors = first.errors.clone();
+
+                let rest = (*start + 1)..(*start + *count);
+                for (sep, chunk_result) in chunk_separators[rest.clone()].iter()
+                    .zip(&chunked_result.results[rest])
+                {
+                    for (lang, translation) in &chunk_result.translations {
+                        merged_translations
+                            .entry(lang.clone())
+                            .and_modify(|existing| {
+                                existing.push_str(sep);
+                                existing.push_str(translation);
+                            })
+                            .or_insert_with(|| translation.clone());
+                    }
+                    for (lang, err) in &chunk_result.errors {
+                        merged_errors.entry(lang.clone()).or_insert_with(|| err.clone());
+                    }
+                }
+
+                results.push(TranslationResult {
+                    source_text: batch.texts[*orig_idx].clone(),
+                    detected_language: first.detected_language.clone(),
+                    translations: merged_translations,
+                    errors: merged_errors,
+                });
+            }
+        }
+
+        Ok(TranslationResultSet { results })
     }
 
     /// Detect the language of `text`, returning a lowercase ISO 639-1 code.

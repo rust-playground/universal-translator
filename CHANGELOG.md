@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.3] — 2026-03-10
+
+### Changed
+
+- **Paragraph-first text chunking** — long inputs now split at `\n\n` paragraph
+  boundaries first, falling back to Unicode sentence boundaries only for
+  oversized paragraphs; keeps related sentences together for better translation
+  context
+- **Configurable chunk limits** — `MAX_CHUNK_CHARS` (hard ceiling) and
+  `PARAGRAPH_TARGET_CHARS` (~60% default, quality-oriented) tuneable via env
+  vars or CLI/API flags
+- **Chunking shared across CLI and API** — logic moved to `translator-core`;
+  CLI now handles long inputs instead of failing
+- **Chunk reassembly preserves structure** — translated chunks rejoin with
+  correct `\n\n` separators so paragraph boundaries survive round-trip
+  translation
+
 ## [0.0.2] — 2026-03-10
 
 ### Added
@@ -66,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
-[Unreleased]: https://github.com/rust-playground/universal-translator/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/rust-playground/universal-translator/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/rust-playground/universal-translator/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/rust-playground/universal-translator/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/rust-playground/universal-translator/compare/0044ce9fe79ee4ea73fa57dca12485b0bd22a5fb...v0.0.1
