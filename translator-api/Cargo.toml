@@ -33,7 +33,6 @@ anyhow             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap               = { workspace = true }
-unicode-segmentation = "1"
 opentelemetry                  = { workspace = true, optional = true }
 opentelemetry_sdk              = { workspace = true, optional = true }
 opentelemetry-otlp             = { workspace = true, optional = true }

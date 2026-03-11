@@ -36,7 +36,7 @@ impl TranslateArgs {
             source_language: self.source_language,
         };
 
-        let result = engine.translate_batch(batch)?;
+        let result = engine.translate_batch_chunked(batch)?;
 
         match self.output {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),

@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "translator-api"
-version = "0.1.0"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2876,12 +2876,11 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "translator-core",
- "unicode-segmentation",
 ]
 
 [[package]]
 name = "translator-cli"
-version = "0.1.0"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2895,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "translator-core"
-version = "0.1.0"
+version = "0.0.3"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -2908,6 +2907,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]

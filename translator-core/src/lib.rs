@@ -1,3 +1,4 @@
+pub mod chunking;
 pub mod detector;
 pub mod engine;
 pub mod error;
