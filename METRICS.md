@@ -93,7 +93,7 @@ The provisioned dashboard (`uid = ut-observability-v1`) contains ten panels:
 | Error Rate by Type                  | time series | Per-error-category rate — see error types below     |
 | Tokens / s                          | time series | Generated tokens per second across all active slots |
 | Slot Completions by Cause           | time series | EOS completions vs. capacity-limit truncations      |
-| Decode Forward Latency p50 / p95    | time series | Time for one batched `forward_batched` call         |
+| Decode Forward Latency p50 / p95    | time series | Time for one batched `LlamaContext::decode` call     |
 | Prefill Latency p50 / p95           | time series | Time for `prefill` (prompt encoding + first token)  |
 | Prompt Tokens p50 / p95             | time series | Token count of the formatted prompt per request     |
 
@@ -124,7 +124,7 @@ Histogram boundaries for `duration_ms`: 100, 250, 500, 1 000, 2 000, 5 000, 10 0
 |-----------------------------------------------|-----------------------------------------------|-----------|---------|-------------------------------------------------------------------------------------------|
 | `translator.scheduler.active_slots`           | `translator_scheduler_active_slots`           | Gauge     | —       | Number of slots actively decoding at the start of each batch pass                         |
 | `translator.scheduler.queue_depth`            | `translator_scheduler_queue_depth`            | Gauge     | —       | Pending requests in the work queue                                                        |
-| `translator.scheduler.decode_forward_ms`      | `translator_scheduler_decode_forward_ms`      | Histogram | —       | Time for one batched `forward_batched` call, in ms                                        |
+| `translator.scheduler.decode_forward_ms`      | `translator_scheduler_decode_forward_ms`      | Histogram | —       | Time for one batched `LlamaContext::decode` call, in ms                                   |
 | `translator.scheduler.prefill_ms`             | `translator_scheduler_prefill_ms`             | Histogram | —       | Time for prompt prefill (encoding + first token sample), in ms                            |
 | `translator.scheduler.prompt_tokens`          | `translator_scheduler_prompt_tokens`          | Histogram | —       | Number of prompt tokens per slot at prefill time                                          |
 | `translator.scheduler.slots_completed`        | `translator_scheduler_slots_completed_total`  | Counter   | `cause` | Slots retired — `cause=eos` (natural end) or `cause=capacity` (truncated at 4 096 tokens) |

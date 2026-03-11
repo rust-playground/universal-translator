@@ -7,7 +7,7 @@ use axum::{
 use clap::Parser;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use translator_core::engine::TranslationEngine;
+use translator_core::{engine::TranslationEngine, EngineConfig};
 
 mod error;
 mod routes;
@@ -28,6 +28,23 @@ struct Args {
     /// [default: platform cache dir / ut/models]
     #[arg(long, env = "MODELS_DIR")]
     models_dir: Option<PathBuf>,
+
+    /// GGUF model file name (e.g. "model-q8_0.gguf").
+    /// Overrides auto-detection. Also settable via MODEL_FILE env var.
+    #[arg(long, env = "MODEL_FILE")]
+    model_file: Option<String>,
+
+    /// Number of concurrent decode slots.
+    #[arg(long, env = "MAX_DECODE_SLOTS")]
+    n_slots: Option<usize>,
+
+    /// Maximum tokens per translation request.
+    #[arg(long, env = "KV_BUDGET_PER_SLOT")]
+    max_tokens: Option<u32>,
+
+    /// Prefill accumulation delay in milliseconds.
+    #[arg(long, env = "PREFILL_ACCUMULATION_MS")]
+    prefill_delay_ms: Option<u64>,
 
     /// TCP port to listen on.
     #[arg(long, default_value_t = 3000)]
@@ -116,7 +133,18 @@ async fn main() {
 
     tracing::info!(?models_dir, "Loading translation engine");
 
-    let engine = TranslationEngine::new(&models_dir);
+    let config = EngineConfig {
+        models_dir,
+        model_file: args.model_file,
+        n_slots: args.n_slots,
+        max_tokens: args.max_tokens,
+        queue_capacity: None,
+        prefill_delay_ms: args.prefill_delay_ms,
+    };
+    let engine = TranslationEngine::from_config(config).unwrap_or_else(|e| {
+        tracing::error!("Failed to load model: {e}");
+        std::process::exit(1);
+    });
     let state = AppState {
         engine,
         #[cfg(feature = "opentelemetry")]

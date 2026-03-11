@@ -1,8 +1,6 @@
-use std::path::Path;
-
 use anyhow::Result;
 use clap::Args;
-use translator_core::{engine::TranslationEngine, types::TranslationBatch};
+use translator_core::{engine::TranslationEngine, types::TranslationBatch, EngineConfig};
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -30,15 +28,15 @@ pub struct TranslateArgs {
 }
 
 impl TranslateArgs {
-    pub async fn run(self, models_dir: &Path) -> Result<()> {
-        let engine = TranslationEngine::new(models_dir);
+    pub fn run(self, config: EngineConfig) -> Result<()> {
+        let engine = TranslationEngine::from_config(config)?;
         let batch = TranslationBatch {
             texts: self.texts,
             target_languages: self.languages,
             source_language: self.source_language,
         };
 
-        let result = engine.translate_batch(batch).await?;
+        let result = engine.translate_batch(batch)?;
 
         match self.output {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),

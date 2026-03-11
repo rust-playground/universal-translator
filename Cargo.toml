@@ -6,9 +6,9 @@ resolver = "3"
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-description = "Fast, fully local text translation CLI and API using TranslateGemma 4B via Candle"
+description = "Fast, fully local text translation CLI and API using TranslateGemma 4B via llama.cpp"
 repository  = "https://github.com/rust-playground/universal-translator"
-keywords    = ["translation", "nlp", "gemma", "candle", "lingua"]
+keywords    = ["translation", "nlp", "gemma", "llama-cpp", "lingua"]
 
 [workspace.dependencies]
 translator-core     = { path = "./translator-core" }
@@ -20,10 +20,7 @@ serde               = { version = "1", features = ["derive"] }
 serde_json          = "1"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
-candle-core         = { version = "0.9" }
-candle-transformers = { version = "0.9" }
-candle-nn           = { version = "0.9" }
-tokenizers          = { version = "0.22", default-features = false, features = ["onig"] }
+llama-cpp-2         = { version = "0.1", default-features = false }
 lingua              = "1"
 clap                = { version = "4", features = ["derive", "env"] }
 axum                = { version = "0.8", features = ["json", "macros"] }

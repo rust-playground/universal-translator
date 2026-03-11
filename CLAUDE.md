@@ -25,10 +25,15 @@ Run once before using the CLI or API:
 bash models/download.sh   # requires: pip install huggingface_hub[cli] && hf auth login
 ```
 
-Downloads TranslateGemma 4B. Required files in `${MODELS_DIR}/translategemma-4b/`:
-- `model-q4k.gguf` (~2.6 GB, GGUF Q4_K_M quantised weights)
-- `config.json`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`
+Downloads TranslateGemma 4B. Required file in `${MODELS_DIR}/translategemma-4b/`:
+- `model-q8_0.gguf` (~4.1 GB, GGUF Q8_0 quantised weights — default, higher precision; tokenizer embedded in GGUF)
 
+Optional smaller weights:
+```bash
+bash models/download.sh --q4   # also downloads Q4_K_M (~2.6 GB)
+```
+
+Select model file at runtime: `--model-file model-q4k.gguf` flag or `MODEL_FILE=model-q4k.gguf` env var.
 Default `MODELS_DIR`: platform cache directory (via `dirs` crate). Override with `--models-dir` flag or `MODELS_DIR` env var.
 
 ## Running
@@ -43,8 +48,8 @@ cargo run -p translator-cli -- detect -t "Bonjour"
 cargo run -p translator-api
 ```
 
-Key CLI flags: `--models-dir`, `--output json`.
-Key API env vars: `MODELS_DIR`, `RUST_LOG`.
+Key CLI flags: `--models-dir`, `--model-file`, `--output json`.
+Key API env vars: `MODELS_DIR`, `MODEL_FILE`, `RUST_LOG`.
 
 ## Architecture
 
@@ -57,21 +62,21 @@ Key API env vars: `MODELS_DIR`, `RUST_LOG`.
 ### Inference stack
 
 - **Model**: TranslateGemma 4B — Gemma 3 4B instruction-tuned decoder-only model for all 55 languages
-- **Framework**: Candle (candle-core, candle-transformers, candle-nn)
-- **Tokenizer**: HuggingFace fast tokenizer (`tokenizers` crate, `tokenizer.json`)
+- **Framework**: [llama.cpp](https://github.com/ggerganov/llama.cpp) via the `llama-cpp-2` Rust crate
+- **Tokenizer**: embedded in the GGUF file (no separate `tokenizer.json` needed)
 - **Language detection**: Lingua (75+ languages) with script-based fallback for Malayalam
 
 ### Core data flow (`engine.rs`)
 
 1. **Detection** — parallel Lingua detection or normalise user-supplied source language
 2. **Work building** — flatten texts × target languages; build Gemma instruct-format prompt with system turn and `Translate from X to Y:` user turn
-3. **Worker dispatch** — send to background Tokio task; concurrent requests are coalesced into a single batch
-4. **Inference** — `LoadedGemmaModel` + `ContinuousScheduler` runs batched decode with temperature/top-k/top-p sampling
+3. **Worker dispatch** — send to dedicated scheduler thread via crossbeam channel; concurrent requests are coalesced into a single batch
+4. **Inference** — `LoadedGemmaModel` + `ContinuousScheduler` runs batched decode via `LlamaContext` with temperature/top-k/top-p sampling
 
 ### Key design decisions
 
 - `TranslationEngine` is `Clone`-cheap (Arc-backed internals)
-- `OnceCell<Arc<LoadedGemmaModel>>` — single model instance, async initialisation, lock-free read path after init
+- Single model instance loaded synchronously at startup, shared read-only via `Arc<LoadedGemmaModel>`
 - Token limits: 4 096 tokens max output (SLOT_CAPACITY)
 - Same-language shortcut: returns original text without inference
 

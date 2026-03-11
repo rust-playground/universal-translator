@@ -18,8 +18,18 @@ impl IntoResponse for ApiError {
             TranslatorError::UnsupportedLanguage(_) => {
                 (StatusCode::BAD_REQUEST, self.0.to_string())
             }
+            TranslatorError::ServiceUnavailable(_) => {
+                (StatusCode::TOO_MANY_REQUESTS, self.0.to_string())
+            }
+            TranslatorError::InputTooLong(_) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, self.0.to_string())
+            }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()),
         };
+
+        if status.is_server_error() {
+            tracing::error!(error = %message, %status, "request failed");
+        }
 
         (status, Json(json!({ "error": message }))).into_response()
     }

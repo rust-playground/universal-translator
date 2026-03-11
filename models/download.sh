@@ -2,7 +2,8 @@
 # Download TranslateGemma 4B GGUF weights and tokenizer from HuggingFace.
 #
 # Usage:
-#   bash models/download.sh                        # → platform cache dir
+#   bash models/download.sh                        # Q8_0 only (default)
+#   bash models/download.sh --q4                   # also download Q4_K_M
 #   MODELS_DIR=/custom/path bash models/download.sh
 #
 # Prerequisites: hf CLI  (pip install huggingface_hub[cli])
@@ -12,15 +13,26 @@
 #
 # Phase 1 — GGUF weights (public, no auth):
 #   mradermacher/translategemma-4b-it-GGUF
-#   File: translategemma-4b-it.Q4_K_M.gguf → renamed to model-q4k.gguf
+#   Q8_0:   translategemma-4b-it.Q8_0.gguf   → model-q8_0.gguf  (~4.1 GB)
+#   Q4_K_M: translategemma-4b-it.Q4_K_M.gguf → model-q4k.gguf  (~2.6 GB)
 #
 # Phase 2 — tokenizer + config (GATED — requires HF login + license acceptance):
 #   google/translategemma-4b-it
 #   Accept the license at: https://huggingface.co/google/translategemma-4b-it
+#   NOTE: These files are optional — the GGUF embeds the tokenizer. Kept for
+#   reference and compatibility with external tooling (e.g. HF Transformers).
 #
-# Download size: ~2.6 GB (model-q4k.gguf, Q4_K_M quantisation)
+# To use Q4_K_M at runtime: MODEL_FILE=model-q4k.gguf cargo run ...
 
 set -euo pipefail
+
+DOWNLOAD_Q4=false
+for arg in "$@"; do
+  case "$arg" in
+    --q4) DOWNLOAD_Q4=true ;;
+    *) echo "Unknown option: $arg"; exit 1 ;;
+  esac
+done
 
 # Resolve platform-appropriate cache dir (mirrors dirs::cache_dir() in Rust)
 case "$(uname -s)" in
@@ -37,12 +49,6 @@ echo "━━━  translategemma-4b"
 echo "     Output: ${GEMMA_DIR}"
 echo ""
 
-# Check if already downloaded (key file present)
-if [[ -f "${GEMMA_DIR}/model-q4k.gguf" ]]; then
-  echo "SKIP  translategemma-4b  (model-q4k.gguf already exists)"
-  exit 0
-fi
-
 if command -v hf &>/dev/null; then
   HF_CLI="hf"
 elif command -v huggingface-cli &>/dev/null; then
@@ -53,38 +59,68 @@ else
   exit 1
 fi
 
-# ── Phase 1: GGUF weights (public, no auth) ──────────────────────────────────
-echo "Phase 1/2 — Downloading GGUF weights (public)…"
 GGUF_REPO="mradermacher/translategemma-4b-it-GGUF"
-GGUF_FILE="translategemma-4b-it.Q4_K_M.gguf"
 
-${HF_CLI} download "${GGUF_REPO}" \
-  "${GGUF_FILE}" \
-  --local-dir "${GEMMA_DIR}"
+# ── Phase 1a: Q8_0 weights (public, no auth) ─────────────────────────────────
+if [[ -f "${GEMMA_DIR}/model-q8_0.gguf" ]]; then
+  echo "SKIP  model-q8_0.gguf (already exists)"
+else
+  echo "Phase 1a — Downloading Q8_0 GGUF weights (~4.1 GB)…"
+  GGUF_FILE="translategemma-4b-it.Q8_0.gguf"
 
-mv "${GEMMA_DIR}/${GGUF_FILE}" "${GEMMA_DIR}/model-q4k.gguf"
-echo "OK    model-q4k.gguf"
+  ${HF_CLI} download "${GGUF_REPO}" \
+    "${GGUF_FILE}" \
+    --local-dir "${GEMMA_DIR}"
+
+  mv "${GEMMA_DIR}/${GGUF_FILE}" "${GEMMA_DIR}/model-q8_0.gguf"
+  echo "OK    model-q8_0.gguf"
+fi
 echo ""
 
-# ── Phase 2: tokenizer + config (gated) ──────────────────────────────────────
-echo "Phase 2/2 — Downloading tokenizer + config (gated repo)…"
-echo "  Requires: hf auth login AND license acceptance at"
-echo "  https://huggingface.co/google/translategemma-4b-it"
-echo ""
+# ── Phase 1b: Q4_K_M weights (optional, public) ─────────────────────────────
+if [[ "${DOWNLOAD_Q4}" == "true" ]]; then
+  if [[ -f "${GEMMA_DIR}/model-q4k.gguf" ]]; then
+    echo "SKIP  model-q4k.gguf (already exists)"
+  else
+    echo "Phase 1b — Downloading Q4_K_M GGUF weights (~2.6 GB)…"
+    GGUF_FILE_Q4="translategemma-4b-it.Q4_K_M.gguf"
 
-GATED_REPO="google/translategemma-4b-it"
+    ${HF_CLI} download "${GGUF_REPO}" \
+      "${GGUF_FILE_Q4}" \
+      --local-dir "${GEMMA_DIR}"
 
-if ! ${HF_CLI} download "${GATED_REPO}" \
-  tokenizer.json tokenizer_config.json config.json special_tokens_map.json \
-  --local-dir "${GEMMA_DIR}"; then
+    mv "${GEMMA_DIR}/${GGUF_FILE_Q4}" "${GEMMA_DIR}/model-q4k.gguf"
+    echo "OK    model-q4k.gguf"
+  fi
   echo ""
-  echo "ERROR: Failed to download from ${GATED_REPO}."
+fi
+
+# ── Phase 2: tokenizer + config (gated, optional) ──────────────────────────
+# NOTE: The GGUF file embeds the tokenizer, so these files are NOT required at
+# runtime. They are downloaded for reference and compatibility with external
+# tooling (e.g. HF Transformers, tokenizer inspection scripts).
+if [[ -f "${GEMMA_DIR}/tokenizer.json" ]]; then
+  echo "SKIP  tokenizer + config (already exists)"
+else
+  echo "Phase 2 — Downloading tokenizer + config (gated repo)…"
+  echo "  Requires: hf auth login AND license acceptance at"
+  echo "  https://huggingface.co/google/translategemma-4b-it"
   echo ""
-  echo "This repo is gated. To fix:"
-  echo "  1. Accept the license at https://huggingface.co/google/translategemma-4b-it"
-  echo "  2. Log in: hf auth login"
-  echo "  3. Re-run: bash models/download.sh"
-  exit 1
+
+  GATED_REPO="google/translategemma-4b-it"
+
+  if ! ${HF_CLI} download "${GATED_REPO}" \
+    tokenizer.json tokenizer_config.json config.json special_tokens_map.json \
+    --local-dir "${GEMMA_DIR}"; then
+    echo ""
+    echo "ERROR: Failed to download from ${GATED_REPO}."
+    echo ""
+    echo "This repo is gated. To fix:"
+    echo "  1. Accept the license at https://huggingface.co/google/translategemma-4b-it"
+    echo "  2. Log in: hf auth login"
+    echo "  3. Re-run: bash models/download.sh"
+    exit 1
+  fi
 fi
 
 echo ""

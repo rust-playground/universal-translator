@@ -6,21 +6,19 @@ license.workspace = true
 
 [features]
 default = []
-metal          = ["candle-core/metal", "candle-transformers/metal", "candle-nn/metal"]
-cuda           = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda"]
+metal          = ["llama-cpp-2/metal"]
+cuda           = ["llama-cpp-2/cuda"]
 opentelemetry  = ["dep:opentelemetry"]
 
 [dependencies]
-candle-core         = { workspace = true }
-candle-transformers = { workspace = true }
-candle-nn           = { workspace = true }
-tokenizers          = { workspace = true }
-serde_json          = { workspace = true }
-lingua              = { workspace = true }
-tokio               = { workspace = true, features = ["rt", "sync"] }
-thiserror           = { workspace = true }
-serde               = { workspace = true }
-tracing             = { workspace = true }
-rand                = { version = "0.8", features = ["small_rng"] }
-futures             = { workspace = true }
-opentelemetry       = { workspace = true, optional = true }
+llama-cpp-2          = { workspace = true }
+serde_json           = { workspace = true }
+lingua               = { workspace = true }
+thiserror            = { workspace = true }
+serde                = { workspace = true }
+tracing              = { workspace = true }
+rand                 = { version = "0.8", features = ["small_rng"] }
+crossbeam-channel    = "0.5"
+rayon                = "1"
+encoding_rs          = "0.8"
+opentelemetry        = { workspace = true, optional = true }

@@ -18,7 +18,6 @@ translator-core    = { workspace = true }
 dirs               = { workspace = true }
 lingua             = { workspace = true }
 clap               = { workspace = true }
-tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serde_json         = { workspace = true }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }

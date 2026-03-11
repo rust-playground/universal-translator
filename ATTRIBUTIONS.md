@@ -11,8 +11,8 @@ each component are listed below.
 
 **License:** Gemma Terms of Use (not Apache/MIT)
 **Source:** https://huggingface.co/google/translategemma-4b-it
-**Used for:** Tokenizer configuration (tokenizer.json, config.json) — downloaded at
-model setup. The model is an instruction-tuned Gemma 3 4B fine-tuned for translation.
+**Used for:** GGUF quantised model weights and config files — downloaded at model setup.
+The model is an instruction-tuned Gemma 3 4B fine-tuned for translation.
 
 > See [LICENSE-GEMMA](LICENSE-GEMMA) and [NOTICE](NOTICE) for the full terms.
 > You must accept the Gemma Terms of Use before downloading model files.
@@ -23,27 +23,15 @@ model setup. The model is an instruction-tuned Gemma 3 4B fine-tuned for transla
 
 **License:** Gemma Terms of Use (inherited from source; GGUF conversion by mradermacher)
 **Source:** https://huggingface.co/mradermacher/translategemma-4b-it-GGUF
-**Used for:** The `model-q4k.gguf` file (~2.6 GB) downloaded at model setup —
-community Q4_K_M GGUF quantisation enabling Candle inference without Python tooling.
+**Used for:** Community GGUF quantisations (Q8_0 and Q4_K_M) for llama.cpp inference.
 
 ---
 
-## Candle (inference framework)
+## llama.cpp (inference framework)
 
-**License:** MIT OR Apache-2.0
-**Source:** https://github.com/huggingface/candle
-**Used for:** All model inference at runtime (candle-core, candle-transformers,
-candle-nn crates)
-
-No additional attribution action is required by the MIT/Apache-2.0 licenses.
-
----
-
-## HuggingFace Tokenizers
-
-**License:** Apache 2.0
-**Source:** https://github.com/huggingface/tokenizers
-**Used for:** Fast tokenisation via the `tokenizers` Rust crate and `tokenizer.json`
+**License:** MIT
+**Source:** https://github.com/ggerganov/llama.cpp
+**Used for:** All model inference at runtime via the `llama-cpp-2` Rust crate
 
 ---
 

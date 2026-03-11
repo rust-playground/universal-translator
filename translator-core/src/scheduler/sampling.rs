@@ -68,6 +68,8 @@ pub const EOS_LOGIT_BIAS: f32 = 6.0;
 /// No-op until `step / expected_len >= LENGTH_PENALTY_START`.  After that,
 /// adds a linearly increasing bonus that saturates at `EOS_LOGIT_BIAS` when
 /// `step >= expected_len`.
+///
+/// Applied to raw logits (before temperature scaling inside `sample_token`).
 pub fn apply_length_bias(
     logits: &mut [f32],
     eos_token_id: u32,
@@ -133,56 +135,90 @@ pub const TOP_K: usize = 40;
 /// probability reaches this threshold.
 pub const TOP_P: f32 = 0.90;
 
-/// Sample the next token from `logits` using temperature / top-K / top-P.
+/// Sift down in a min-heap ordered by the f32 value of `(u32, f32)` elements.
+#[inline]
+fn min_heap_sift_down(heap: &mut [(u32, f32)], mut i: usize, len: usize) {
+    loop {
+        let left = 2 * i + 1;
+        let right = 2 * i + 2;
+        let mut smallest = i;
+        if left < len && heap[left].1 < heap[smallest].1 {
+            smallest = left;
+        }
+        if right < len && heap[right].1 < heap[smallest].1 {
+            smallest = right;
+        }
+        if smallest == i {
+            break;
+        }
+        heap.swap(i, smallest);
+        i = smallest;
+    }
+}
+
+/// Sample the next token from `logits` using top-K / top-P / temperature.
 ///
-/// Does not mutate `logits`.  Uses `rng` for the weighted random draw.
+/// Temperature is applied to the ≤K candidates AFTER top-K selection —
+/// since temperature is a positive constant it doesn't change rank order,
+/// so top-K can run on raw logits (saving ~262 K divisions per call).
 ///
-/// Hot-path optimisation: temperature scaling and candidate collection are
-/// fused into a single O(V) pass.  Top-K is then found with an O(V)-average
-/// quickselect (`select_nth_unstable_by`) rather than a full O(V log V) sort.
-/// Softmax, top-P filtering, and the weighted draw all operate on the ≤K
-/// candidate vec (≤40 elements), keeping per-token allocations under 320 B.
+/// Top-K uses a stack-allocated min-heap of size TOP_K=40 (320 bytes, L1-resident)
+/// for an O(vocab) single pass with zero heap allocation.
 ///
 /// Call AFTER `apply_decoding_filters` and `apply_length_bias`.
 pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
     let vocab = logits.len();
 
-    // 1. Top-K: collect finite logits into (index, scaled-value) pairs in one
-    //    pass, applying temperature scaling inline to avoid a separate O(V) loop.
+    // 1. Top-K via stack-allocated min-heap: O(vocab) scan, zero heap allocation.
+    //    TOP_K=40 → 320 bytes on the stack; stays in L1 cache for the full vocab scan.
     let k = TOP_K.min(vocab);
-    let mut candidates: Vec<(u32, f32)> = logits
-        .iter()
-        .enumerate()
-        .filter(|&(_, &v)| v.is_finite())
-        .map(|(i, &v)| (i as u32, v / TEMPERATURE))
-        .collect();
-    if candidates.len() > k {
-        candidates.select_nth_unstable_by(k, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        candidates.truncate(k);
+    let mut heap = [(0u32, f32::NEG_INFINITY); TOP_K];
+    let mut heap_len = 0usize;
+
+    for (i, &v) in logits.iter().enumerate() {
+        if !v.is_finite() {
+            continue;
+        }
+        if heap_len < k {
+            heap[heap_len] = (i as u32, v);
+            heap_len += 1;
+            if heap_len == k {
+                // Build min-heap in O(K) once we have K candidates.
+                for j in (0..k / 2).rev() {
+                    min_heap_sift_down(&mut heap, j, k);
+                }
+            }
+        } else if v > heap[0].1 {
+            // New candidate beats current heap-min → replace root and restore heap.
+            heap[0] = (i as u32, v);
+            min_heap_sift_down(&mut heap, 0, heap_len);
+        }
     }
+
+    let candidates = &mut heap[..heap_len];
 
     if candidates.is_empty() {
         return 0;
     }
 
-    // 2. Softmax over the ≤K candidates only.
-    let max = candidates
-        .iter()
-        .map(|(_, v)| *v)
-        .fold(f32::NEG_INFINITY, f32::max);
-    for (_, v) in &mut candidates {
+    // 2. Apply temperature to the ≤K candidates only (~40 divisions instead of 262K).
+    for (_, v) in candidates.iter_mut() {
+        *v /= TEMPERATURE;
+    }
+
+    // 3. Softmax over the ≤K candidates only.
+    let max = candidates.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+    for (_, v) in candidates.iter_mut() {
         *v = (*v - max).exp();
     }
     let sum: f32 = candidates.iter().map(|(_, v)| v).sum();
     if sum > 0.0 {
-        for (_, v) in &mut candidates {
+        for (_, v) in candidates.iter_mut() {
             *v /= sum;
         }
     }
 
-    // 3. Top-P (nucleus): sort the small K-element vec by probability, then
+    // 4. Top-P (nucleus): sort the small K-element slice by probability, then
     //    truncate once cumulative mass >= TOP_P.
     candidates.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -196,14 +232,14 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
             break;
         }
     }
-    candidates.truncate(cutoff);
+    let candidates = &mut candidates[..cutoff];
 
-    // 4. Renormalise & weighted draw.
+    // 5. Renormalise & weighted draw.
     let sum: f32 = candidates.iter().map(|(_, v)| v).sum();
     let draw: f32 = Standard.sample(rng);
     let threshold = draw * sum;
     let mut cumsum = 0.0_f32;
-    for &(idx, p) in &candidates {
+    for &(idx, p) in candidates.iter() {
         cumsum += p;
         if cumsum >= threshold {
             return idx;
@@ -280,7 +316,7 @@ mod tests {
 
     #[test]
     fn length_bias_at_capacity() {
-        // step == expected_len → fraction = 1.0 → bias == EOS_LOGIT_BIAS.
+        // step == expected_len → fraction = 1.0 → bias == EOS_LOGIT_BIAS (raw logit space).
         let mut logits = vec![0.0f32; 5];
         let eos = 0u32;
         apply_length_bias(&mut logits, eos, 10, 10);

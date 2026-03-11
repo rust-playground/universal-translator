@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
-use translator_core::engine::TranslationEngine;
+use translator_core::detector::Detector;
 
 #[derive(Clone, ValueEnum)]
 pub enum OutputFormat {
@@ -20,9 +20,9 @@ pub struct DetectArgs {
 }
 
 impl DetectArgs {
-    pub async fn run(self, models_dir: &Path) -> Result<()> {
-        let engine = TranslationEngine::new(models_dir);
-        let detected = engine.detect_language(&self.text).await?;
+    pub fn run(self, _models_dir: &Path) -> Result<()> {
+        let detector = Detector::new();
+        let detected = detector.detect(&self.text)?;
 
         match self.output {
             OutputFormat::Json => println!(

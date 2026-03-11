@@ -1,14 +1,34 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use crate::detector::Detector;
 use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
 use crate::scheduler::{ContinuousScheduler, InferRequest, SLOT_CAPACITY};
 use crate::types::{LanguageDetectionResult, TranslationBatch, TranslationResult, TranslationResultSet};
-use futures::future::try_join_all;
-use tokio::task;
+
+// ── Configuration ────────────────────────────────────────────────────────────
+
+/// Configuration for the translation engine.
+///
+/// All fields are optional — sensible defaults are used when `None`.
+/// Env-var reading belongs in the CLI/API layer (via clap `env = "..."`),
+/// not here.
+pub struct EngineConfig {
+    pub models_dir: PathBuf,
+    pub model_file: Option<String>,
+    /// Number of concurrent decode slots.
+    pub n_slots: Option<usize>,
+    /// Maximum tokens per translation (maps to KV budget per slot).
+    pub max_tokens: Option<u32>,
+    /// Bounded queue capacity for pending translation requests.
+    pub queue_capacity: Option<usize>,
+    /// Prefill accumulation delay in milliseconds.
+    pub prefill_delay_ms: Option<u64>,
+}
 
 // ── Language helpers ─────────────────────────────────────────────────────────
 
@@ -74,21 +94,7 @@ fn lang_full_name(code: &str) -> &str {
     }
 }
 
-/// Build a Gemma instruct-format translation prompt.
-///
-/// Uses the Gemma 3 chat template with a system turn that constrains output
-/// to a single translation (prevents multi-option "helpful assistant" mode):
-///
-///   <bos>
-///   <start_of_turn>system
-///   You are a translation engine. Output only the translated text. Do not add explanations, alternatives, notes, or any other text.<end_of_turn>
-///   <start_of_turn>user
-///   Translate from {src} to {tgt}:
-///   {text}<end_of_turn>
-///   <start_of_turn>model
-///
-/// `<bos>` is included so we tokenize without `add_special_tokens`.
-/// The model generates the translation and ends with `<end_of_turn>`.
+/// Build a full Gemma instruct-format translation prompt.
 fn translate_gemma_prompt(src_lang: &str, tgt_lang: &str, text: &str) -> String {
     format!(
         "<bos><start_of_turn>system\n\
@@ -145,15 +151,33 @@ pub fn supported_languages() -> Vec<&'static str> {
 
 // ── Engine ───────────────────────────────────────────────────────────────────
 
+/// Joins the scheduler thread on drop, ensuring LlamaContext/LlamaModel are
+/// fully freed before process exit runs Metal/CUDA static destructors.
+struct SchedulerGuard(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for SchedulerGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// The central translation engine. Cheap to clone — all heavy state is reference-counted.
+///
+/// **Drop order matters:** `worker_tx` is declared before `_scheduler_guard` so
+/// that when the last clone drops, the channel closes first (signaling the
+/// scheduler to exit), then the `Arc<SchedulerGuard>` refcount hits zero and
+/// joins the thread — ensuring full cleanup before static destructors run.
 #[derive(Clone)]
 pub struct TranslationEngine {
-    models_dir: PathBuf,
-    /// Cached model reference — populated on first use.
-    model_cache: Arc<OnceLock<Arc<LoadedGemmaModel>>>,
+    worker_tx: crossbeam_channel::Sender<InferRequest>,
+    _scheduler_guard: Arc<SchedulerGuard>,
     detector: Arc<Detector>,
-    /// Sender half of the continuous-batching scheduler channel.  Initialised lazily.
-    work_tx: Arc<OnceLock<std::sync::mpsc::Sender<InferRequest>>>,
+    /// Bounded channel capacity.
+    queue_capacity: usize,
+    /// Resolved KV budget per slot (tokens).
+    kv_budget_per_slot: u32,
     #[cfg(feature = "opentelemetry")]
     requests: opentelemetry::metrics::Counter<u64>,
     #[cfg(feature = "opentelemetry")]
@@ -162,15 +186,78 @@ pub struct TranslationEngine {
     duration_ms: opentelemetry::metrics::Histogram<f64>,
 }
 
+/// Default slot counts per backend.
+/// llama.cpp manages KV cache memory internally — no need for GPU memory queries.
+#[cfg(feature = "metal")]
+const DEFAULT_N_SLOTS_METAL: usize = 32;
+#[cfg(feature = "cuda")]
+const DEFAULT_N_SLOTS_CUDA: usize = 64;
+const DEFAULT_N_SLOTS_CPU: usize = 4;
+
+/// Compile-time default slot count per backend.
+fn auto_n_slots() -> usize {
+    #[cfg(feature = "metal")]
+    {
+        return DEFAULT_N_SLOTS_METAL;
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        return DEFAULT_N_SLOTS_CUDA;
+    }
+
+    #[allow(unreachable_code)]
+    DEFAULT_N_SLOTS_CPU
+}
+
+/// Default KV budget per slot (tokens).
+pub(crate) const DEFAULT_KV_BUDGET_PER_SLOT: u32 = 1024;
+
+/// Default prefill accumulation delay (ms).
+pub(crate) const DEFAULT_PREFILL_ACCUMULATION_MS: u64 = 10;
+
+
 impl TranslationEngine {
-    pub fn new(models_dir: impl AsRef<Path>) -> Self {
+    pub fn from_config(config: EngineConfig) -> Result<Self, TranslatorError> {
+        let model_dir = config.models_dir.join("translategemma-4b");
+        tracing::info!(?model_dir, "Loading TranslateGemma model");
+        let model = Arc::new(LoadedGemmaModel::load(&model_dir, config.model_file.as_deref())?);
+
+        let n_slots = config.n_slots.unwrap_or_else(auto_n_slots);
+        let kv_budget_per_slot = config.max_tokens.unwrap_or(DEFAULT_KV_BUDGET_PER_SLOT);
+        let queue_capacity = config.queue_capacity.unwrap_or_else(|| (n_slots * 4).max(512));
+        let prefill_delay_ms = config.prefill_delay_ms.unwrap_or(DEFAULT_PREFILL_ACCUMULATION_MS);
+        tracing::info!(n_slots, kv_budget_per_slot, queue_capacity, prefill_delay_ms, "engine config resolved");
+
+        let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
+        let handle = std::thread::Builder::new()
+            .name("translator-scheduler".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ContinuousScheduler::new(model, rx, n_slots, kv_budget_per_slot, prefill_delay_ms).run()
+                }));
+                if let Err(panic) = result {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("unknown panic");
+                    tracing::error!(
+                        panic = msg,
+                        "translator-scheduler thread panicked — service is down until restart"
+                    );
+                }
+            })
+            .expect("failed to spawn translator-scheduler thread");
+
         #[cfg(feature = "opentelemetry")]
         let meter = opentelemetry::global::meter("translator");
-        Self {
-            models_dir: models_dir.as_ref().to_path_buf(),
-            model_cache: Arc::new(OnceLock::new()),
+        Ok(Self {
+            worker_tx: tx,
+            _scheduler_guard: Arc::new(SchedulerGuard(Some(handle))),
             detector: Arc::new(Detector::new()),
-            work_tx: Arc::new(OnceLock::new()),
+            queue_capacity,
+            kv_budget_per_slot,
             #[cfg(feature = "opentelemetry")]
             requests: meter.u64_counter("translator.translation.requests").build(),
             #[cfg(feature = "opentelemetry")]
@@ -182,29 +269,37 @@ impl TranslationEngine {
                     100., 250., 500., 1000., 2000., 5000., 10000., 30000., 60000., 120000.,
                 ])
                 .build(),
-        }
+        })
+    }
+
+    /// Convenience constructor matching the old `new(models_dir, model_file)` signature.
+    pub fn new(models_dir: impl AsRef<Path>, model_file: Option<&str>) -> Result<Self, TranslatorError> {
+        Self::from_config(EngineConfig {
+            models_dir: models_dir.as_ref().to_path_buf(),
+            model_file: model_file.map(String::from),
+            n_slots: None,
+            max_tokens: None,
+            queue_capacity: None,
+            prefill_delay_ms: None,
+        })
+    }
+
+    /// Resolved KV budget per slot (tokens) — for chunking thresholds.
+    pub fn kv_budget_per_slot(&self) -> u32 {
+        self.kv_budget_per_slot
     }
 
     /// Detect the language of `text`, returning a lowercase ISO 639-1 code.
-    pub async fn detect_language(&self, text: &str) -> Result<String, TranslatorError> {
-        let text_owned = text.to_string();
-        let detector = self.detector.clone();
-        task::spawn_blocking(move || detector.detect(&text_owned))
-            .await
-            .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))?
+    pub fn detect_language(&self, text: &str) -> Result<String, TranslatorError> {
+        self.detector.detect(text)
     }
 
     /// Detect the language of `text`, returning full metadata including Lingua confidence.
-    pub async fn detect_language_full(
+    pub fn detect_language_full(
         &self,
         text: &str,
     ) -> Result<LanguageDetectionResult, TranslatorError> {
-        let text_owned = text.to_string();
-        let detector = self.detector.clone();
-        let (code, language_name, confidence) =
-            task::spawn_blocking(move || detector.detect_with_confidence(&text_owned))
-                .await
-                .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??;
+        let (code, language_name, confidence) = self.detector.detect_with_confidence(text)?;
         let supported = supported_target_languages().contains(&code.as_str());
         Ok(LanguageDetectionResult {
             language_code: code,
@@ -216,7 +311,7 @@ impl TranslationEngine {
 
     /// Translate a batch of texts into all requested target languages.
     #[tracing::instrument(skip(self, batch), fields(n_texts = batch.texts.len(), n_targets = batch.target_languages.len()))]
-    pub async fn translate_batch(
+    pub fn translate_batch(
         &self,
         mut batch: TranslationBatch,
     ) -> Result<TranslationResultSet, TranslatorError> {
@@ -240,30 +335,19 @@ impl TranslationEngine {
             self.batch_size.record(n as u64, &[]);
         }
 
-        // Phase 1 — resolve source languages: use caller hint or detect in parallel.
+        // Phase 1 — resolve source languages: use caller hint or detect in parallel via rayon.
+        let t0 = std::time::Instant::now();
         let source_langs: Vec<String> = if let Some(ref src) = batch.source_language {
             let normalized = normalize_lang_code(src).to_string();
             vec![normalized; n]
         } else {
-            let detect_handles: Vec<_> = batch
+            batch
                 .texts
-                .iter()
-                .map(|text| {
-                    let engine = self.clone();
-                    let text = text.clone();
-                    task::spawn(async move { engine.detect_language(&text).await })
-                })
-                .collect();
-            let mut langs = Vec::with_capacity(n);
-            for handle in detect_handles {
-                langs.push(
-                    handle
-                        .await
-                        .map_err(|e| TranslatorError::TranslationFailed(e.to_string()))??,
-                );
-            }
-            langs
+                .par_iter()
+                .map(|text| self.detector.detect(text))
+                .collect::<Result<Vec<String>, TranslatorError>>()?
         };
+        tracing::debug!(detection_ms = t0.elapsed().as_millis(), "phase 1 done");
 
         let mut all_translations: Vec<HashMap<String, String>> =
             (0..n).map(|_| HashMap::new()).collect();
@@ -307,30 +391,67 @@ impl TranslationEngine {
             }
         }
 
-        // Phase 3 — dispatch each work item individually to the continuous scheduler.
+        // Phase 3 — dispatch work items to the continuous scheduler.
         if !work_texts.is_empty() {
-            let tx = self.get_or_start_worker();
-            let mut reply_rxs = Vec::with_capacity(work_texts.len());
-            for (text, expected_output_len) in work_texts.into_iter().zip(work_expected_lens) {
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                tx.send(InferRequest {
+            let work_item_count = work_texts.len();
+            let tx = &self.worker_tx;
+
+            // Backpressure check: reject entire batch if insufficient queue capacity.
+            let available = self.queue_capacity - tx.len();
+            if available < work_item_count {
+                return Err(TranslatorError::ServiceUnavailable(format!(
+                    "translation queue full: {work_item_count} items needed, {available} available"
+                )));
+            }
+
+            tracing::debug!(
+                work_items = work_item_count,
+                queue_len = tx.len(),
+                queue_capacity = self.queue_capacity,
+                "dispatching to scheduler"
+            );
+
+            // Single shared reply channel — all N slots reply into one receiver.
+            // Each reply carries its index so results can be placed in order.
+            let (reply_tx, reply_rx) =
+                std::sync::mpsc::channel::<(usize, Result<String, TranslatorError>)>();
+            let mut enqueued = 0usize;
+            for (idx, (text, expected_output_len)) in
+                work_texts.into_iter().zip(work_expected_lens).enumerate()
+            {
+                tx.try_send(InferRequest {
                     text,
                     expected_output_len,
-                    reply_tx,
+                    index: idx,
+                    reply_tx: reply_tx.clone(),
                 })
-                .map_err(|_| TranslatorError::TranslationFailed("scheduler stopped".into()))?;
-                reply_rxs.push(reply_rx);
+                .map_err(|_| TranslatorError::ServiceUnavailable("translation queue full".into()))?;
+                enqueued += 1;
             }
-            let translated: Vec<String> =
-                try_join_all(reply_rxs.into_iter().map(|rx| async move {
-                    rx.await
-                        .map_err(|_| {
-                            TranslatorError::TranslationFailed("scheduler dropped reply".into())
-                        })
-                        .and_then(|r| r)
-                }))
-                .await?;
-            for ((text_idx, target_lang), result) in work_indices.iter().zip(translated) {
+            drop(reply_tx); // close our copy so channel ends after N replies
+
+            let t2 = std::time::Instant::now();
+            let mut first_reply_ms: Option<u128> = None;
+            let mut translated: Vec<Option<String>> = vec![None; work_item_count];
+            for n_recv in 0..enqueued {
+                let (idx, result) = reply_rx
+                    .recv()
+                    .map_err(|_| TranslatorError::TranslationFailed("scheduler dropped reply".into()))?;
+                if n_recv == 0 {
+                    first_reply_ms = Some(t2.elapsed().as_millis());
+                }
+                translated[idx] = Some(result?);
+            }
+            tracing::debug!(
+                first_reply_ms = first_reply_ms.unwrap_or(0),
+                all_replies_ms = t2.elapsed().as_millis(),
+                work_items = enqueued,
+                "phase 4 done (replies received)"
+            );
+
+            for ((text_idx, target_lang), result) in
+                work_indices.iter().zip(translated.into_iter().map(|o| o.unwrap()))
+            {
                 all_translations[*text_idx].insert(target_lang.clone(), result);
             }
         }
@@ -357,30 +478,4 @@ impl TranslationEngine {
         Ok(TranslationResultSet { results })
     }
 
-    /// Returns the scheduler channel sender, starting it on first call.
-    fn get_or_start_worker(&self) -> &std::sync::mpsc::Sender<InferRequest> {
-        self.work_tx.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let model_cache = self.model_cache.clone();
-            let model_dir = self.models_dir.join("translategemma-4b");
-            tokio::spawn(async move {
-                tracing::info!("Continuous scheduler starting, loading model…");
-                let model =
-                    match task::spawn_blocking(move || LoadedGemmaModel::load(&model_dir)).await {
-                        Ok(Ok(m)) => Arc::new(m),
-                        Ok(Err(e)) => {
-                            tracing::error!("Scheduler failed to load model: {e}");
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::error!("Scheduler model-load panicked: {e}");
-                            return;
-                        }
-                    };
-                let _ = model_cache.set(model.clone());
-                ContinuousScheduler::new(model, rx).run().await;
-            });
-            tx
-        })
-    }
 }
