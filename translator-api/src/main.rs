@@ -42,10 +42,6 @@ struct Args {
     #[arg(long, env = "KV_BUDGET_PER_SLOT")]
     max_tokens: Option<u32>,
 
-    /// Bounded queue capacity for pending translation requests.
-    #[arg(long, env = "QUEUE_CAPACITY")]
-    queue_capacity: Option<usize>,
-
     /// Prefill accumulation delay in milliseconds.
     #[arg(long, env = "PREFILL_ACCUMULATION_MS")]
     prefill_delay_ms: Option<u64>,
@@ -142,7 +138,7 @@ async fn main() {
         model_file: args.model_file,
         n_slots: args.n_slots,
         max_tokens: args.max_tokens,
-        queue_capacity: args.queue_capacity,
+        queue_capacity: None,
         prefill_delay_ms: args.prefill_delay_ms,
     };
     let engine = TranslationEngine::from_config(config).unwrap_or_else(|e| {

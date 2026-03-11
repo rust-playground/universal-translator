@@ -33,10 +33,6 @@ struct Cli {
     #[arg(long, env = "KV_BUDGET_PER_SLOT")]
     max_tokens: Option<u32>,
 
-    /// Bounded queue capacity for pending translation requests.
-    #[arg(long, env = "QUEUE_CAPACITY")]
-    queue_capacity: Option<usize>,
-
     /// Prefill accumulation delay in milliseconds.
     #[arg(long, env = "PREFILL_ACCUMULATION_MS")]
     prefill_delay_ms: Option<u64>,
@@ -57,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         model_file: cli.model_file,
         n_slots: cli.n_slots,
         max_tokens: cli.max_tokens,
-        queue_capacity: cli.queue_capacity,
+        queue_capacity: None,
         prefill_delay_ms: cli.prefill_delay_ms,
     };
     cli.command.run(config)

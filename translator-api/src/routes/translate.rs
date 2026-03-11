@@ -153,3 +153,94 @@ fn record_error(state: &AppState, e: &TranslatorError) {
         state.error_ctr.add(1, &[KeyValue::new("error_type", kind)]);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::chunk_text;
+
+    #[test]
+    fn short_text_no_chunking() {
+        let result = chunk_text("Hello world.", 100);
+        assert_eq!(result, vec!["Hello world."]);
+    }
+
+    #[test]
+    fn exact_boundary() {
+        let text = "Hello world.";
+        let result = chunk_text(text, text.len());
+        assert_eq!(result, vec!["Hello world."]);
+    }
+
+    #[test]
+    fn two_sentences_split() {
+        let text = "First sentence. Second sentence.";
+        // max_chars just big enough for the first sentence but not both
+        let result = chunk_text(text, 16);
+        assert_eq!(result.len(), 2);
+        assert!(result[0].contains("First"));
+        assert!(result[1].contains("Second"));
+    }
+
+    #[test]
+    fn single_long_sentence_no_boundary() {
+        // One sentence with no internal sentence boundaries — greedy push keeps it as one chunk
+        let text = "This is one very long sentence without any terminating punctuation that goes on and on";
+        let result = chunk_text(text, 20);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], text);
+    }
+
+    #[test]
+    fn multiple_sentences_greedy_packing() {
+        let text = "One. Two. Three. Four. Five. Six.";
+        // Each sentence is ~5 chars; set max_chars so ~2-3 sentences fit per chunk
+        let result = chunk_text(text, 12);
+        // Should produce fewer chunks than sentences (greedy packing)
+        assert!(result.len() < 6, "expected greedy packing, got {} chunks", result.len());
+        // Reassembled text should equal original
+        let reassembled: String = result.concat();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn empty_string() {
+        let result = chunk_text("", 100);
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn unicode_sentences() {
+        // Japanese text with sentence-ending periods (。)
+        let text = "これは文です。もう一つの文です。";
+        // Small enough to force a split if boundaries are detected
+        let result = chunk_text(text, 24);
+        // Should produce at least 2 chunks at the 。 boundary
+        assert!(result.len() >= 2, "expected split at Japanese sentence boundary, got {} chunks", result.len());
+        let reassembled: String = result.concat();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn labels_without_sentence_boundaries() {
+        // Short field labels — colons must not cause splitting
+        let r = chunk_text("Title:", 10);
+        assert_eq!(r, vec!["Title:"]);
+
+        let r = chunk_text("First Name:", 20);
+        assert_eq!(r, vec!["First Name:"]);
+
+        let r = chunk_text("Last Name:", 20);
+        assert_eq!(r, vec!["Last Name:"]);
+    }
+
+    #[test]
+    fn no_sentence_boundaries() {
+        // Long text with no sentence-ending punctuation
+        let text = "word ".repeat(50);
+        let text = text.trim();
+        let result = chunk_text(text, 20);
+        // unicode_sentences finds nothing useful → fallback returns original
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], text);
+    }
+}
