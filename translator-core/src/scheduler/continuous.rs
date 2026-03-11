@@ -87,13 +87,8 @@ impl Metrics {
 /// Maximum output tokens per slot (prompt tokens + generated tokens combined).
 pub const SLOT_CAPACITY: usize = 4096;
 
-/// How long to wait for additional requests after the first one arrives when
-/// the scheduler is idle.
-const PREFILL_ACCUMULATION_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Default KV budget per slot (tokens). Controls context pre-allocation.
-/// Override with `KV_BUDGET_PER_SLOT` env var.
-const DEFAULT_KV_BUDGET_PER_SLOT: u32 = 1024;
+/// Token headroom reserved for output when checking prompt length.
+const INPUT_HEADROOM: usize = 64;
 
 // ── Public request type ───────────────────────────────────────────────────────
 
@@ -147,6 +142,8 @@ pub struct ContinuousScheduler {
     model: std::sync::Arc<LoadedGemmaModel>,
     work_rx: crossbeam_channel::Receiver<InferRequest>,
     n_slots: usize,
+    kv_budget_per_slot: u32,
+    prefill_delay_ms: u64,
     metrics: Metrics,
 }
 
@@ -155,11 +152,15 @@ impl ContinuousScheduler {
         model: std::sync::Arc<LoadedGemmaModel>,
         work_rx: crossbeam_channel::Receiver<InferRequest>,
         n_slots: usize,
+        kv_budget_per_slot: u32,
+        prefill_delay_ms: u64,
     ) -> Self {
         Self {
             model,
             work_rx,
             n_slots,
+            kv_budget_per_slot,
+            prefill_delay_ms,
             metrics: Metrics::new(),
         }
     }
@@ -169,7 +170,14 @@ impl ContinuousScheduler {
     /// Call from a dedicated `std::thread::spawn` thread.
     /// Returns when the work channel closes.
     pub fn run(self) {
-        run_loop(&self.model, &self.work_rx, self.n_slots, &self.metrics);
+        run_loop(
+            &self.model,
+            &self.work_rx,
+            self.n_slots,
+            self.kv_budget_per_slot,
+            self.prefill_delay_ms,
+            &self.metrics,
+        );
     }
 }
 
@@ -179,16 +187,16 @@ fn run_loop(
     model: &LoadedGemmaModel,
     work_rx: &crossbeam_channel::Receiver<InferRequest>,
     n_slots: usize,
+    kv_budget_per_slot: u32,
+    prefill_delay_ms: u64,
     metrics: &Metrics,
 ) {
-    tracing::info!(n_slots, "ContinuousScheduler started");
+    tracing::info!(n_slots, kv_budget_per_slot, prefill_delay_ms, "ContinuousScheduler started");
 
-    let kv_budget_per_slot: u32 = std::env::var("KV_BUDGET_PER_SLOT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_KV_BUDGET_PER_SLOT);
     let n_ctx = n_slots as u32 * kv_budget_per_slot;
     tracing::info!(n_ctx, kv_budget_per_slot, "creating llama context");
+    let max_prompt_tokens = (kv_budget_per_slot as usize).saturating_sub(INPUT_HEADROOM);
+    let prefill_accumulation_delay = std::time::Duration::from_millis(prefill_delay_ms);
 
     let mut ctx = match model.create_context(n_ctx, n_slots as u32) {
         Ok(c) => c,
@@ -220,7 +228,7 @@ fn run_loop(
 
             let remaining_capacity = n_empty - pending.len();
             if remaining_capacity > 0 {
-                pending.extend(collect_pending(model, work_rx, remaining_capacity, metrics));
+                pending.extend(collect_pending(model, work_rx, remaining_capacity, max_prompt_tokens, metrics));
             }
 
             if !pending.is_empty() {
@@ -260,7 +268,7 @@ fn run_loop(
                 Err(_) => break 'scheduler, // all senders dropped → clean shutdown
                 Ok(req) => {
                     let mut pending = Vec::new();
-                    if let Some(pp) = tokenize_into_pending(model, req) {
+                    if let Some(pp) = tokenize_into_pending(model, req, max_prompt_tokens) {
                         #[cfg(feature = "opentelemetry")]
                         metrics
                             .prompt_tokens
@@ -271,7 +279,7 @@ fn run_loop(
                     // PREFILL_ACCUMULATION_DELAY so concurrent requests aren't split
                     // across separate prefill batches.
                     let t_accum = std::time::Instant::now();
-                    let deadline = t_accum + PREFILL_ACCUMULATION_DELAY;
+                    let deadline = t_accum + prefill_accumulation_delay;
                     loop {
                         let remaining =
                             deadline.saturating_duration_since(std::time::Instant::now());
@@ -280,7 +288,7 @@ fn run_loop(
                         }
                         match work_rx.recv_timeout(remaining) {
                             Ok(r) => {
-                                if let Some(pp) = tokenize_into_pending(model, r) {
+                                if let Some(pp) = tokenize_into_pending(model, r, max_prompt_tokens) {
                                     #[cfg(feature = "opentelemetry")]
                                     metrics
                                         .prompt_tokens
@@ -424,7 +432,7 @@ fn run_loop(
             let mut pending: Vec<PendingPrefill> = carry_over.drain(..from_carry).collect();
             let remaining = n_empty_after - pending.len();
             if remaining > 0 {
-                pending.extend(collect_pending(model, work_rx, remaining, metrics));
+                pending.extend(collect_pending(model, work_rx, remaining, max_prompt_tokens, metrics));
             }
             if !pending.is_empty() {
                 batch_prefill_and_assign(
@@ -446,14 +454,33 @@ fn run_loop(
 // ── Helper: collect pending prefill items ────────────────────────────────────
 
 /// Tokenize an [`InferRequest`] into a [`PendingPrefill`].
-fn tokenize_into_pending(model: &LoadedGemmaModel, req: InferRequest) -> Option<PendingPrefill> {
+///
+/// Returns `None` (and sends an error reply) if tokenization fails or the
+/// prompt exceeds `max_prompt_tokens`.
+fn tokenize_into_pending(
+    model: &LoadedGemmaModel,
+    req: InferRequest,
+    max_prompt_tokens: usize,
+) -> Option<PendingPrefill> {
     match model.tokenize(&req.text) {
-        Ok(token_ids) => Some(PendingPrefill {
-            token_ids,
-            expected_len: req.expected_output_len,
-            index: req.index,
-            reply_tx: req.reply_tx,
-        }),
+        Ok(token_ids) => {
+            if token_ids.len() > max_prompt_tokens {
+                let _ = req.reply_tx.send((
+                    req.index,
+                    Err(TranslatorError::InputTooLong(format!(
+                        "prompt is {} tokens, max is {max_prompt_tokens}",
+                        token_ids.len()
+                    ))),
+                ));
+                return None;
+            }
+            Some(PendingPrefill {
+                token_ids,
+                expected_len: req.expected_output_len,
+                index: req.index,
+                reply_tx: req.reply_tx,
+            })
+        }
         Err(e) => {
             let _ = req.reply_tx.send((req.index, Err(e)));
             None
@@ -467,13 +494,14 @@ fn collect_pending(
     model: &LoadedGemmaModel,
     work_rx: &crossbeam_channel::Receiver<InferRequest>,
     limit: usize,
+    max_prompt_tokens: usize,
     metrics: &Metrics,
 ) -> Vec<PendingPrefill> {
     let mut pending = Vec::new();
     for _ in 0..limit {
         match work_rx.try_recv() {
             Ok(req) => {
-                if let Some(pp) = tokenize_into_pending(model, req) {
+                if let Some(pp) = tokenize_into_pending(model, req, max_prompt_tokens) {
                     #[cfg(feature = "opentelemetry")]
                     metrics
                         .prompt_tokens

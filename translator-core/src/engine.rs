@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -9,6 +9,26 @@ use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
 use crate::scheduler::{ContinuousScheduler, InferRequest, SLOT_CAPACITY};
 use crate::types::{LanguageDetectionResult, TranslationBatch, TranslationResult, TranslationResultSet};
+
+// ── Configuration ────────────────────────────────────────────────────────────
+
+/// Configuration for the translation engine.
+///
+/// All fields are optional — sensible defaults are used when `None`.
+/// Env-var reading belongs in the CLI/API layer (via clap `env = "..."`),
+/// not here.
+pub struct EngineConfig {
+    pub models_dir: PathBuf,
+    pub model_file: Option<String>,
+    /// Number of concurrent decode slots.
+    pub n_slots: Option<usize>,
+    /// Maximum tokens per translation (maps to KV budget per slot).
+    pub max_tokens: Option<u32>,
+    /// Bounded queue capacity for pending translation requests.
+    pub queue_capacity: Option<usize>,
+    /// Prefill accumulation delay in milliseconds.
+    pub prefill_delay_ms: Option<u64>,
+}
 
 // ── Language helpers ─────────────────────────────────────────────────────────
 
@@ -154,8 +174,10 @@ pub struct TranslationEngine {
     worker_tx: crossbeam_channel::Sender<InferRequest>,
     _scheduler_guard: Arc<SchedulerGuard>,
     detector: Arc<Detector>,
-    /// Bounded channel capacity — respects QUEUE_CAPACITY env var.
+    /// Bounded channel capacity.
     queue_capacity: usize,
+    /// Resolved KV budget per slot (tokens).
+    kv_budget_per_slot: u32,
     #[cfg(feature = "opentelemetry")]
     requests: opentelemetry::metrics::Counter<u64>,
     #[cfg(feature = "opentelemetry")]
@@ -172,55 +194,47 @@ const DEFAULT_N_SLOTS_METAL: usize = 32;
 const DEFAULT_N_SLOTS_CUDA: usize = 64;
 const DEFAULT_N_SLOTS_CPU: usize = 4;
 
+/// Compile-time default slot count per backend.
 fn auto_n_slots() -> usize {
-    // Env var always wins — allows manual tuning.
-    if let Some(n) = std::env::var("MAX_DECODE_SLOTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        tracing::info!(n_slots = n, "n_slots from MAX_DECODE_SLOTS env var");
-        return n;
-    }
-
     #[cfg(feature = "metal")]
     {
-        tracing::info!(n_slots = DEFAULT_N_SLOTS_METAL, "auto n_slots (Metal)");
         return DEFAULT_N_SLOTS_METAL;
     }
 
     #[cfg(feature = "cuda")]
     {
-        tracing::info!(n_slots = DEFAULT_N_SLOTS_CUDA, "auto n_slots (CUDA)");
         return DEFAULT_N_SLOTS_CUDA;
     }
 
     #[allow(unreachable_code)]
-    {
-        tracing::info!(n_slots = DEFAULT_N_SLOTS_CPU, "auto n_slots (CPU)");
-        DEFAULT_N_SLOTS_CPU
-    }
+    DEFAULT_N_SLOTS_CPU
 }
 
-impl TranslationEngine {
-    pub fn new(models_dir: impl AsRef<Path>, model_file: Option<&str>) -> Result<Self, TranslatorError> {
-        let model_dir = models_dir.as_ref().join("translategemma-4b");
-        tracing::info!(?model_dir, "Loading TranslateGemma model");
-        let model = Arc::new(LoadedGemmaModel::load(&model_dir, model_file)?);
+/// Default KV budget per slot (tokens).
+pub(crate) const DEFAULT_KV_BUDGET_PER_SLOT: u32 = 1024;
 
-        let n_slots = auto_n_slots();
-        // Default: max(n_slots*4, 512) so that "all" language batches
-        // (e.g. 9 texts × 55 languages = 495 items) don't instant-reject.
-        let queue_capacity: usize = std::env::var("QUEUE_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| (n_slots * 4).max(512));
+/// Default prefill accumulation delay (ms).
+pub(crate) const DEFAULT_PREFILL_ACCUMULATION_MS: u64 = 10;
+
+
+impl TranslationEngine {
+    pub fn from_config(config: EngineConfig) -> Result<Self, TranslatorError> {
+        let model_dir = config.models_dir.join("translategemma-4b");
+        tracing::info!(?model_dir, "Loading TranslateGemma model");
+        let model = Arc::new(LoadedGemmaModel::load(&model_dir, config.model_file.as_deref())?);
+
+        let n_slots = config.n_slots.unwrap_or_else(auto_n_slots);
+        let kv_budget_per_slot = config.max_tokens.unwrap_or(DEFAULT_KV_BUDGET_PER_SLOT);
+        let queue_capacity = config.queue_capacity.unwrap_or_else(|| (n_slots * 4).max(512));
+        let prefill_delay_ms = config.prefill_delay_ms.unwrap_or(DEFAULT_PREFILL_ACCUMULATION_MS);
+        tracing::info!(n_slots, kv_budget_per_slot, queue_capacity, prefill_delay_ms, "engine config resolved");
 
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
         let handle = std::thread::Builder::new()
             .name("translator-scheduler".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    ContinuousScheduler::new(model, rx, n_slots).run()
+                    ContinuousScheduler::new(model, rx, n_slots, kv_budget_per_slot, prefill_delay_ms).run()
                 }));
                 if let Err(panic) = result {
                     let msg = panic
@@ -243,6 +257,7 @@ impl TranslationEngine {
             _scheduler_guard: Arc::new(SchedulerGuard(Some(handle))),
             detector: Arc::new(Detector::new()),
             queue_capacity,
+            kv_budget_per_slot,
             #[cfg(feature = "opentelemetry")]
             requests: meter.u64_counter("translator.translation.requests").build(),
             #[cfg(feature = "opentelemetry")]
@@ -255,6 +270,23 @@ impl TranslationEngine {
                 ])
                 .build(),
         })
+    }
+
+    /// Convenience constructor matching the old `new(models_dir, model_file)` signature.
+    pub fn new(models_dir: impl AsRef<Path>, model_file: Option<&str>) -> Result<Self, TranslatorError> {
+        Self::from_config(EngineConfig {
+            models_dir: models_dir.as_ref().to_path_buf(),
+            model_file: model_file.map(String::from),
+            n_slots: None,
+            max_tokens: None,
+            queue_capacity: None,
+            prefill_delay_ms: None,
+        })
+    }
+
+    /// Resolved KV budget per slot (tokens) — for chunking thresholds.
+    pub fn kv_budget_per_slot(&self) -> u32 {
+        self.kv_budget_per_slot
     }
 
     /// Detect the language of `text`, returning a lowercase ISO 639-1 code.

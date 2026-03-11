@@ -21,6 +21,9 @@ impl IntoResponse for ApiError {
             TranslatorError::ServiceUnavailable(_) => {
                 (StatusCode::TOO_MANY_REQUESTS, self.0.to_string())
             }
+            TranslatorError::InputTooLong(_) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, self.0.to_string())
+            }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()),
         };
 

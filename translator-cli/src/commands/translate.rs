@@ -1,8 +1,6 @@
-use std::path::Path;
-
 use anyhow::Result;
 use clap::Args;
-use translator_core::{engine::TranslationEngine, types::TranslationBatch};
+use translator_core::{engine::TranslationEngine, types::TranslationBatch, EngineConfig};
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -30,8 +28,8 @@ pub struct TranslateArgs {
 }
 
 impl TranslateArgs {
-    pub fn run(self, models_dir: &Path, model_file: Option<&str>) -> Result<()> {
-        let engine = TranslationEngine::new(models_dir, model_file)?;
+    pub fn run(self, config: EngineConfig) -> Result<()> {
+        let engine = TranslationEngine::from_config(config)?;
         let batch = TranslationBatch {
             texts: self.texts,
             target_languages: self.languages,

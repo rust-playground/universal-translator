@@ -4,3 +4,5 @@ pub mod error;
 pub mod model;
 pub mod scheduler;
 pub mod types;
+
+pub use engine::EngineConfig;

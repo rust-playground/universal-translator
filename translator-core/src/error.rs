@@ -22,4 +22,7 @@ pub enum TranslatorError {
 
     #[error("Service overloaded: {0}")]
     ServiceUnavailable(String),
+
+    #[error("Input too long: {0}")]
+    InputTooLong(String),
 }

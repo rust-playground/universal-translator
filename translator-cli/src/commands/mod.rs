@@ -3,10 +3,9 @@ pub mod detect_language;
 pub mod languages;
 pub mod translate;
 
-use std::path::Path;
-
 use anyhow::Result;
 use clap::Subcommand;
+use translator_core::EngineConfig;
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -17,11 +16,11 @@ pub enum Commands {
 }
 
 impl Commands {
-    pub fn run(self, models_dir: &Path, model_file: Option<&str>) -> Result<()> {
+    pub fn run(self, config: EngineConfig) -> Result<()> {
         match self {
-            Commands::Translate(args) => args.run(models_dir, model_file),
-            Commands::Detect(args) => args.run(models_dir),
-            Commands::DetectLanguage(args) => args.run(models_dir),
+            Commands::Translate(args) => args.run(config),
+            Commands::Detect(args) => args.run(&config.models_dir),
+            Commands::DetectLanguage(args) => args.run(&config.models_dir),
             Commands::Languages(args) => args.run(),
         }
     }

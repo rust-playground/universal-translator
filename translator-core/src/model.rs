@@ -152,12 +152,26 @@ impl LoadedGemmaModel {
         n_ctx: u32,
         n_seq_max: u32,
     ) -> Result<LlamaContext<'_>, TranslatorError> {
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(4);
+
+        // LLAMA_FLASH_ATTN_TYPE_ENABLED = 1 (from llama.h).
+        // Explicit ENABLED is needed so flash attention remains active even
+        // with quantized KV cache (AUTO would disable it).
+        let flash_attn_enabled: i32 = 1;
+
         let params = LlamaContextParams::default()
             .with_n_ctx(Some(
                 NonZeroU32::new(n_ctx).expect("n_ctx must be > 0"),
             ))
             .with_n_batch(n_ctx)
-            .with_n_seq_max(n_seq_max);
+            .with_n_seq_max(n_seq_max)
+            .with_flash_attention_policy(flash_attn_enabled)
+            .with_n_threads(n_threads)
+            .with_n_threads_batch(n_threads);
+
+        tracing::info!(n_threads, "llama context: flash_attn=enabled");
 
         self.model
             .new_context(&self.backend, params)

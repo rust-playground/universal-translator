@@ -13,7 +13,7 @@ pub struct TranslationBatch {
 }
 
 /// Translation result for a single source text.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TranslationResult {
     pub source_text: String,
     pub detected_language: String,

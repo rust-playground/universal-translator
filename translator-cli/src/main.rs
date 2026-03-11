@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use translator_core::EngineConfig;
 
 mod commands;
 
@@ -24,6 +25,22 @@ struct Cli {
     #[arg(long)]
     model_file: Option<String>,
 
+    /// Number of concurrent decode slots.
+    #[arg(long, env = "MAX_DECODE_SLOTS")]
+    n_slots: Option<usize>,
+
+    /// Maximum tokens per translation request.
+    #[arg(long, env = "KV_BUDGET_PER_SLOT")]
+    max_tokens: Option<u32>,
+
+    /// Bounded queue capacity for pending translation requests.
+    #[arg(long, env = "QUEUE_CAPACITY")]
+    queue_capacity: Option<usize>,
+
+    /// Prefill accumulation delay in milliseconds.
+    #[arg(long, env = "PREFILL_ACCUMULATION_MS")]
+    prefill_delay_ms: Option<u64>,
+
     #[command(subcommand)]
     command: commands::Commands,
 }
@@ -35,6 +52,13 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let models_dir = cli.models_dir.unwrap_or_else(default_models_dir);
-    cli.command.run(&models_dir, cli.model_file.as_deref())
+    let config = EngineConfig {
+        models_dir: cli.models_dir.unwrap_or_else(default_models_dir),
+        model_file: cli.model_file,
+        n_slots: cli.n_slots,
+        max_tokens: cli.max_tokens,
+        queue_capacity: cli.queue_capacity,
+        prefill_delay_ms: cli.prefill_delay_ms,
+    };
+    cli.command.run(config)
 }
