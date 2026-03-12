@@ -47,6 +47,15 @@ struct Cli {
     #[arg(long, env = "PARAGRAPH_TARGET_CHARS")]
     paragraph_target_chars: Option<usize>,
 
+    /// Bounded queue capacity for pending translation requests.
+    #[arg(long, env = "QUEUE_CAPACITY")]
+    queue_capacity: Option<usize>,
+
+    /// Timeout (in seconds) when sending work items to the scheduler queue.
+    /// Allows requests to wait for capacity instead of failing instantly. Default: 30.
+    #[arg(long, env = "QUEUE_SEND_TIMEOUT_SECS")]
+    queue_send_timeout_secs: Option<u64>,
+
     #[command(subcommand)]
     command: commands::Commands,
 }
@@ -63,10 +72,11 @@ fn main() -> anyhow::Result<()> {
         model_file: cli.model_file,
         n_slots: cli.n_slots,
         max_tokens: cli.max_tokens,
-        queue_capacity: None,
+        queue_capacity: cli.queue_capacity,
         prefill_delay_ms: cli.prefill_delay_ms,
         max_chunk_chars: cli.max_chunk_chars,
         paragraph_target_chars: cli.paragraph_target_chars,
+        queue_send_timeout_secs: cli.queue_send_timeout_secs,
     };
     cli.command.run(config)
 }

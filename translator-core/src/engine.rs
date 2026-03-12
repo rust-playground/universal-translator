@@ -34,6 +34,9 @@ pub struct EngineConfig {
     /// Target size (in characters) for paragraph-level chunk packing.
     /// Shorter chunks improve translation quality. Defaults to ~60% of `max_chunk_chars`.
     pub paragraph_target_chars: Option<usize>,
+    /// Timeout (in seconds) when sending work items to the scheduler queue.
+    /// Defaults to 30. Allows requests to wait for capacity instead of failing instantly.
+    pub queue_send_timeout_secs: Option<u64>,
 }
 
 // ── Language helpers ─────────────────────────────────────────────────────────
@@ -182,6 +185,8 @@ pub struct TranslationEngine {
     detector: Arc<Detector>,
     /// Bounded channel capacity.
     queue_capacity: usize,
+    /// Timeout for sending work items to the queue.
+    queue_send_timeout: std::time::Duration,
     /// Resolved KV budget per slot (tokens).
     kv_budget_per_slot: u32,
     /// Hard ceiling (in characters) for text chunks.
@@ -226,6 +231,9 @@ pub(crate) const DEFAULT_KV_BUDGET_PER_SLOT: u32 = 1024;
 /// Default prefill accumulation delay (ms).
 pub(crate) const DEFAULT_PREFILL_ACCUMULATION_MS: u64 = 10;
 
+/// Default queue send timeout (seconds).
+pub(crate) const DEFAULT_QUEUE_SEND_TIMEOUT_SECS: u64 = 30;
+
 
 impl TranslationEngine {
     pub fn from_config(config: EngineConfig) -> Result<Self, TranslatorError> {
@@ -235,13 +243,15 @@ impl TranslationEngine {
 
         let n_slots = config.n_slots.unwrap_or_else(auto_n_slots);
         let kv_budget_per_slot = config.max_tokens.unwrap_or(DEFAULT_KV_BUDGET_PER_SLOT);
-        let queue_capacity = config.queue_capacity.unwrap_or_else(|| (n_slots * 4).max(512));
+        let queue_capacity = config.queue_capacity.unwrap_or_else(|| (n_slots * 64).max(2048));
+        let queue_send_timeout_secs = config.queue_send_timeout_secs.unwrap_or(DEFAULT_QUEUE_SEND_TIMEOUT_SECS);
+        let queue_send_timeout = std::time::Duration::from_secs(queue_send_timeout_secs);
         let prefill_delay_ms = config.prefill_delay_ms.unwrap_or(DEFAULT_PREFILL_ACCUMULATION_MS);
         let max_chunk_chars = config.max_chunk_chars
             .unwrap_or_else(|| (kv_budget_per_slot.saturating_sub(100) * 4) as usize);
         let paragraph_target_chars = config.paragraph_target_chars
             .unwrap_or_else(|| max_chunk_chars * 3 / 5);
-        tracing::info!(n_slots, kv_budget_per_slot, queue_capacity, prefill_delay_ms, max_chunk_chars, paragraph_target_chars, "engine config resolved");
+        tracing::info!(n_slots, kv_budget_per_slot, queue_capacity, queue_send_timeout_secs, prefill_delay_ms, max_chunk_chars, paragraph_target_chars, "engine config resolved");
 
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
         let handle = std::thread::Builder::new()
@@ -271,6 +281,7 @@ impl TranslationEngine {
             _scheduler_guard: Arc::new(SchedulerGuard(Some(handle))),
             detector: Arc::new(Detector::new()),
             queue_capacity,
+            queue_send_timeout,
             kv_budget_per_slot,
             max_chunk_chars,
             paragraph_target_chars,
@@ -299,6 +310,7 @@ impl TranslationEngine {
             prefill_delay_ms: None,
             max_chunk_chars: None,
             paragraph_target_chars: None,
+            queue_send_timeout_secs: None,
         })
     }
 
@@ -472,6 +484,14 @@ impl TranslationEngine {
         for i in 0..n {
             let src = source_langs[i].as_str();
 
+            // Empty text shortcut — return as-is without inference.
+            if batch.texts[i].trim().is_empty() {
+                for target_lang in &batch.target_languages {
+                    all_translations[i].insert(target_lang.clone(), batch.texts[i].clone());
+                }
+                continue;
+            }
+
             for target_lang in &batch.target_languages {
                 let norm_lang = normalize_lang_code(target_lang);
 
@@ -507,14 +527,6 @@ impl TranslationEngine {
             let work_item_count = work_texts.len();
             let tx = &self.worker_tx;
 
-            // Backpressure check: reject entire batch if insufficient queue capacity.
-            let available = self.queue_capacity - tx.len();
-            if available < work_item_count {
-                return Err(TranslatorError::ServiceUnavailable(format!(
-                    "translation queue full: {work_item_count} items needed, {available} available"
-                )));
-            }
-
             tracing::debug!(
                 work_items = work_item_count,
                 queue_len = tx.len(),
@@ -527,23 +539,27 @@ impl TranslationEngine {
             let (reply_tx, reply_rx) =
                 std::sync::mpsc::channel::<(usize, Result<String, TranslatorError>)>();
             let mut enqueued = 0usize;
+            let send_deadline = self.queue_send_timeout;
             for (idx, (text, expected_output_len)) in
                 work_texts.into_iter().zip(work_expected_lens).enumerate()
             {
-                tx.try_send(InferRequest {
+                tx.send_timeout(InferRequest {
                     text,
                     expected_output_len,
                     index: idx,
                     reply_tx: reply_tx.clone(),
-                })
-                .map_err(|_| TranslatorError::ServiceUnavailable("translation queue full".into()))?;
+                }, send_deadline)
+                .map_err(|_| TranslatorError::ServiceUnavailable(
+                    "translation queue full — timed out waiting for capacity".into()
+                ))?;
                 enqueued += 1;
             }
             drop(reply_tx); // close our copy so channel ends after N replies
 
             let t2 = std::time::Instant::now();
             let mut first_reply_ms: Option<u128> = None;
-            let mut translated: Vec<Option<String>> = vec![None; work_item_count];
+            let mut translated: Vec<Option<Result<String, TranslatorError>>> =
+                (0..work_item_count).map(|_| None).collect();
             for n_recv in 0..enqueued {
                 let (idx, result) = reply_rx
                     .recv()
@@ -551,7 +567,7 @@ impl TranslationEngine {
                 if n_recv == 0 {
                     first_reply_ms = Some(t2.elapsed().as_millis());
                 }
-                translated[idx] = Some(result?);
+                translated[idx] = Some(result);
             }
             tracing::debug!(
                 first_reply_ms = first_reply_ms.unwrap_or(0),
@@ -563,7 +579,14 @@ impl TranslationEngine {
             for ((text_idx, target_lang), result) in
                 work_indices.iter().zip(translated.into_iter().map(|o| o.unwrap()))
             {
-                all_translations[*text_idx].insert(target_lang.clone(), result);
+                match result {
+                    Ok(translation) => {
+                        all_translations[*text_idx].insert(target_lang.clone(), translation);
+                    }
+                    Err(e) => {
+                        all_errors[*text_idx].insert(target_lang.clone(), e.to_string());
+                    }
+                }
             }
         }
 

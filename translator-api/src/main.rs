@@ -56,6 +56,15 @@ struct Args {
     #[arg(long, env = "PARAGRAPH_TARGET_CHARS")]
     paragraph_target_chars: Option<usize>,
 
+    /// Bounded queue capacity for pending translation requests.
+    #[arg(long, env = "QUEUE_CAPACITY")]
+    queue_capacity: Option<usize>,
+
+    /// Timeout (in seconds) when sending work items to the scheduler queue.
+    /// Allows requests to wait for capacity instead of failing instantly. Default: 30.
+    #[arg(long, env = "QUEUE_SEND_TIMEOUT_SECS")]
+    queue_send_timeout_secs: Option<u64>,
+
     /// TCP port to listen on.
     #[arg(long, default_value_t = 3000)]
     port: u16,
@@ -148,10 +157,11 @@ async fn main() {
         model_file: args.model_file,
         n_slots: args.n_slots,
         max_tokens: args.max_tokens,
-        queue_capacity: None,
+        queue_capacity: args.queue_capacity,
         prefill_delay_ms: args.prefill_delay_ms,
         max_chunk_chars: args.max_chunk_chars,
         paragraph_target_chars: args.paragraph_target_chars,
+        queue_send_timeout_secs: args.queue_send_timeout_secs,
     };
     let engine = TranslationEngine::from_config(config).unwrap_or_else(|e| {
         tracing::error!("Failed to load model: {e}");
