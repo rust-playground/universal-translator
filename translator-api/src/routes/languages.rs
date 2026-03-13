@@ -1,14 +1,14 @@
 use axum::Json;
 use serde::Serialize;
-use translator_core::engine::supported_target_languages;
+use translator_core::Language;
 
 #[derive(Serialize)]
 pub struct LanguagesResponse {
-    pub languages: &'static [&'static str],
+    pub languages: Vec<Language>,
 }
 
 pub async fn languages() -> Json<LanguagesResponse> {
     Json(LanguagesResponse {
-        languages: supported_target_languages(),
+        languages: Language::all().to_vec(),
     })
 }

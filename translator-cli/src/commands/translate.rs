@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Args;
-use translator_core::{engine::TranslationEngine, types::TranslationBatch, EngineConfig};
+use translator_core::{Language, engine::TranslationEngine, types::TranslationBatch, EngineConfig};
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -30,10 +30,26 @@ pub struct TranslateArgs {
 impl TranslateArgs {
     pub fn run(self, config: EngineConfig) -> Result<()> {
         let engine = TranslationEngine::from_config(config)?;
+
+        let target_languages = if self.languages == ["all"] {
+            Language::all().to_vec()
+        } else {
+            self.languages
+                .iter()
+                .map(|s| s.parse::<Language>())
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let source_language = self
+            .source_language
+            .as_deref()
+            .map(|s| s.parse::<Language>())
+            .transpose()?;
+
         let batch = TranslationBatch {
             texts: self.texts,
-            target_languages: self.languages,
-            source_language: self.source_language,
+            target_languages,
+            source_language,
         };
 
         let result = engine.translate_batch_chunked(batch)?;

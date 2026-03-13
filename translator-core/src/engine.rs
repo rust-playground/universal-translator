@@ -6,6 +6,7 @@ use rayon::prelude::*;
 
 use crate::detector::Detector;
 use crate::error::TranslatorError;
+use crate::language::{self, Language};
 use crate::model::LoadedGemmaModel;
 use crate::scheduler::{ContinuousScheduler, InferRequest, SLOT_CAPACITY};
 use crate::types::{LanguageDetectionResult, TranslationBatch, TranslationResult, TranslationResultSet};
@@ -18,8 +19,7 @@ use crate::types::{LanguageDetectionResult, TranslationBatch, TranslationResult,
 /// Env-var reading belongs in the CLI/API layer (via clap `env = "..."`),
 /// not here.
 pub struct EngineConfig {
-    pub models_dir: PathBuf,
-    pub model_file: Option<String>,
+    pub model_path: PathBuf,
     /// Number of concurrent decode slots.
     pub n_slots: Option<usize>,
     /// Maximum tokens per translation (maps to KV budget per slot).
@@ -34,74 +34,15 @@ pub struct EngineConfig {
     /// Target size (in characters) for paragraph-level chunk packing.
     /// Shorter chunks improve translation quality. Defaults to ~60% of `max_chunk_chars`.
     pub paragraph_target_chars: Option<usize>,
+    /// Timeout (in seconds) when sending work items to the scheduler queue.
+    /// Defaults to 30. Allows requests to wait for capacity instead of failing instantly.
+    pub queue_send_timeout_secs: Option<u64>,
 }
 
-// ── Language helpers ─────────────────────────────────────────────────────────
-
-/// Map ISO 639-1 code → full English language name used in the Gemma prompt.
-fn lang_full_name(code: &str) -> &str {
-    match code {
-        "af" => "Afrikaans",
-        "am" => "Amharic",
-        "ar" => "Arabic",
-        "bg" => "Bulgarian",
-        "bn" => "Bengali",
-        "ca" => "Catalan",
-        "cs" => "Czech",
-        "da" => "Danish",
-        "de" => "German",
-        "el" => "Greek",
-        "en" => "English",
-        "es" => "Spanish",
-        "et" => "Estonian",
-        "fa" => "Persian",
-        "fi" => "Finnish",
-        "fr" => "French",
-        "gu" => "Gujarati",
-        "ha" => "Hausa",
-        "hi" => "Hindi",
-        "hr" => "Croatian",
-        "hu" => "Hungarian",
-        "id" => "Indonesian",
-        "it" => "Italian",
-        "ja" => "Japanese",
-        "kn" => "Kannada",
-        "ko" => "Korean",
-        "lt" => "Lithuanian",
-        "lv" => "Latvian",
-        "ml" => "Malayalam",
-        "mr" => "Marathi",
-        "ms" => "Malay",
-        "mt" => "Maltese",
-        "ne" => "Nepali",
-        "nl" => "Dutch",
-        "no" => "Norwegian",
-        "pa" => "Punjabi",
-        "pl" => "Polish",
-        "pt" => "Portuguese",
-        "ro" => "Romanian",
-        "ru" => "Russian",
-        "si" => "Sinhala",
-        "sk" => "Slovak",
-        "sl" => "Slovenian",
-        "sr" => "Serbian",
-        "sv" => "Swedish",
-        "sw" => "Swahili",
-        "ta" => "Tamil",
-        "te" => "Telugu",
-        "th" => "Thai",
-        "tr" => "Turkish",
-        "uk" => "Ukrainian",
-        "ur" => "Urdu",
-        "vi" => "Vietnamese",
-        "yi" => "Yiddish",
-        "zh" => "Chinese",
-        other => other, // unknown code — pass through as-is
-    }
-}
+// ── Prompt builder ───────────────────────────────────────────────────────────
 
 /// Build a full Gemma instruct-format translation prompt.
-fn translate_gemma_prompt(src_lang: &str, tgt_lang: &str, text: &str) -> String {
+fn translate_gemma_prompt(src_lang: Language, tgt_lang: Language, text: &str) -> String {
     format!(
         "<bos><start_of_turn>system\n\
          You are a translation engine. Output only the translated text. \
@@ -109,50 +50,10 @@ fn translate_gemma_prompt(src_lang: &str, tgt_lang: &str, text: &str) -> String 
          <start_of_turn>user\n\
          Translate from {} to {}:\n{}<end_of_turn>\n\
          <start_of_turn>model\n",
-        lang_full_name(src_lang),
-        lang_full_name(tgt_lang),
+        src_lang.full_name(),
+        tgt_lang.full_name(),
         text
     )
-}
-
-/// Map regional locale codes to their base ISO 639-1 code.
-fn normalize_lang_code(code: &str) -> &str {
-    match code {
-        "zh-hk" | "zh-cn" | "zh-tw" => "zh",
-        "fr-ca" => "fr",
-        "es-mx" => "es",
-        "pt-br" | "pt-pt" => "pt",
-        "nb" | "nn" => "no", // Norwegian Bokmål / Nynorsk
-        other => other,
-    }
-}
-
-/// All target language codes supported by this engine.
-/// 55 languages officially supported by TranslateGemma 4B (https://huggingface.co/google/translategemma-4b-it).
-pub fn supported_target_languages() -> &'static [&'static str] {
-    &[
-        "af", "am", "ar", "bg", "bn", "ca", "cs", "da", "de", "el", "en", "es", "et", "fa",
-        "fi", "fr", "gu", "ha", "hi", "hr", "hu", "id", "it", "ja", "kn", "ko", "lt", "lv",
-        "ml", "mr", "ms", "mt", "ne", "nl", "no", "pa", "pl", "pt", "ro", "ru", "si", "sk",
-        "sl", "sr", "sv", "sw", "ta", "te", "th", "tr", "uk", "ur", "vi", "yi", "zh",
-    ]
-}
-
-/// Language codes that are both detectable (by Lingua or script fallback) and
-/// translatable as a target.
-pub fn supported_languages() -> Vec<&'static str> {
-    use lingua::Language;
-    let detectable: std::collections::HashSet<String> = Language::all()
-        .into_iter()
-        .map(|l| format!("{:?}", l.iso_code_639_1()).to_lowercase())
-        .collect();
-    let mut langs: Vec<&'static str> = supported_target_languages()
-        .iter()
-        .copied()
-        .filter(|&code| detectable.contains(code) || code == "ml")
-        .collect();
-    langs.sort_unstable();
-    langs
 }
 
 // ── Engine ───────────────────────────────────────────────────────────────────
@@ -182,6 +83,8 @@ pub struct TranslationEngine {
     detector: Arc<Detector>,
     /// Bounded channel capacity.
     queue_capacity: usize,
+    /// Timeout for sending work items to the queue.
+    queue_send_timeout: std::time::Duration,
     /// Resolved KV budget per slot (tokens).
     kv_budget_per_slot: u32,
     /// Hard ceiling (in characters) for text chunks.
@@ -226,22 +129,26 @@ pub(crate) const DEFAULT_KV_BUDGET_PER_SLOT: u32 = 1024;
 /// Default prefill accumulation delay (ms).
 pub(crate) const DEFAULT_PREFILL_ACCUMULATION_MS: u64 = 10;
 
+/// Default queue send timeout (seconds).
+pub(crate) const DEFAULT_QUEUE_SEND_TIMEOUT_SECS: u64 = 30;
+
 
 impl TranslationEngine {
     pub fn from_config(config: EngineConfig) -> Result<Self, TranslatorError> {
-        let model_dir = config.models_dir.join("translategemma-4b");
-        tracing::info!(?model_dir, "Loading TranslateGemma model");
-        let model = Arc::new(LoadedGemmaModel::load(&model_dir, config.model_file.as_deref())?);
+        tracing::info!(model_path = %config.model_path.display(), "Loading TranslateGemma model");
+        let model = Arc::new(LoadedGemmaModel::load(&config.model_path)?);
 
         let n_slots = config.n_slots.unwrap_or_else(auto_n_slots);
         let kv_budget_per_slot = config.max_tokens.unwrap_or(DEFAULT_KV_BUDGET_PER_SLOT);
-        let queue_capacity = config.queue_capacity.unwrap_or_else(|| (n_slots * 4).max(512));
+        let queue_capacity = config.queue_capacity.unwrap_or_else(|| (n_slots * 8).max(128));
+        let queue_send_timeout_secs = config.queue_send_timeout_secs.unwrap_or(DEFAULT_QUEUE_SEND_TIMEOUT_SECS);
+        let queue_send_timeout = std::time::Duration::from_secs(queue_send_timeout_secs);
         let prefill_delay_ms = config.prefill_delay_ms.unwrap_or(DEFAULT_PREFILL_ACCUMULATION_MS);
         let max_chunk_chars = config.max_chunk_chars
             .unwrap_or_else(|| (kv_budget_per_slot.saturating_sub(100) * 4) as usize);
         let paragraph_target_chars = config.paragraph_target_chars
             .unwrap_or_else(|| max_chunk_chars * 3 / 5);
-        tracing::info!(n_slots, kv_budget_per_slot, queue_capacity, prefill_delay_ms, max_chunk_chars, paragraph_target_chars, "engine config resolved");
+        tracing::info!(n_slots, kv_budget_per_slot, queue_capacity, queue_send_timeout_secs, prefill_delay_ms, max_chunk_chars, paragraph_target_chars, "engine config resolved");
 
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
         let handle = std::thread::Builder::new()
@@ -271,6 +178,7 @@ impl TranslationEngine {
             _scheduler_guard: Arc::new(SchedulerGuard(Some(handle))),
             detector: Arc::new(Detector::new()),
             queue_capacity,
+            queue_send_timeout,
             kv_budget_per_slot,
             max_chunk_chars,
             paragraph_target_chars,
@@ -288,17 +196,17 @@ impl TranslationEngine {
         })
     }
 
-    /// Convenience constructor matching the old `new(models_dir, model_file)` signature.
-    pub fn new(models_dir: impl AsRef<Path>, model_file: Option<&str>) -> Result<Self, TranslatorError> {
+    /// Convenience constructor taking a direct model path.
+    pub fn new(model_path: impl AsRef<Path>) -> Result<Self, TranslatorError> {
         Self::from_config(EngineConfig {
-            models_dir: models_dir.as_ref().to_path_buf(),
-            model_file: model_file.map(String::from),
+            model_path: model_path.as_ref().to_path_buf(),
             n_slots: None,
             max_tokens: None,
             queue_capacity: None,
             prefill_delay_ms: None,
             max_chunk_chars: None,
             paragraph_target_chars: None,
+            queue_send_timeout_secs: None,
         })
     }
 
@@ -353,7 +261,7 @@ impl TranslationEngine {
         let chunked_batch = TranslationBatch {
             texts: chunked_texts,
             target_languages: batch.target_languages.clone(),
-            source_language: batch.source_language.clone(),
+            source_language: batch.source_language,
         };
 
         let chunked_result = self.translate_batch(chunked_batch)?;
@@ -411,7 +319,7 @@ impl TranslationEngine {
         text: &str,
     ) -> Result<LanguageDetectionResult, TranslatorError> {
         let (code, language_name, confidence) = self.detector.detect_with_confidence(text)?;
-        let supported = supported_target_languages().contains(&code.as_str());
+        let supported = code.parse::<Language>().is_ok();
         Ok(LanguageDetectionResult {
             language_code: code,
             language: language_name,
@@ -424,16 +332,10 @@ impl TranslationEngine {
     #[tracing::instrument(skip(self, batch), fields(n_texts = batch.texts.len(), n_targets = batch.target_languages.len()))]
     pub fn translate_batch(
         &self,
-        mut batch: TranslationBatch,
+        batch: TranslationBatch,
     ) -> Result<TranslationResultSet, TranslatorError> {
         if batch.texts.is_empty() {
             return Ok(TranslationResultSet { results: vec![] });
-        }
-        if batch.target_languages == ["all"] {
-            batch.target_languages = supported_target_languages()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
         }
 
         let n = batch.texts.len();
@@ -448,15 +350,21 @@ impl TranslationEngine {
 
         // Phase 1 — resolve source languages: use caller hint or detect in parallel via rayon.
         let t0 = std::time::Instant::now();
-        let source_langs: Vec<String> = if let Some(ref src) = batch.source_language {
-            let normalized = normalize_lang_code(src).to_string();
-            vec![normalized; n]
+        let source_langs: Vec<Result<Language, TranslatorError>> = if let Some(src) = batch.source_language {
+            (0..n).map(|_| Ok(src)).collect()
         } else {
             batch
                 .texts
                 .par_iter()
-                .map(|text| self.detector.detect(text))
-                .collect::<Result<Vec<String>, TranslatorError>>()?
+                .map(|text| {
+                    let code = self.detector.detect(text)?;
+                    code.parse::<Language>().map_err(|_| {
+                        TranslatorError::DetectionFailed(format!(
+                            "detected language '{code}' is not in the supported set"
+                        ))
+                    })
+                })
+                .collect()
         };
         tracing::debug!(detection_ms = t0.elapsed().as_millis(), "phase 1 done");
 
@@ -470,35 +378,42 @@ impl TranslationEngine {
         let mut work_indices: Vec<(usize, String)> = vec![];
 
         for i in 0..n {
-            let src = source_langs[i].as_str();
-
-            for target_lang in &batch.target_languages {
-                let norm_lang = normalize_lang_code(target_lang);
-
-                // Same-language shortcut — return original text unchanged.
-                if norm_lang == src || target_lang.as_str() == src {
-                    all_translations[i].insert(target_lang.clone(), batch.texts[i].clone());
+            let src = match &source_langs[i] {
+                Ok(lang) => *lang,
+                Err(e) => {
+                    // Per-text detection failure: populate errors for all targets, skip inference.
+                    for tgt in &batch.target_languages {
+                        all_errors[i].insert(tgt.code().to_string(), e.to_string());
+                    }
                     continue;
                 }
+            };
 
-                // Validate that the target language is in our supported set.
-                if lang_full_name(norm_lang) == norm_lang
-                    && !supported_target_languages().contains(&norm_lang)
-                {
-                    all_errors[i].insert(
-                        target_lang.clone(),
-                        format!("Unsupported target language: {norm_lang}"),
-                    );
+            // Empty text shortcut — return as-is without inference.
+            if batch.texts[i].trim().is_empty() {
+                for tgt in &batch.target_languages {
+                    all_translations[i].insert(tgt.code().to_string(), batch.texts[i].clone());
+                }
+                continue;
+            }
+
+            for &tgt in &batch.target_languages {
+                // Same-language shortcut — return original text unchanged.
+                if tgt == src {
+                    all_translations[i].insert(tgt.code().to_string(), batch.texts[i].clone());
                     continue;
                 }
 
                 let text = &batch.texts[i];
                 // chars / 3 ≈ 1.5 tokens (UTF-8 bytes / 3 ≈ tokens), +15 slack.
-                let expected_output_len = (text.len() / 3 + 15).clamp(15, SLOT_CAPACITY);
-                let prompt = translate_gemma_prompt(src, norm_lang, text);
+                // Scaled by language pair expansion ratio for better EOS bias timing.
+                let expected_output_len =
+                    ((text.len() as f32 / 3.0 + 15.0) * language::expansion_ratio(src, tgt)) as usize;
+                let expected_output_len = expected_output_len.clamp(15, SLOT_CAPACITY);
+                let prompt = translate_gemma_prompt(src, tgt, text);
                 work_texts.push(prompt);
                 work_expected_lens.push(expected_output_len);
-                work_indices.push((i, target_lang.clone()));
+                work_indices.push((i, tgt.code().to_string()));
             }
         }
 
@@ -506,14 +421,6 @@ impl TranslationEngine {
         if !work_texts.is_empty() {
             let work_item_count = work_texts.len();
             let tx = &self.worker_tx;
-
-            // Backpressure check: reject entire batch if insufficient queue capacity.
-            let available = self.queue_capacity - tx.len();
-            if available < work_item_count {
-                return Err(TranslatorError::ServiceUnavailable(format!(
-                    "translation queue full: {work_item_count} items needed, {available} available"
-                )));
-            }
 
             tracing::debug!(
                 work_items = work_item_count,
@@ -527,16 +434,31 @@ impl TranslationEngine {
             let (reply_tx, reply_rx) =
                 std::sync::mpsc::channel::<(usize, Result<String, TranslatorError>)>();
             let mut enqueued = 0usize;
+            let send_deadline = self.queue_send_timeout;
             for (idx, (text, expected_output_len)) in
                 work_texts.into_iter().zip(work_expected_lens).enumerate()
             {
-                tx.try_send(InferRequest {
+                let req = InferRequest {
                     text,
                     expected_output_len,
                     index: idx,
                     reply_tx: reply_tx.clone(),
-                })
-                .map_err(|_| TranslatorError::ServiceUnavailable("translation queue full".into()))?;
+                };
+                match tx.try_send(req) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(req)) => {
+                        tx.send_timeout(req, send_deadline).map_err(|_| {
+                            TranslatorError::ServiceUnavailable(
+                                "translation queue full — timed out waiting for capacity".into(),
+                            )
+                        })?;
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return Err(TranslatorError::TranslationFailed(
+                            "scheduler stopped".into(),
+                        ));
+                    }
+                }
                 enqueued += 1;
             }
             drop(reply_tx); // close our copy so channel ends after N replies
@@ -551,7 +473,13 @@ impl TranslationEngine {
                 if n_recv == 0 {
                     first_reply_ms = Some(t2.elapsed().as_millis());
                 }
-                translated[idx] = Some(result?);
+                match result {
+                    Ok(text) => translated[idx] = Some(text),
+                    Err(e) => {
+                        let (text_idx, ref target_lang) = work_indices[idx];
+                        all_errors[text_idx].insert(target_lang.clone(), e.to_string());
+                    }
+                }
             }
             tracing::debug!(
                 first_reply_ms = first_reply_ms.unwrap_or(0),
@@ -560,23 +488,29 @@ impl TranslationEngine {
                 "phase 4 done (replies received)"
             );
 
-            for ((text_idx, target_lang), result) in
-                work_indices.iter().zip(translated.into_iter().map(|o| o.unwrap()))
-            {
-                all_translations[*text_idx].insert(target_lang.clone(), result);
+            for (idx, (text_idx, target_lang)) in work_indices.iter().enumerate() {
+                if let Some(translation) = translated[idx].take() {
+                    all_translations[*text_idx].insert(target_lang.clone(), translation);
+                }
             }
         }
 
         // Assemble results, preserving original order.
         let results = (0..n)
             .map(|i| {
+                let src_code = match &source_langs[i] {
+                    Ok(lang) => lang.code().to_string(),
+                    Err(_) => "unknown".to_string(),
+                };
                 let mut translations = std::mem::take(&mut all_translations[i]);
-                translations
-                    .entry(source_langs[i].clone())
-                    .or_insert_with(|| batch.texts[i].clone());
+                if source_langs[i].is_ok() {
+                    translations
+                        .entry(src_code.clone())
+                        .or_insert_with(|| batch.texts[i].clone());
+                }
                 TranslationResult {
                     source_text: batch.texts[i].clone(),
-                    detected_language: source_langs[i].clone(),
+                    detected_language: src_code,
                     translations,
                     errors: std::mem::take(&mut all_errors[i]),
                 }
@@ -589,4 +523,17 @@ impl TranslationEngine {
         Ok(TranslationResultSet { results })
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_format() {
+        let prompt = translate_gemma_prompt(Language::En, Language::Fr, "Hello");
+        assert!(prompt.contains("Translate from English to French:"));
+        assert!(prompt.contains("Hello"));
+        assert!(prompt.starts_with("<bos>"));
+    }
 }

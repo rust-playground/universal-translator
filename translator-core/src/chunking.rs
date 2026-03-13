@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// A chunk of text with metadata for reassembly.
@@ -13,11 +14,22 @@ pub struct TextChunk {
 /// boundaries for oversized paragraphs. Keeps related sentences together for
 /// better translation context.
 ///
+/// Line endings are normalized: `\r\n` and `\r` become `\n` before splitting.
+/// Output always uses Unix line endings (`\n`).
+///
 /// - `paragraph_target` — flush paragraph accumulator when adding next paragraph
 ///   would exceed this (quality limit)
 /// - `max_chars` — hard ceiling for sentence fallback (capacity limit); also used
 ///   for the initial "skip chunking" check
 pub fn chunk_text(text: &str, paragraph_target: usize, max_chars: usize) -> Vec<TextChunk> {
+    // Normalize line endings: \r\n and \r → \n (zero allocation when no \r present).
+    let text: Cow<str> = if text.contains('\r') {
+        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(text)
+    };
+    let text: &str = &text;
+
     if text.len() <= max_chars {
         return vec![TextChunk { text: text.to_string(), join_separator: "" }];
     }
@@ -331,5 +343,34 @@ mod tests {
             );
         }
         assert_eq!(reassemble(&result), text);
+    }
+
+    // --- CRLF / line ending normalization ---
+
+    #[test]
+    fn crlf_paragraph_splitting() {
+        let text = "First.\r\n\r\nSecond.";
+        let result = chunk_text(text, 10, 10);
+        assert_eq!(texts(&result), vec!["First.", "Second."]);
+        assert_eq!(result[0].join_separator, "");
+        assert_eq!(result[1].join_separator, "\n\n");
+        // Reassembly uses \n\n (Unix), not original \r\n\r\n
+        assert_eq!(reassemble(&result), "First.\n\nSecond.");
+    }
+
+    #[test]
+    fn cr_only_line_endings() {
+        let text = "First.\r\rSecond.";
+        let result = chunk_text(text, 10, 10);
+        assert_eq!(texts(&result), vec!["First.", "Second."]);
+        assert_eq!(reassemble(&result), "First.\n\nSecond.");
+    }
+
+    #[test]
+    fn mixed_line_endings() {
+        let text = "A.\r\n\r\nB.\n\nC.\r\rD.";
+        let result = chunk_text(text, 5, 5);
+        assert_eq!(texts(&result), vec!["A.", "B.", "C.", "D."]);
+        assert_eq!(reassemble(&result), "A.\n\nB.\n\nC.\n\nD.");
     }
 }

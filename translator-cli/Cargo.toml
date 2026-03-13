@@ -16,9 +16,11 @@ cuda    = ["translator-core/cuda"]
 [dependencies]
 translator-core    = { workspace = true }
 dirs               = { workspace = true }
-lingua             = { workspace = true }
 clap               = { workspace = true }
 serde_json         = { workspace = true }
 anyhow             = { workspace = true }
-tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+reqwest            = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread"] }
+futures            = { workspace = true }
+indicatif          = { workspace = true }

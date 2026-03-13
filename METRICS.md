@@ -72,7 +72,7 @@ curl -s -X POST http://localhost:3000/translate \
 |-----------------|------------------------------|--------------------------------------------------------------|
 | `OTLP_ENDPOINT` | `http://localhost:4317`      | OTLP gRPC endpoint the API pushes signals to                 |
 | `RUST_LOG`      | `info`                       | Log level filter (`trace`, `debug`, `info`, `warn`, `error`) |
-| `MODELS_DIR`    | platform cache / `ut/models` | Model directory (unchanged from non-OTel build)              |
+| `MODEL_PATH`    | `<cache>/ut/models/translategemma-4b/model-q8_0.gguf` | Path to GGUF model file (unchanged from non-OTel build) |
 
 The `OTLP_ENDPOINT` must be reachable from the host where the API runs. When running the API
 in Docker alongside the stack, use `http://otel-collector:4317` and attach it to the `obs`

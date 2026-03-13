@@ -29,7 +29,7 @@ translation across 55 languages.
 - Weights: GGUF quantised — two formats supported:
   - **Q8_0** (`model-q8_0.gguf`, ~4.1 GB) — default, higher precision
   - **Q4_K_M** (`model-q4k.gguf`, ~2.6 GB) — opt-in, smaller footprint, comparable throughput under llama.cpp
-- Selection: `--model-file` flag or `MODEL_FILE` env var. Default auto-detects Q8_0 → Q4_K_M → any `*.gguf`.
+- Selection: `--model-path` flag or `MODEL_PATH` env var. Default: `<cache>/ut/models/translategemma-4b/model-q8_0.gguf`.
 - Framework: [llama.cpp](https://github.com/ggerganov/llama.cpp) via the `llama-cpp-2` Rust crate
 - Tokenizer: embedded in the GGUF file (no separate `tokenizer.json` needed)
 
@@ -50,6 +50,37 @@ the translation output.
 
 **Recommendation:** split long documents into paragraphs or sentences, translate each
 piece, then reassemble the results on the client side.
+
+---
+
+## Text chunking
+
+The engine automatically splits long inputs at `\n\n` paragraph boundaries, falling
+back to Unicode sentence boundaries (via `unicode-segmentation`) for oversized
+paragraphs. Chunked translations are reassembled before returning results.
+
+### Configurable limits
+
+| Env var / constant | Default | Purpose |
+|--------------------|---------|---------|
+| `MAX_CHUNK_CHARS` | 1 500 | Hard ceiling per chunk (sentence fallback limit) |
+| `PARAGRAPH_TARGET_CHARS` | 800 | Soft target — flush paragraph accumulator when exceeded |
+
+### Line ending normalization
+
+`\r\n` (Windows) and `\r` (old Mac) line endings are normalized to `\n` before
+chunking. Translated output always uses Unix line endings (`\n`), regardless of the
+input encoding.
+
+### Per-text error handling
+
+If a chunk is still too large after splitting (e.g. no sentence boundaries found),
+the scheduler may return an `InputTooLong` error. This error is routed to the
+individual text's `errors` field in the response — other texts in the same batch are
+unaffected and return their translations normally. Only `ServiceUnavailable`
+(backpressure) fails the entire batch.
+
+---
 
 **Expected output length** is estimated as `(input_bytes / 3 + 15).clamp(15, 4096)`
 from the original text's byte length. This estimate is used to calibrate EOS bias

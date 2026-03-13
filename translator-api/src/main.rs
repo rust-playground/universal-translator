@@ -15,24 +15,19 @@ mod state;
 
 use state::AppState;
 
-fn default_models_dir() -> PathBuf {
+fn default_model_path() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("ut/models")
+        .join("ut/models/translategemma-4b/model-q8_0.gguf")
 }
 
 #[derive(Parser)]
 #[command(name = "translator-api", about = "Universal translation HTTP API")]
 struct Args {
-    /// Directory containing model files.
-    /// [default: platform cache dir / ut/models]
-    #[arg(long, env = "MODELS_DIR")]
-    models_dir: Option<PathBuf>,
-
-    /// GGUF model file name (e.g. "model-q8_0.gguf").
-    /// Overrides auto-detection. Also settable via MODEL_FILE env var.
-    #[arg(long, env = "MODEL_FILE")]
-    model_file: Option<String>,
+    /// Path to the GGUF model file.
+    /// [default: <cache>/ut/models/translategemma-4b/model-q8_0.gguf]
+    #[arg(long, env = "MODEL_PATH")]
+    model_path: Option<PathBuf>,
 
     /// Number of concurrent decode slots.
     #[arg(long, env = "MAX_DECODE_SLOTS")]
@@ -55,6 +50,23 @@ struct Args {
     /// Shorter chunks improve translation quality. Defaults to ~60% of max-chunk-chars.
     #[arg(long, env = "PARAGRAPH_TARGET_CHARS")]
     paragraph_target_chars: Option<usize>,
+
+    /// Bounded queue capacity for pending translation requests.
+    #[arg(long, env = "QUEUE_CAPACITY")]
+    queue_capacity: Option<usize>,
+
+    /// Timeout (in seconds) when sending work items to the scheduler queue.
+    /// Allows requests to wait for capacity instead of failing instantly. Default: 30.
+    #[arg(long, env = "QUEUE_SEND_TIMEOUT_SECS")]
+    queue_send_timeout_secs: Option<u64>,
+
+    /// Maximum number of texts in a single request. Default: 128.
+    #[arg(long, env = "MAX_TEXTS_PER_REQUEST", default_value_t = 128)]
+    max_texts_per_request: usize,
+
+    /// Maximum total work items (texts × languages) per request. Default: 2048.
+    #[arg(long, env = "MAX_WORK_ITEMS_PER_REQUEST", default_value_t = 2048)]
+    max_work_items_per_request: usize,
 
     /// TCP port to listen on.
     #[arg(long, default_value_t = 3000)]
@@ -138,20 +150,20 @@ async fn main() {
     init_tracing();
 
     let args = Args::parse();
-    let models_dir = args.models_dir.unwrap_or_else(default_models_dir);
+    let model_path = args.model_path.unwrap_or_else(default_model_path);
     let addr = format!("0.0.0.0:{}", args.port);
 
-    tracing::info!(?models_dir, "Loading translation engine");
+    tracing::info!(?model_path, "Loading translation engine");
 
     let config = EngineConfig {
-        models_dir,
-        model_file: args.model_file,
+        model_path,
         n_slots: args.n_slots,
         max_tokens: args.max_tokens,
-        queue_capacity: None,
+        queue_capacity: args.queue_capacity,
         prefill_delay_ms: args.prefill_delay_ms,
         max_chunk_chars: args.max_chunk_chars,
         paragraph_target_chars: args.paragraph_target_chars,
+        queue_send_timeout_secs: args.queue_send_timeout_secs,
     };
     let engine = TranslationEngine::from_config(config).unwrap_or_else(|e| {
         tracing::error!("Failed to load model: {e}");
@@ -159,6 +171,8 @@ async fn main() {
     });
     let state = AppState {
         engine,
+        max_texts_per_request: args.max_texts_per_request,
+        max_work_items_per_request: args.max_work_items_per_request,
         #[cfg(feature = "opentelemetry")]
         error_ctr: opentelemetry::global::meter("translator")
             .u64_counter("translator.translation.errors")
@@ -167,6 +181,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/translate", post(routes::translate::translate))
+        .route("/translate/stream", post(routes::translate::translate_stream))
         .route("/detect-language", post(routes::detect_language::detect_language))
         .route("/languages", get(routes::languages::languages))
         .route("/health", get(|| async { "OK" }))

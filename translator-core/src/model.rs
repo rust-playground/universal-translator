@@ -10,70 +10,15 @@ use llama_cpp_2::token::LlamaToken;
 
 use crate::error::TranslatorError;
 
-/// Find the first `*.gguf` file in a directory.
-fn find_gguf_file(dir: &Path) -> Result<PathBuf, TranslatorError> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(TranslatorError::Io)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "gguf"))
-        .collect();
-    entries.sort();
-    entries.into_iter().next().ok_or_else(|| {
-        TranslatorError::ModelNotFound(format!(
-            "no .gguf file found in {} — run models/download.sh",
-            dir.display()
-        ))
-    })
-}
-
-/// Resolve the GGUF model file path.
-///
-/// Priority:
-/// 1. Explicit `model_file` param (from `--model-file` flag)
-/// 2. `MODEL_FILE` env var
-/// 3. `model-q8_0.gguf` (preferred default — higher precision)
-/// 4. `model-q4k.gguf` (fallback if Q8_0 not present)
-/// 5. Any `*.gguf` in directory (last resort)
-fn resolve_gguf_path(model_dir: &Path, model_file: Option<&str>) -> Result<PathBuf, TranslatorError> {
-    // 1. Explicit --model-file flag
-    if let Some(name) = model_file {
-        let path = model_dir.join(name);
-        if !path.exists() {
-            return Err(TranslatorError::ModelNotFound(format!(
-                "--model-file {name} not found at {}",
-                path.display()
-            )));
-        }
-        return Ok(path);
+/// Verify the GGUF model file exists at the given path.
+fn resolve_gguf_path(model_path: &Path) -> Result<PathBuf, TranslatorError> {
+    if !model_path.exists() {
+        return Err(TranslatorError::ModelNotFound(format!(
+            "model file not found: {} — run `ut setup` to download",
+            model_path.display()
+        )));
     }
-
-    // 2. MODEL_FILE env var
-    if let Ok(name) = std::env::var("MODEL_FILE") {
-        let path = model_dir.join(&name);
-        if !path.exists() {
-            return Err(TranslatorError::ModelNotFound(format!(
-                "MODEL_FILE={name} not found at {}",
-                path.display()
-            )));
-        }
-        return Ok(path);
-    }
-
-    // 3. Q8_0 default (higher precision, comparable throughput under llama.cpp)
-    let q8 = model_dir.join("model-q8_0.gguf");
-    if q8.exists() {
-        return Ok(q8);
-    }
-
-    // 4. Q4_K_M fallback
-    let q4k = model_dir.join("model-q4k.gguf");
-    if q4k.exists() {
-        return Ok(q4k);
-    }
-
-    // 5. Any *.gguf in directory
-    find_gguf_file(model_dir)
+    Ok(model_path.to_path_buf())
 }
 
 /// A loaded TranslateGemma 4B model backed by llama.cpp.
@@ -97,10 +42,8 @@ unsafe impl Send for LoadedGemmaModel {}
 unsafe impl Sync for LoadedGemmaModel {}
 
 impl LoadedGemmaModel {
-    /// Load the model from a directory containing a GGUF file.
-    ///
-    /// `model_file` overrides automatic GGUF file selection (e.g. `"model-q8_0.gguf"`).
-    pub fn load(model_dir: &Path, model_file: Option<&str>) -> Result<Self, TranslatorError> {
+    /// Load the model from a GGUF file path.
+    pub fn load(model_path: &Path) -> Result<Self, TranslatorError> {
         let mut backend = LlamaBackend::init()
             .map_err(|e| TranslatorError::Model(format!("llama backend init: {e}")))?;
 
@@ -109,7 +52,7 @@ impl LoadedGemmaModel {
             backend.void_logs();
         }
 
-        let gguf_path = resolve_gguf_path(model_dir, model_file)?;
+        let gguf_path = resolve_gguf_path(model_path)?;
 
         let model_params = LlamaModelParams::default().with_n_gpu_layers(999);
 
@@ -120,9 +63,8 @@ impl LoadedGemmaModel {
         tracing::info!("eos_token_id={eos_token_id}");
 
         tracing::info!(
-            "TranslateGemma model loaded: {} (from {})",
+            "TranslateGemma model loaded: {}",
             gguf_path.file_name().unwrap_or_default().to_string_lossy(),
-            model_dir.display()
         );
 
         Ok(Self {
@@ -136,6 +78,11 @@ impl LoadedGemmaModel {
 
     pub fn eos_token_id(&self) -> u32 {
         self.eos_token_id
+    }
+
+    /// Number of vocabulary tokens in the model.
+    pub fn vocab_size(&self) -> usize {
+        self.model.n_vocab() as usize
     }
 
     /// Check if a token is an end-of-generation token (covers both `<eos>` and

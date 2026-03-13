@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.4] — 2026-03-12
+
+### Added
+
+- **`ut setup` subcommand** — downloads model weights directly from HuggingFace with progress bar (no Python/hf CLI dependency)
+- **`translator-api-client` crate** — full HTTP client with retry, SSE streaming, builder pattern
+- **`POST /translate/stream`** — SSE streaming endpoint for incremental translation results
+- **`Language` enum** (`translator-core/src/language.rs`) — typed 55-language enum with
+  `Copy + Eq + Hash`, serde as ISO code, `full_name()`, `script_group()`, `expansion_ratio()`
+- **Request validation** — `max_texts_per_request` (default 128) and
+  `max_work_items_per_request` (default 2048) limits on API and CLI
+- **`queue_capacity` and `queue_send_timeout_secs`** configurable via CLI flags / env vars
+- **`load-test` binary** — Rust replacement for Python load test, covers all 5 endpoints
+- **`model.vocab_size()` accessor**
+
+### Changed
+
+- **`--models-dir` + `--model-file` flags replaced by single `--model-path` flag** (defaults to `<cache>/ut/models/translategemma-4b/model-q8_0.gguf`)
+- **Model resolution is now explicit** — no silent fallback chain; missing model error directs to `ut setup`
+- **`TranslationBatch` now uses typed `Language` values**; raw string parsing moved to
+  API/CLI boundary via new `TranslationRequest` struct
+- **`/languages` endpoint** returns typed `Language` objects (serialized as ISO codes)
+  instead of `&'static [&'static str]`
+- **CLI `languages` command** uses `Language::full_name()` instead of lingua name mapping
+- **Scheduler reuses per-slot logits buffers** (~1 MB per slot) instead of allocating per
+  decode step
+- **CRLF / `\r` line endings** normalized to `\n` before text chunking
+- Types (`TranslationResult`, `TranslationResultSet`, `LanguageDetectionResult`) now
+  derive `Deserialize`
+
+### Removed
+
+- `models/download.sh` — replaced by `ut setup`
+- `tests/load_test.py` — replaced by Rust `load-test` binary
+- `tests/integration.py` and `tests/fixtures/translations.csv`
+- HuggingFace CLI (`hf`) prerequisite — `ut setup` downloads directly, no Python needed
+- Direct `lingua` dependency from `translator-cli` (detection stays in `translator-core`)
+- `supported_target_languages()` free function — replaced by `Language::all()`
+
 ## [0.0.3] — 2026-03-10
 
 ### Changed
@@ -83,7 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
-[Unreleased]: https://github.com/rust-playground/universal-translator/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/rust-playground/universal-translator/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/rust-playground/universal-translator/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/rust-playground/universal-translator/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/rust-playground/universal-translator/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/rust-playground/universal-translator/compare/0044ce9fe79ee4ea73fa57dca12485b0bd22a5fb...v0.0.1

@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use clap::{Args, ValueEnum};
 use translator_core::detector::Detector;
-use translator_core::engine::supported_target_languages;
+use translator_core::Language;
 
 #[derive(Clone, ValueEnum)]
 pub enum OutputFormat {
@@ -24,7 +24,7 @@ impl DetectLanguageArgs {
     pub fn run(self, _models_dir: &Path) -> Result<()> {
         let detector = Detector::new();
         let (code, language_name, confidence) = detector.detect_with_confidence(&self.text)?;
-        let translation_supported = supported_target_languages().contains(&code.as_str());
+        let translation_supported = code.parse::<Language>().is_ok();
 
         match self.output {
             OutputFormat::Json => println!(
