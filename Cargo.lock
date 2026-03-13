@@ -3404,7 +3404,6 @@ dependencies = [
 name = "translator-api"
 version = "0.0.4"
 dependencies = [
- "anyhow",
  "axum",
  "clap",
  "dirs",
@@ -3450,7 +3449,6 @@ dependencies = [
  "reqwest 0.13.2",
  "serde_json",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "translator-core",
 ]
