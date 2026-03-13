@@ -65,6 +65,14 @@ struct Args {
     #[arg(long, env = "QUEUE_SEND_TIMEOUT_SECS")]
     queue_send_timeout_secs: Option<u64>,
 
+    /// Maximum number of texts in a single request. Default: 128.
+    #[arg(long, env = "MAX_TEXTS_PER_REQUEST", default_value_t = 128)]
+    max_texts_per_request: usize,
+
+    /// Maximum total work items (texts × languages) per request. Default: 2048.
+    #[arg(long, env = "MAX_WORK_ITEMS_PER_REQUEST", default_value_t = 2048)]
+    max_work_items_per_request: usize,
+
     /// TCP port to listen on.
     #[arg(long, default_value_t = 3000)]
     port: u16,
@@ -169,6 +177,8 @@ async fn main() {
     });
     let state = AppState {
         engine,
+        max_texts_per_request: args.max_texts_per_request,
+        max_work_items_per_request: args.max_work_items_per_request,
         #[cfg(feature = "opentelemetry")]
         error_ctr: opentelemetry::global::meter("translator")
             .u64_counter("translator.translation.errors")
@@ -177,6 +187,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/translate", post(routes::translate::translate))
+        .route("/translate/stream", post(routes::translate::translate_stream))
         .route("/detect-language", post(routes::detect_language::detect_language))
         .route("/languages", get(routes::languages::languages))
         .route("/health", get(|| async { "OK" }))

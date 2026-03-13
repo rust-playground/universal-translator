@@ -138,6 +138,11 @@ impl LoadedGemmaModel {
         self.eos_token_id
     }
 
+    /// Number of vocabulary tokens in the model.
+    pub fn vocab_size(&self) -> usize {
+        self.model.n_vocab() as usize
+    }
+
     /// Check if a token is an end-of-generation token (covers both `<eos>` and
     /// `<end_of_turn>` for Gemma models).
     pub fn is_eog_token(&self, token_id: u32) -> bool {

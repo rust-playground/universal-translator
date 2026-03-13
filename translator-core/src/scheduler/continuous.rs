@@ -130,6 +130,8 @@ struct Slot {
     reply_tx: mpsc::Sender<(usize, Result<String, TranslatorError>)>,
     /// When this slot was assigned (after prefill). Used to measure decode latency.
     assigned_at: std::time::Instant,
+    /// Reusable buffer for logit extraction — avoids ~1MB allocation per decode step.
+    logits_buf: Vec<f32>,
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -209,8 +211,11 @@ fn run_loop(
     let mut batch = LlamaBatch::new(n_ctx as usize, 1);
 
     let eos_id = model.eos_token_id();
+    let vocab_size = model.vocab_size();
     let mut slots: Vec<Option<Slot>> = (0..n_slots).map(|_| None).collect();
     let mut rng = SmallRng::from_entropy();
+    // Shared logits buffer for prefill path (only one prefill at a time).
+    let mut prefill_logits_buf: Vec<f32> = vec![0.0; vocab_size];
 
     // Sequence ID pool: free IDs available for assignment.
     // Stored as a stack (LIFO) — order doesn't matter.
@@ -241,6 +246,8 @@ fn run_loop(
                     &mut free_seq_ids,
                     eos_id,
                     &mut rng,
+                    vocab_size,
+                    &mut prefill_logits_buf,
                     metrics,
                 );
             }
@@ -321,6 +328,8 @@ fn run_loop(
                             &mut free_seq_ids,
                             eos_id,
                             &mut rng,
+                            vocab_size,
+                            &mut prefill_logits_buf,
                             metrics,
                         );
                     }
@@ -372,12 +381,15 @@ fn run_loop(
         // Per-slot logit extraction and sampling on CPU.
         let mut tok_ids: Vec<u32> = Vec::with_capacity(n_active);
         for (bi, &slot_idx) in active_indices.iter().enumerate() {
-            let slot = slots[slot_idx].as_ref().unwrap();
-            let mut logits = ctx.get_logits_ith(bi as i32).to_vec();
+            let slot = slots[slot_idx].as_mut().unwrap();
+            let src = ctx.get_logits_ith(bi as i32);
+            let len = src.len().min(slot.logits_buf.len());
+            slot.logits_buf[..len].copy_from_slice(&src[..len]);
+            let logits = &mut slot.logits_buf[..len];
 
-            apply_decoding_filters(&mut logits, &slot.output_ids);
-            apply_length_bias(&mut logits, eos_id, slot.output_ids.len(), slot.expected_len);
-            force_eos_on_tail_repeat(&mut logits, eos_id, &slot.output_ids);
+            apply_decoding_filters(logits, &slot.output_ids);
+            apply_length_bias(logits, eos_id, slot.output_ids.len(), slot.expected_len);
+            force_eos_on_tail_repeat(logits, eos_id, &slot.output_ids);
 
             // Hard ceiling at SLOT_CAPACITY.
             if slot.output_ids.len() + 1 >= SLOT_CAPACITY {
@@ -388,7 +400,7 @@ fn run_loop(
                 }
             }
 
-            tok_ids.push(sample_token(&mut logits, &mut rng));
+            tok_ids.push(sample_token(logits, &mut rng));
         }
 
         // ── Retire slots that emitted EOG; update the rest ───────────────
@@ -444,6 +456,8 @@ fn run_loop(
                     &mut free_seq_ids,
                     eos_id,
                     &mut rng,
+                    vocab_size,
+                    &mut prefill_logits_buf,
                     metrics,
                 );
             }
@@ -530,6 +544,8 @@ fn batch_prefill_and_assign(
     free_seq_ids: &mut Vec<i32>,
     eos_id: u32,
     rng: &mut SmallRng,
+    vocab_size: usize,
+    prefill_logits_buf: &mut [f32],
     metrics: &Metrics,
 ) {
     let empty_slot_count = slots.iter().filter(|s| s.is_none()).count();
@@ -615,11 +631,14 @@ fn batch_prefill_and_assign(
 
     // Sample first token for each prefilled sequence.
     for entry in entries {
-        let mut logits = ctx.get_logits_ith(entry.logits_batch_idx).to_vec();
+        let src = ctx.get_logits_ith(entry.logits_batch_idx);
+        let len = src.len().min(prefill_logits_buf.len());
+        prefill_logits_buf[..len].copy_from_slice(&src[..len]);
+        let logits = &mut prefill_logits_buf[..len];
 
-        apply_decoding_filters(&mut logits, &[]);
-        apply_length_bias(&mut logits, eos_id, 0, entry.expected_len);
-        let first_token = sample_token(&mut logits, rng);
+        apply_decoding_filters(logits, &[]);
+        apply_length_bias(logits, eos_id, 0, entry.expected_len);
+        let first_token = sample_token(logits, rng);
 
         if model.is_eog_token(first_token) {
             free_seq_ids.push(entry.seq_id);
@@ -641,6 +660,7 @@ fn batch_prefill_and_assign(
                     index: entry.index,
                     reply_tx: entry.reply_tx,
                     assigned_at: std::time::Instant::now(),
+                    logits_buf: vec![0.0; vocab_size],
                 });
             }
             None => {
