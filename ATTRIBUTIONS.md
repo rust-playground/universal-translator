@@ -2,7 +2,7 @@
 
 This project uses pre-trained machine translation models and libraries at runtime.
 The model weights are not distributed with this source code — they are downloaded
-separately via `models/download.sh`. Licenses and attribution requirements for
+separately via `ut setup`. Licenses and attribution requirements for
 each component are listed below.
 
 ---

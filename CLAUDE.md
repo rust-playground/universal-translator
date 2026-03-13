@@ -12,9 +12,8 @@ cargo build --features cuda          # Linux GPU (CUDA/NVIDIA)
 cargo clippy --workspace -- -D warnings   # lint (CI enforces -D warnings)
 cargo test --workspace               # unit tests
 
-# Integration tests (requires built CLI binary)
-cargo build -p translator-cli
-python3 tests/integration.py --binary ./target/debug/ut
+# Load test (requires running API server)
+cargo run -p translator-api-client --bin load-test
 ```
 
 ## Model Setup

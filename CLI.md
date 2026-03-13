@@ -13,13 +13,10 @@ cargo build -p translator-cli
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--models-dir PATH` | Platform cache dir¹ | Directory containing model files |
-| `--model-file NAME` | Auto-detect² | GGUF model file name within the model directory (e.g. `model-q4k.gguf`) |
+| `--model-path PATH` | `<cache>/ut/models/translategemma-4b/model-q8_0.gguf`¹ | Full path to the GGUF model file |
 
-¹ `~/.cache/ut/models` on Linux, `~/Library/Caches/ut/models` on macOS.
-Override with the `MODELS_DIR` environment variable or this flag.
-
-² Auto-detection priority: `--model-file` flag → `MODEL_FILE` env var → `model-q8_0.gguf` → `model-q4k.gguf` → any `*.gguf`.
+¹ `~/.cache/ut/models/…` on Linux, `~/Library/Caches/ut/models/…` on macOS.
+Override with the `MODEL_PATH` environment variable or this flag.
 
 ---
 

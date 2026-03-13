@@ -53,8 +53,6 @@ universal-translator/
 ├── translator-core/   # Core library: engine, language detector, types
 ├── translator-api/    # Axum HTTP API server
 ├── translator-cli/    # Command-line interface
-├── models/            # Model directories (not checked in — see below)
-│   └── download.sh    # Script to download and convert all models
 └── docs/models.md     # Model management guide
 ```
 
@@ -66,11 +64,6 @@ universal-translator/
   - Ubuntu/Debian: `sudo apt install cmake g++`
   - Fedora: `sudo dnf install cmake gcc-c++`
 - Tested on Linux (x86_64, arm64) and macOS (Apple Silicon)
-- HuggingFace CLI for model download:
-  ```bash
-  pip install huggingface_hub[cli]
-  hf auth login   # required: accept the Gemma licence at huggingface.co/google/translategemma-4b-it
-  ```
 
 ## Quick start
 
@@ -80,22 +73,23 @@ universal-translator/
 cargo build --release
 ```
 
-### Get the models
+### Get the model
 
 ```bash
-bash models/download.sh
+cargo run -p translator-cli -- setup
 ```
 
-This downloads TranslateGemma 4B (~4.1 GB, Q8_0 quantised, gated — requires HF login and
-[Gemma license acceptance](https://huggingface.co/google/translategemma-4b-it)) into the
-default model directory. For a smaller Q4_K_M variant (~2.6 GB):
+This downloads TranslateGemma 4B Q8_0 (~4.1 GB) directly from HuggingFace into the
+default model directory. No Python or HuggingFace CLI required.
+
+For the smaller Q4_K_M variant (~2.6 GB):
 
 ```bash
-bash models/download.sh --q4
+cargo run -p translator-cli -- setup --url https://huggingface.co/mradermacher/translategemma-4b-it-GGUF/resolve/main/translategemma-4b-it.Q4_K_M.gguf
 ```
 
-Use `--model-file model-q4k.gguf` to select Q4_K_M at runtime. Q8_0 is the default (higher precision, comparable throughput under llama.cpp).
-See [docs/models.md](docs/models.md) for details, directory layout, and alternative hosting options.
+Use `--model-path <path>` to select a specific model file at runtime. Q8_0 is the default.
+See [docs/models.md](docs/models.md) for details and alternative hosting options.
 
 ### Run the API server
 

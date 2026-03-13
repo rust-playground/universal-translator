@@ -29,7 +29,7 @@ translation across 55 languages.
 - Weights: GGUF quantised — two formats supported:
   - **Q8_0** (`model-q8_0.gguf`, ~4.1 GB) — default, higher precision
   - **Q4_K_M** (`model-q4k.gguf`, ~2.6 GB) — opt-in, smaller footprint, comparable throughput under llama.cpp
-- Selection: `--model-file` flag or `MODEL_FILE` env var. Default auto-detects Q8_0 → Q4_K_M → any `*.gguf`.
+- Selection: `--model-path` flag or `MODEL_PATH` env var. Default: `<cache>/ut/models/translategemma-4b/model-q8_0.gguf`.
 - Framework: [llama.cpp](https://github.com/ggerganov/llama.cpp) via the `llama-cpp-2` Rust crate
 - Tokenizer: embedded in the GGUF file (no separate `tokenizer.json` needed)
 

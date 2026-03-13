@@ -25,27 +25,6 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
-## Integration Tests (CLI golden-fixture)
-
-Tests CLI output against a committed CSV of expected translations.
-
-```bash
-# Build the CLI first
-# Add --features metal (macOS) or --features cuda (Linux) for GPU inference
-cargo build -r -p translator-cli
-
-# Run tests against golden fixtures
-python3 tests/integration.py --binary ./target/debug/ut
-
-# (Re)generate golden fixtures from current CLI output
-python3 tests/integration.py --binary ./target/debug/ut --seed
-
-# Show full actual vs expected on failures
-python3 tests/integration.py --binary ./target/debug/ut --verbose
-```
-
-Requires: models downloaded via `bash models/download.sh` (see docs/models.md).
-
 ## Load Tests (API throughput/latency)
 
 Rust binary that measures throughput and latency under concurrent load across all API endpoints.

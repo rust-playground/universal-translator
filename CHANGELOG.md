@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `models/download.sh` — replaced by `ut setup`
 - `tests/load_test.py` — replaced by Rust `load-test` binary
 - `tests/integration.py` and `tests/fixtures/translations.csv`
+- HuggingFace CLI (`hf`) prerequisite — `ut setup` downloads directly, no Python needed
 - Direct `lingua` dependency from `translator-cli` (detection stays in `translator-core`)
 - `supported_target_languages()` free function — replaced by `Language::all()`
 
