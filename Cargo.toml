@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.0.3"
+version = "0.0.4"
 license = "MIT OR Apache-2.0"
 description = "Fast, fully local text translation CLI and API using TranslateGemma 4B via llama.cpp"
 repository  = "https://github.com/rust-playground/universal-translator"
@@ -25,7 +25,8 @@ lingua              = "1"
 clap                = { version = "4", features = ["derive", "env"] }
 axum                = { version = "0.8", features = ["json", "macros"] }
 tower-http          = { version = "0.6", features = ["trace"] }
-reqwest             = { version = "0.12", features = ["json", "stream"] }
+reqwest             = { version = "0.13", features = ["json", "stream"] }
+indicatif           = "0.18"
 futures             = { version = "0.3", default-features = false, features = ["async-await", "alloc"] }
 tokio-stream        = "0.1"
 opentelemetry          = { version = "0.31" }

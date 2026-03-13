@@ -7,7 +7,7 @@
 //! 3. `force_eos_on_tail_repeat` — catch repetition loops missed by n-gram filter
 //! 4. `sample_token`           — temperature / top-K / top-P sampling
 
-use rand::distributions::{Distribution, Standard};
+use rand::distr::{Distribution, StandardUniform};
 use rand::rngs::SmallRng;
 
 // ── Repetition / n-gram filters ───────────────────────────────────────────────
@@ -236,7 +236,7 @@ pub fn sample_token(logits: &mut [f32], rng: &mut SmallRng) -> u32 {
 
     // 5. Renormalise & weighted draw.
     let sum: f32 = candidates.iter().map(|(_, v)| v).sum();
-    let draw: f32 = Standard.sample(rng);
+    let draw: f32 = StandardUniform.sample(rng);
     let threshold = draw * sum;
     let mut cumsum = 0.0_f32;
     for &(idx, p) in candidates.iter() {

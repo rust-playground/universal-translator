@@ -15,8 +15,8 @@ use std::sync::mpsc;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::token::LlamaToken;
-use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rand::rngs::SmallRng;
 
 use crate::error::TranslatorError;
 use crate::model::LoadedGemmaModel;
@@ -213,7 +213,7 @@ fn run_loop(
     let eos_id = model.eos_token_id();
     let vocab_size = model.vocab_size();
     let mut slots: Vec<Option<Slot>> = (0..n_slots).map(|_| None).collect();
-    let mut rng = SmallRng::from_entropy();
+    let mut rng = SmallRng::from_rng(&mut rand::rng());
     // Shared logits buffer for prefill path (only one prefill at a time).
     let mut prefill_logits_buf: Vec<f32> = vec![0.0; vocab_size];
 

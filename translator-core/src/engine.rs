@@ -19,8 +19,7 @@ use crate::types::{LanguageDetectionResult, TranslationBatch, TranslationResult,
 /// Env-var reading belongs in the CLI/API layer (via clap `env = "..."`),
 /// not here.
 pub struct EngineConfig {
-    pub models_dir: PathBuf,
-    pub model_file: Option<String>,
+    pub model_path: PathBuf,
     /// Number of concurrent decode slots.
     pub n_slots: Option<usize>,
     /// Maximum tokens per translation (maps to KV budget per slot).
@@ -136,9 +135,8 @@ pub(crate) const DEFAULT_QUEUE_SEND_TIMEOUT_SECS: u64 = 30;
 
 impl TranslationEngine {
     pub fn from_config(config: EngineConfig) -> Result<Self, TranslatorError> {
-        let model_dir = config.models_dir.join("translategemma-4b");
-        tracing::info!(?model_dir, "Loading TranslateGemma model");
-        let model = Arc::new(LoadedGemmaModel::load(&model_dir, config.model_file.as_deref())?);
+        tracing::info!(model_path = %config.model_path.display(), "Loading TranslateGemma model");
+        let model = Arc::new(LoadedGemmaModel::load(&config.model_path)?);
 
         let n_slots = config.n_slots.unwrap_or_else(auto_n_slots);
         let kv_budget_per_slot = config.max_tokens.unwrap_or(DEFAULT_KV_BUDGET_PER_SLOT);
@@ -198,11 +196,10 @@ impl TranslationEngine {
         })
     }
 
-    /// Convenience constructor matching the old `new(models_dir, model_file)` signature.
-    pub fn new(models_dir: impl AsRef<Path>, model_file: Option<&str>) -> Result<Self, TranslatorError> {
+    /// Convenience constructor taking a direct model path.
+    pub fn new(model_path: impl AsRef<Path>) -> Result<Self, TranslatorError> {
         Self::from_config(EngineConfig {
-            models_dir: models_dir.as_ref().to_path_buf(),
-            model_file: model_file.map(String::from),
+            model_path: model_path.as_ref().to_path_buf(),
             n_slots: None,
             max_tokens: None,
             queue_capacity: None,

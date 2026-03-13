@@ -15,24 +15,19 @@ mod state;
 
 use state::AppState;
 
-fn default_models_dir() -> PathBuf {
+fn default_model_path() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("ut/models")
+        .join("ut/models/translategemma-4b/model-q8_0.gguf")
 }
 
 #[derive(Parser)]
 #[command(name = "translator-api", about = "Universal translation HTTP API")]
 struct Args {
-    /// Directory containing model files.
-    /// [default: platform cache dir / ut/models]
-    #[arg(long, env = "MODELS_DIR")]
-    models_dir: Option<PathBuf>,
-
-    /// GGUF model file name (e.g. "model-q8_0.gguf").
-    /// Overrides auto-detection. Also settable via MODEL_FILE env var.
-    #[arg(long, env = "MODEL_FILE")]
-    model_file: Option<String>,
+    /// Path to the GGUF model file.
+    /// [default: <cache>/ut/models/translategemma-4b/model-q8_0.gguf]
+    #[arg(long, env = "MODEL_PATH")]
+    model_path: Option<PathBuf>,
 
     /// Number of concurrent decode slots.
     #[arg(long, env = "MAX_DECODE_SLOTS")]
@@ -155,14 +150,13 @@ async fn main() {
     init_tracing();
 
     let args = Args::parse();
-    let models_dir = args.models_dir.unwrap_or_else(default_models_dir);
+    let model_path = args.model_path.unwrap_or_else(default_model_path);
     let addr = format!("0.0.0.0:{}", args.port);
 
-    tracing::info!(?models_dir, "Loading translation engine");
+    tracing::info!(?model_path, "Loading translation engine");
 
     let config = EngineConfig {
-        models_dir,
-        model_file: args.model_file,
+        model_path,
         n_slots: args.n_slots,
         max_tokens: args.max_tokens,
         queue_capacity: args.queue_capacity,

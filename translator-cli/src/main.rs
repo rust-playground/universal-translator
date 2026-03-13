@@ -12,18 +12,17 @@ fn default_models_dir() -> PathBuf {
         .join("ut/models")
 }
 
+fn default_model_path() -> PathBuf {
+    default_models_dir().join("translategemma-4b/model-q8_0.gguf")
+}
+
 #[derive(Parser)]
 #[command(name = "ut", about = "Universal translation CLI")]
 struct Cli {
-    /// Directory containing language-pair model directories.
-    /// [default: ~/.cache/ut/models  (macOS: ~/Library/Caches/ut/models)]
-    #[arg(long)]
-    models_dir: Option<PathBuf>,
-
-    /// GGUF model file name within the model directory (e.g. "model-q8_0.gguf").
-    /// Overrides MODEL_FILE env var and auto-detection.
-    #[arg(long)]
-    model_file: Option<String>,
+    /// Path to the GGUF model file.
+    /// [default: <cache>/ut/models/translategemma-4b/model-q8_0.gguf]
+    #[arg(long, env = "MODEL_PATH")]
+    model_path: Option<PathBuf>,
 
     /// Number of concurrent decode slots.
     #[arg(long, env = "MAX_DECODE_SLOTS")]
@@ -67,9 +66,9 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let model_path = cli.model_path.unwrap_or_else(default_model_path);
     let config = EngineConfig {
-        models_dir: cli.models_dir.unwrap_or_else(default_models_dir),
-        model_file: cli.model_file,
+        model_path: model_path.clone(),
         n_slots: cli.n_slots,
         max_tokens: cli.max_tokens,
         queue_capacity: cli.queue_capacity,
@@ -78,5 +77,5 @@ fn main() -> anyhow::Result<()> {
         paragraph_target_chars: cli.paragraph_target_chars,
         queue_send_timeout_secs: cli.queue_send_timeout_secs,
     };
-    cli.command.run(config)
+    cli.command.run(config, &default_models_dir())
 }

@@ -22,19 +22,18 @@ python3 tests/integration.py --binary ./target/debug/ut
 Run once before using the CLI or API:
 
 ```bash
-bash models/download.sh   # requires: pip install huggingface_hub[cli] && hf auth login
+cargo run -p translator-cli -- setup              # download Q8_0 (default, ~4.1 GB)
+cargo run -p translator-cli -- setup --url <url>   # download custom GGUF
 ```
 
-Downloads TranslateGemma 4B. Required file in `${MODELS_DIR}/translategemma-4b/`:
-- `model-q8_0.gguf` (~4.1 GB, GGUF Q8_0 quantised weights — default, higher precision; tokenizer embedded in GGUF)
+Downloads TranslateGemma 4B GGUF weights directly from HuggingFace (no Python/hf CLI dependency).
+Default output: `<cache>/ut/models/translategemma-4b/model-q8_0.gguf` (tokenizer embedded in GGUF).
 
-Optional smaller weights:
-```bash
-bash models/download.sh --q4   # also downloads Q4_K_M (~2.6 GB)
-```
+Q4_K_M (~2.6 GB) available at:
+`https://huggingface.co/mradermacher/translategemma-4b-it-GGUF/resolve/main/translategemma-4b-it.Q4_K_M.gguf`
 
-Select model file at runtime: `--model-file model-q4k.gguf` flag or `MODEL_FILE=model-q4k.gguf` env var.
-Default `MODELS_DIR`: platform cache directory (via `dirs` crate). Override with `--models-dir` flag or `MODELS_DIR` env var.
+Select model file at runtime: `--model-path <path>` flag or `MODEL_PATH=<path>` env var.
+Default `MODEL_PATH`: platform cache directory (via `dirs` crate) + `ut/models/translategemma-4b/model-q8_0.gguf`.
 
 ## Running
 
@@ -48,8 +47,8 @@ cargo run -p translator-cli -- detect -t "Bonjour"
 cargo run -p translator-api
 ```
 
-Key CLI flags: `--models-dir`, `--model-file`, `--output json`.
-Key API env vars: `MODELS_DIR`, `MODEL_FILE`, `RUST_LOG`.
+Key CLI flags: `--model-path`, `--output json`.
+Key API env vars: `MODEL_PATH`, `RUST_LOG`.
 
 ## Architecture
 
