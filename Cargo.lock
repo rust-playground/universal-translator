@@ -3402,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "translator-api"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "axum",
  "clap",
@@ -3424,7 +3424,7 @@ dependencies = [
 
 [[package]]
 name = "translator-api-client"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "clap",
  "futures",
@@ -3439,7 +3439,7 @@ dependencies = [
 
 [[package]]
 name = "translator-cli"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3455,7 +3455,7 @@ dependencies = [
 
 [[package]]
 name = "translator-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",

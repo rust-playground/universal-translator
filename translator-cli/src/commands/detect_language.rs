@@ -24,24 +24,24 @@ impl DetectLanguageArgs {
     pub fn run(self, _models_dir: &Path) -> Result<()> {
         let detector = Detector::new();
         let (code, language_name, confidence) = detector.detect_with_confidence(&self.text)?;
-        let translation_supported = code.parse::<Language>().is_ok();
+        let lang = code.parse::<Language>().ok();
 
         match self.output {
             OutputFormat::Json => println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "language_code": code,
-                    "language": language_name,
+                    "language": lang,
                     "confidence": confidence,
-                    "translation_supported": translation_supported,
+                    "translation_supported": lang.is_some(),
                 }))?
             ),
             OutputFormat::Pretty => {
-                let supported = if translation_supported { "yes" } else { "no" };
+                let supported = if lang.is_some() { "yes" } else { "no" };
+                let lang_display = lang.map(|l| l.code()).unwrap_or(&code);
                 println!(
                     "Language: {} ({}) — confidence: {:.1}% — translation supported: {}",
                     language_name,
-                    code,
+                    lang_display,
                     confidence * 100.0,
                     supported,
                 );

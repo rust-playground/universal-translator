@@ -58,12 +58,16 @@ impl TranslateArgs {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
             OutputFormat::Pretty => {
                 for r in &result.results {
-                    println!("Source [{}]: {}", r.detected_language, r.source_text);
+                    let src = r
+                        .detected_language
+                        .map(|l| l.code())
+                        .unwrap_or("unknown");
+                    println!("Source [{src}]: {}", r.source_text);
                     for (lang, translation) in &r.translations {
-                        println!("  [{lang}] {translation}");
+                        println!("  [{}] {translation}", lang.code());
                     }
                     for (lang, err) in &r.errors {
-                        println!("  [{lang}] ERROR: {err}");
+                        println!("  [{}] ERROR: {err}", lang.code());
                     }
                     println!();
                 }

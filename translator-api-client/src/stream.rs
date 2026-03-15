@@ -92,6 +92,7 @@ fn parse_sse_block(block: &str) -> Option<Result<TranslationResult, ClientError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use translator_core::Language;
 
     #[test]
     fn parse_translation_event() {
@@ -100,7 +101,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap().unwrap();
         assert_eq!(result.source_text, "hi");
-        assert_eq!(result.translations.get("fr").unwrap(), "salut");
+        assert_eq!(result.translations.get(&Language::Fr).unwrap(), "salut");
     }
 
     #[test]

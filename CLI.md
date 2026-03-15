@@ -107,8 +107,7 @@ Language: French (fr) — confidence: 87.3% — translation supported: yes
 
 ```json
 {
-  "language_code": "fr",
-  "language": "French",
+  "language": "fr",
   "confidence": 0.873,
   "translation_supported": true
 }
