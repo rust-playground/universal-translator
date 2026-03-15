@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::TranslationItemError;
 use crate::language::Language;
 
 /// JSON deserialization target — accepts raw strings including the `"all"` sentinel.
@@ -27,12 +28,11 @@ pub struct TranslationBatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationResult {
     pub source_text: String,
-    pub detected_language: String,
-    /// `"fr"` → `"Bonjour"`
-    pub translations: HashMap<String, String>,
+    pub detected_language: Option<Language>,
+    pub translations: HashMap<Language, String>,
     /// Per-language errors; omitted from JSON when empty.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub errors: HashMap<String, String>,
+    pub errors: HashMap<Language, TranslationItemError>,
 }
 
 /// Top-level batch response — one result per input text.
@@ -44,8 +44,7 @@ pub struct TranslationResultSet {
 /// Result of a standalone language detection request.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LanguageDetectionResult {
-    pub language_code: String,
-    pub language: String,
+    pub language: Option<Language>,
     pub confidence: f64,
     pub translation_supported: bool,
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::detector::Detector;
-use crate::error::TranslatorError;
+use crate::error::{TranslationItemError, TranslatorError};
 use crate::language::{self, Language};
 use crate::model::LoadedGemmaModel;
 use crate::scheduler::{ContinuousScheduler, InferRequest, SLOT_CAPACITY};
@@ -284,7 +284,7 @@ impl TranslationEngine {
                 {
                     for (lang, translation) in &chunk_result.translations {
                         merged_translations
-                            .entry(lang.clone())
+                            .entry(*lang)
                             .and_modify(|existing| {
                                 existing.push_str(sep);
                                 existing.push_str(translation);
@@ -292,13 +292,13 @@ impl TranslationEngine {
                             .or_insert_with(|| translation.clone());
                     }
                     for (lang, err) in &chunk_result.errors {
-                        merged_errors.entry(lang.clone()).or_insert_with(|| err.clone());
+                        merged_errors.entry(*lang).or_insert_with(|| err.clone());
                     }
                 }
 
                 results.push(TranslationResult {
                     source_text: batch.texts[*orig_idx].clone(),
-                    detected_language: first.detected_language.clone(),
+                    detected_language: first.detected_language,
                     translations: merged_translations,
                     errors: merged_errors,
                 });
@@ -318,13 +318,12 @@ impl TranslationEngine {
         &self,
         text: &str,
     ) -> Result<LanguageDetectionResult, TranslatorError> {
-        let (code, language_name, confidence) = self.detector.detect_with_confidence(text)?;
-        let supported = code.parse::<Language>().is_ok();
+        let (code, _language_name, confidence) = self.detector.detect_with_confidence(text)?;
+        let lang = code.parse::<Language>().ok();
         Ok(LanguageDetectionResult {
-            language_code: code,
-            language: language_name,
+            language: lang,
             confidence,
-            translation_supported: supported,
+            translation_supported: lang.is_some(),
         })
     }
 
@@ -368,22 +367,24 @@ impl TranslationEngine {
         };
         tracing::debug!(detection_ms = t0.elapsed().as_millis(), "phase 1 done");
 
-        let mut all_translations: Vec<HashMap<String, String>> =
+        let mut all_translations: Vec<HashMap<Language, String>> =
             (0..n).map(|_| HashMap::new()).collect();
-        let mut all_errors: Vec<HashMap<String, String>> = (0..n).map(|_| HashMap::new()).collect();
+        let mut all_errors: Vec<HashMap<Language, TranslationItemError>> =
+            (0..n).map(|_| HashMap::new()).collect();
 
         // Phase 2 — build flat list of work items for all texts × target languages.
         let mut work_texts: Vec<String> = vec![];
         let mut work_expected_lens: Vec<usize> = vec![];
-        let mut work_indices: Vec<(usize, String)> = vec![];
+        let mut work_indices: Vec<(usize, Language)> = vec![];
 
         for i in 0..n {
             let src = match &source_langs[i] {
                 Ok(lang) => *lang,
                 Err(e) => {
                     // Per-text detection failure: populate errors for all targets, skip inference.
+                    let item_err = TranslationItemError::from(e);
                     for tgt in &batch.target_languages {
-                        all_errors[i].insert(tgt.code().to_string(), e.to_string());
+                        all_errors[i].insert(*tgt, item_err.clone());
                     }
                     continue;
                 }
@@ -392,7 +393,7 @@ impl TranslationEngine {
             // Empty text shortcut — return as-is without inference.
             if batch.texts[i].trim().is_empty() {
                 for tgt in &batch.target_languages {
-                    all_translations[i].insert(tgt.code().to_string(), batch.texts[i].clone());
+                    all_translations[i].insert(*tgt, batch.texts[i].clone());
                 }
                 continue;
             }
@@ -400,7 +401,7 @@ impl TranslationEngine {
             for &tgt in &batch.target_languages {
                 // Same-language shortcut — return original text unchanged.
                 if tgt == src {
-                    all_translations[i].insert(tgt.code().to_string(), batch.texts[i].clone());
+                    all_translations[i].insert(tgt, batch.texts[i].clone());
                     continue;
                 }
 
@@ -413,7 +414,7 @@ impl TranslationEngine {
                 let prompt = translate_gemma_prompt(src, tgt, text);
                 work_texts.push(prompt);
                 work_expected_lens.push(expected_output_len);
-                work_indices.push((i, tgt.code().to_string()));
+                work_indices.push((i, tgt));
             }
         }
 
@@ -476,8 +477,8 @@ impl TranslationEngine {
                 match result {
                     Ok(text) => translated[idx] = Some(text),
                     Err(e) => {
-                        let (text_idx, ref target_lang) = work_indices[idx];
-                        all_errors[text_idx].insert(target_lang.clone(), e.to_string());
+                        let (text_idx, target_lang) = work_indices[idx];
+                        all_errors[text_idx].insert(target_lang, TranslationItemError::from(&e));
                     }
                 }
             }
@@ -488,9 +489,9 @@ impl TranslationEngine {
                 "phase 4 done (replies received)"
             );
 
-            for (idx, (text_idx, target_lang)) in work_indices.iter().enumerate() {
+            for (idx, &(text_idx, target_lang)) in work_indices.iter().enumerate() {
                 if let Some(translation) = translated[idx].take() {
-                    all_translations[*text_idx].insert(target_lang.clone(), translation);
+                    all_translations[text_idx].insert(target_lang, translation);
                 }
             }
         }
@@ -498,19 +499,16 @@ impl TranslationEngine {
         // Assemble results, preserving original order.
         let results = (0..n)
             .map(|i| {
-                let src_code = match &source_langs[i] {
-                    Ok(lang) => lang.code().to_string(),
-                    Err(_) => "unknown".to_string(),
-                };
+                let detected = source_langs[i].as_ref().ok().copied();
                 let mut translations = std::mem::take(&mut all_translations[i]);
-                if source_langs[i].is_ok() {
+                if let Some(src) = detected {
                     translations
-                        .entry(src_code.clone())
+                        .entry(src)
                         .or_insert_with(|| batch.texts[i].clone());
                 }
                 TranslationResult {
                     source_text: batch.texts[i].clone(),
-                    detected_language: src_code,
+                    detected_language: detected,
                     translations,
                     errors: std::mem::take(&mut all_errors[i]),
                 }

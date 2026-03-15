@@ -106,8 +106,11 @@ Translate one or more texts into one or more target languages.
 }
 ```
 
-The `errors` key maps target language codes to error messages for any translations
-that failed individually. It is omitted from the response when empty.
+The `errors` key maps target language codes to structured error objects for any
+translations that failed individually. Each error is a JSON object with `type` and
+`message` fields, e.g. `{"type":"TranslationFailed","message":"inference timeout"}`.
+Possible types: `DetectionFailed`, `UnsupportedLanguage`, `TranslationFailed`.
+The key is omitted from the response when empty.
 
 **Example**
 
@@ -144,8 +147,7 @@ Detect the language of a piece of text.
 
 ```json
 {
-  "language_code": "fr",
-  "language": "French",
+  "language": "fr",
   "confidence": 0.87,
   "translation_supported": true
 }
@@ -153,8 +155,7 @@ Detect the language of a piece of text.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `language_code` | `string` | ISO 639-1 code of the detected language |
-| `language` | `string` | Full English name of the detected language |
+| `language` | `string \| null` | ISO 639-1 code of the detected language, or `null` if detection yields an unsupported language |
 | `confidence` | `number` | Relative confidence score in `[0, 1]` — see below |
 | `translation_supported` | `bool` | Whether the detected language can be used as a source or target for `/translate` |
 
