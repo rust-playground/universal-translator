@@ -2,14 +2,21 @@ use std::future::Future;
 use std::time::Duration;
 
 use futures::Stream;
-use translator_core::Language;
 use translator_core::types::{
-    LanguageDetectionResult, TranslationRequest, TranslationResult, TranslationResultSet,
+    LanguageDetectionResult, LanguageEntry, TranslationRequest, TranslationResult,
+    TranslationResultSet,
 };
 
 use crate::error::ClientError;
 use crate::retry::RetryConfig;
 use crate::stream::parse_sse_stream;
+
+/// Internal selector for `/languages?for=`.
+#[derive(Copy, Clone)]
+enum LanguagesFor {
+    Translate,
+    Detect,
+}
 
 /// HTTP client for the Universal Translator API.
 #[derive(Clone)]
@@ -130,17 +137,34 @@ impl TranslatorClient {
         Ok(parse_sse_stream(resp))
     }
 
-    /// GET `/languages` — list supported languages with retry.
-    pub async fn languages(&self) -> Result<Vec<Language>, ClientError> {
+    /// GET `/languages` — list translate-supported languages with retry.
+    pub async fn languages(&self) -> Result<Vec<LanguageEntry>, ClientError> {
+        self.languages_for(LanguagesFor::Translate).await
+    }
+
+    /// GET `/languages?for=detect` — list detect-supported codes (broader
+    /// than translate; includes lingua's full coverage plus script and
+    /// heuristic refinements). Codes returned here may not round-trip into
+    /// translation; check against `languages()` to know what translate accepts.
+    pub async fn languages_detect(&self) -> Result<Vec<LanguageEntry>, ClientError> {
+        self.languages_for(LanguagesFor::Detect).await
+    }
+
+    async fn languages_for(&self, kind: LanguagesFor) -> Result<Vec<LanguageEntry>, ClientError> {
         #[derive(serde::Deserialize)]
         struct Resp {
-            languages: Vec<Language>,
+            languages: Vec<LanguageEntry>,
         }
+
+        let suffix = match kind {
+            LanguagesFor::Translate => "?for=translate",
+            LanguagesFor::Detect => "?for=detect",
+        };
 
         self.with_retry(|| async {
             let resp = self
                 .http
-                .get(format!("{}/languages", self.base_url))
+                .get(format!("{}/languages{suffix}", self.base_url))
                 .send()
                 .await?;
             let resp: Resp = handle_response(resp).await?;

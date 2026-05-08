@@ -33,8 +33,8 @@ ut translate -t TEXT [-t TEXT ...] -l LANG[,LANG...] [-s SOURCE] [--output prett
 | Flag | Description |
 |------|-------------|
 | `-t`, `--text TEXT` | Text to translate. Required. Repeat for multiple inputs. |
-| `-l`, `--language LANG` | Target language ISO 639-1 code. Required. Comma-separated or repeated. |
-| `-s`, `--source LANG` | Source language ISO 639-1 code. Skips auto-detection when supplied. All texts in the batch are assumed to be in this language. |
+| `-l`, `--language LANG` | Target BCP 47 code (`fr`, `pt-BR`, `zh-Hant`). Required. Comma-separated or repeated. Dash and underscore both accepted; case-insensitive. |
+| `-s`, `--source LANG` | Source BCP 47 code. Skips auto-detection when supplied. All texts in the batch are assumed to be in this language. |
 | `--output pretty\|json` | Output format (default: `pretty`) |
 
 **Pretty output** (default):
@@ -71,6 +71,13 @@ ut translate -t "Hello world" -l fr
 ut translate -t "Hello world" -l fr,de,ja
 ut translate -t "Hello world" -l fr -l de -l ja
 
+# Regional variants — pt-BR vs pt-PT, zh-Hant vs zh-Hans
+ut translate -t "Hello world" -l pt-BR,pt-PT
+ut translate -t "Hello world" -l zh-Hant,zh-Hans
+
+# Underscore form is also accepted
+ut translate -t "Hello world" -l pt_BR,fr_CA
+
 # Multiple input texts
 ut translate -t "Hello world" -t "Good morning" -l fr
 
@@ -100,7 +107,21 @@ ut detect-language TEXT [--output pretty|json]
 **Pretty output** (default):
 
 ```
-Language: French (fr) — confidence: 87.3% — translation supported: yes
+Language: French (fr) — confidence: 87.3%
+```
+
+When the detector emits an alias whose translate-side equivalent is a
+different code (e.g. Bokmål `nb` → `no`, Tagalog `tl` → `fil`), the line
+includes a `translate as` clause:
+
+```
+Language: Bokmal (nb) — translate as: no — confidence: 92.0%
+```
+
+For text the detector recognizes but translate can't accept (e.g. Welsh):
+
+```
+Language: Welsh (cy) — confidence: 91.0% — translation supported: no
 ```
 
 **JSON output** (`--output json`) — `LanguageDetectionResult`:
@@ -108,10 +129,18 @@ Language: French (fr) — confidence: 87.3% — translation supported: yes
 ```json
 {
   "language": "fr",
-  "confidence": 0.873,
-  "translation_supported": true
+  "translate_language": "fr",
+  "confidence": 0.873
 }
 ```
+
+`language` is the raw BCP 47 code from the detector (may include script
+subtags like `zh-CN` or heuristic regional tags like `pt-BR`).
+`translate_language` is the same code mapped into the translate-side
+`Language` enum via the standard FromStr aliases (`nb`/`nn` → `no`,
+`tl` → `fil`, `iw` → `he`, etc.); `null` for lingua-only languages the
+engine can't translate from. Pass either form to `ut translate -s …` —
+both work via FromStr.
 
 `confidence` is a relative score in `[0, 1]`. See
 [API.md — confidence score semantics](API.md#confidence-score-semantics) for the
@@ -128,8 +157,10 @@ ut detect-language "مرحبا بالعالم" --output json
 
 ### detect
 
-Detect the language of a text and print only the ISO 639-1 language code. Lightweight
-alternative to `detect-language` when you only need the code.
+Detect the language of a text and print only the BCP 47 code. Lightweight
+alternative to `detect-language` when you only need the code. Returned codes
+may include script tags (`zh-Hant`, `sr-Cyrl`) or heuristic regional tags
+(`pt-BR`, `en-US`, `fr-CA`).
 
 ```
 ut detect TEXT [--output pretty|json]
@@ -166,33 +197,39 @@ ut detect "Hello world" --output json
 
 ### languages
 
-List all supported languages.
+List supported languages for either translate or detect.
 
 ```
-ut languages [--filter STRING] [--output pretty|json]
+ut languages [--for translate|detect] [--filter STRING] [--output pretty|json]
 ```
 
 | Flag | Description |
 |------|-------------|
+| `--for translate\|detect` | Which side's list to print (default: `translate`). The detect list is broader: lingua's 75 base languages plus deterministic script refinements (`zh-Hant`, `sr-Cyrl`) and best-effort heuristic regional codes (`pt-BR`, `en-US`). Codes from the detect list may not round-trip into translation. |
 | `--filter STRING` | Case-insensitive substring filter on code or language name |
 | `--output pretty\|json` | Output format (default: `pretty`) |
 
 **Pretty output** (default):
 
 ```
-af     afrikaans
-am     amharic
-ar     arabic
+af         Afrikaans
+ar         Arabic
+ar-EG      Egyptian Arabic
+ar-SA      Saudi Arabic
 ...
-55 language(s)
+pt-BR      Brazilian Portuguese
+pt-PT      European Portuguese
+...
+70 language(s)
 ```
 
 **JSON output** (`--output json`):
 
 ```json
 [
-  { "code": "af", "name": "afrikaans" },
-  { "code": "am", "name": "amharic" },
+  { "code": "af", "name": "Afrikaans" },
+  { "code": "ar", "name": "Arabic" },
+  { "code": "ar-EG", "name": "Egyptian Arabic" },
   ...
 ]
 ```
@@ -200,8 +237,11 @@ ar     arabic
 **Examples**
 
 ```bash
-# List all languages
+# List translate-supported languages (default)
 ut languages
+
+# List detect-supported codes (broader; includes zh-Hant, sr-Cyrl, cy, ka, etc.)
+ut languages --for detect
 
 # Filter by name or code
 ut languages --filter french

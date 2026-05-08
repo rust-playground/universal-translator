@@ -63,7 +63,7 @@ Scenarios (positional args, default: all):
 | Scenario | Endpoint | Description |
 |----------|----------|-------------|
 | `translate-en-fr` | `POST /translate` | Single target language (fr) — isolates per-request latency |
-| `translate-en-all` | `POST /translate` | All 54 non-English languages — measures fan-out / batch efficiency |
+| `translate-en-all` | `POST /translate` | All 69 non-English languages and locales — measures fan-out / batch efficiency |
 | `detect` | `POST /detect-language` | Language detection |
 | `languages` | `GET /languages` | List supported languages |
 | `health` | `GET /health` | Health check |

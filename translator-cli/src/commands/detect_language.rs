@@ -24,28 +24,45 @@ impl DetectLanguageArgs {
     pub fn run(self, _models_dir: &Path) -> Result<()> {
         let detector = Detector::new();
         let (code, language_name, confidence) = detector.detect_with_confidence(&self.text)?;
-        let lang = code.parse::<Language>().ok();
+        let translate_language = code.parse::<Language>().ok();
 
         match self.output {
             OutputFormat::Json => println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "language": lang,
+                    "language": code,
+                    "translate_language": translate_language,
                     "confidence": confidence,
-                    "translation_supported": lang.is_some(),
                 }))?
             ),
-            OutputFormat::Pretty => {
-                let supported = if lang.is_some() { "yes" } else { "no" };
-                let lang_display = lang.map(|l| l.code()).unwrap_or(&code);
-                println!(
-                    "Language: {} ({}) — confidence: {:.1}% — translation supported: {}",
-                    language_name,
-                    lang_display,
-                    confidence * 100.0,
-                    supported,
-                );
-            }
+            OutputFormat::Pretty => match translate_language {
+                Some(lang) if lang.code() != code => {
+                    // Detector emitted an alias (e.g. "nb"); show the mapping.
+                    println!(
+                        "Language: {} ({}) — translate as: {} — confidence: {:.1}%",
+                        language_name,
+                        code,
+                        lang.code(),
+                        confidence * 100.0,
+                    );
+                }
+                Some(_) => {
+                    println!(
+                        "Language: {} ({}) — confidence: {:.1}%",
+                        language_name,
+                        code,
+                        confidence * 100.0,
+                    );
+                }
+                None => {
+                    println!(
+                        "Language: {} ({}) — confidence: {:.1}% — translation supported: no",
+                        language_name,
+                        code,
+                        confidence * 100.0,
+                    );
+                }
+            },
         }
         Ok(())
     }

@@ -1,5 +1,6 @@
 pub mod chunking;
 pub mod detector;
+pub mod dialect;
 pub mod engine;
 pub mod error;
 pub mod language;

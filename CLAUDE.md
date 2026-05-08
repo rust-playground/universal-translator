@@ -37,46 +37,87 @@ Default `MODEL_PATH`: platform cache directory (via `dirs` crate) + `ut/models/t
 ## Running
 
 ```bash
-# CLI
-cargo run -p translator-cli -- translate -t "Hello world" -l fr,de,ja
-cargo run -p translator-cli -- languages
-cargo run -p translator-cli -- detect -t "Bonjour"
+# CLI (`ut` binary)
+cargo run -p translator-cli -- translate -t "Hello world" -l fr,de,ja          # base codes
+cargo run -p translator-cli -- translate -t "Hello world" -l pt-BR,zh-Hant     # regional variants (dash or underscore, case-insensitive)
+cargo run -p translator-cli -- detect -t "Bonjour"                              # returns BCP 47 string
+cargo run -p translator-cli -- detect-language "Bonjour" --output json          # full result with confidence + translate_language
+cargo run -p translator-cli -- languages                                        # translate-supported (default; 70 entries)
+cargo run -p translator-cli -- languages --for detect                            # broader detect-supported list (95 entries)
 
 # API server (http://localhost:3000)
 cargo run -p translator-api
 ```
 
-Key CLI flags: `--model-path`, `--output json`.
+Subcommands: `translate`, `detect`, `detect-language`, `languages`, `setup`.
+
+Global CLI flags: `--model-path`, plus per-command `--output pretty|json`.
+Subcommand-specific: `languages --for translate|detect`.
 Key API env vars: `MODEL_PATH`, `RUST_LOG`.
 
 ## Architecture
 
-3-crate workspace:
+4-crate workspace:
 
-- **`translator-core`** — library crate: engine, model, detector, types, error
-- **`translator-cli`** — `ut` binary: Clap CLI with `translate`, `detect`, `languages` subcommands
-- **`translator-api`** — Axum HTTP server: `POST /translate`, `GET /languages`, `GET /health`
+- **`translator-core`** — library: engine, scheduler, model loader, detector, dialect heuristics, language enum, types, error
+- **`translator-cli`** — `ut` binary, Clap CLI
+- **`translator-api`** — Axum HTTP server
+- **`translator-api-client`** — typed Rust client for the API (used by `load-test`)
+
+### API endpoints
+
+- `POST /translate` — batch translate; accepts `texts`, `target_languages` (list or `["all"]`), optional `source_language`
+- `POST /translate/stream` — same input, SSE stream of per-text results
+- `POST /detect-language` — returns `{ language, translate_language, confidence }`
+- `GET /languages?for=translate|detect` — list supported codes (default `translate`)
+- `GET /health` — liveness
 
 ### Inference stack
 
-- **Model**: TranslateGemma 4B — Gemma 3 4B instruction-tuned decoder-only model for all 55 languages
-- **Framework**: [llama.cpp](https://github.com/ggerganov/llama.cpp) via the `llama-cpp-2` Rust crate
-- **Tokenizer**: embedded in the GGUF file (no separate `tokenizer.json` needed)
-- **Language detection**: Lingua (75+ languages) with script-based fallback for Malayalam
+- **Model**: TranslateGemma 4B (Gemma 3 4B instruction-tuned, decoder-only). Translate-side `Language` enum has 70 variants: 55 base + 4 added base (`He`, `Is`, `Fil`, `Zu`) + 11 WMT24++ regional pairs (`ar_EG`, `ar_SA`, `es_MX`, `fr_CA`, `fr_FR`, `pt_BR`, `pt_PT`, `sw_KE`, `sw_TZ`, `zh_CN`, `zh_TW`). Variant naming: `pt_BR` style under `#[allow(non_camel_case_types)]`; `code()` returns BCP 47 dash form (`"pt-BR"`).
+- **Framework**: [llama.cpp](https://github.com/ggerganov/llama.cpp) via `llama-cpp-2`
+- **Tokenizer**: embedded in the GGUF file
+- **Prompt**: `translate_gemma_prompt` uses BCP 47 codes (`"Translate from en to pt-BR:"`) — matches the official TranslateGemma chat-template format and threads regional info to the model.
+
+### Language detection (`detector.rs` + `dialect.rs`)
+
+Pipeline. Each step is non-destructive — falls through to the previous result on no commit. Full pipeline returns a `String` (BCP 47) — broader than the translate enum.
+
+1. **Lingua** — 75 base ISO 639-1 / 639-3 codes (parallel detection via Rayon for batches).
+2. **Script disambiguation** (deterministic, Unicode-block tests, no false positives) — `zh-CN`/`zh-TW` (Han Simplified vs Traditional character-set membership), `sr-Cyrl`/`sr-Latn`, `az-Cyrl`/`az-Latn`/`az-Arab`, `pa-Guru`/`pa-Arab`, `mn-Cyrl`/`mn-Mong`.
+3. **Heuristic dialect markers** (`dialect.rs`, best-effort) — Aho-Corasick word-boundary scoring with **streaming early-return** (commit when winner ≥ 2 hits and beats loser by ≥ 2). Currently covers `pt-BR`/`pt-PT`, `en-US`/`en-GB`, `fr-CA`/`fr-FR`.
+4. **Malayalam (`ml`) script-only fallback** when lingua returns nothing.
+
+`LanguageDetectionResult { language: String, translate_language: Option<Language>, confidence: f64 }`. `language` is the raw detector output; `translate_language` is the same code parsed via `Language::FromStr` — surfaces aliases (`nb`/`nn` → `no`, `tl` → `fil`, `iw` → `he`, `zh-Hans` → `zh-CN`, `pt-AO` → `pt`). One mapping table, two consumers (input parsing on `/translate` and output mapping on `/detect-language`).
+
+**Boundary contract:** detect's universe is broader than the translate enum. The engine's auto-detect-source path returns `UnsupportedLanguage` (not `DetectionFailed`) when the detected code is lingua-only (e.g. `cy` Welsh, `ka` Georgian). Pass an explicit `source_language` to translate from those.
+
+See `README.md` for the canonical 107-entry support table.
 
 ### Core data flow (`engine.rs`)
 
-1. **Detection** — parallel Lingua detection or normalise user-supplied source language
-2. **Work building** — flatten texts × target languages; build Gemma instruct-format prompt with system turn and `Translate from X to Y:` user turn
-3. **Worker dispatch** — send to dedicated scheduler thread via crossbeam channel; concurrent requests are coalesced into a single batch
-4. **Inference** — `LoadedGemmaModel` + `ContinuousScheduler` runs batched decode via `LlamaContext` with temperature/top-k/top-p sampling
+1. **Detection** — parallel Lingua + post-processing per text (or pass-through if caller supplied `source_language`). Detect output is parsed via `Language::from_str`; lingua-only codes → `UnsupportedLanguage`.
+2. **Work building** — flatten texts × target languages; build Gemma instruct-format prompt with system turn and `Translate from <src-code> to <tgt-code>:` user turn (BCP 47 codes, not English names).
+3. **Worker dispatch** — send to dedicated scheduler thread via crossbeam channel; concurrent requests coalesce into a single batch.
+4. **Inference** — `LoadedGemmaModel` + `ContinuousScheduler` runs batched decode via `LlamaContext` with temperature / top-k / top-p sampling, repetition penalty, no-repeat n-gram, length bias.
 
 ### Key design decisions
 
 - `TranslationEngine` is `Clone`-cheap (Arc-backed internals)
-- Single model instance loaded synchronously at startup, shared read-only via `Arc<LoadedGemmaModel>`
+- Single model loaded synchronously at startup, shared read-only via `Arc<LoadedGemmaModel>`
 - Token limits: 4 096 tokens max output (SLOT_CAPACITY)
 - Same-language shortcut: returns original text without inference
+- Auto-chunking at `\n\n` paragraph boundaries (Unicode sentence fallback) for long inputs; reassembled before returning
+- `Language::FromStr` accepts dash and underscore, case-insensitive; unknown region tags fall back to base with a `tracing::debug!`
+
+### Key dependencies
+
+- `llama-cpp-2` (vendored llama.cpp) — inference
+- `lingua` — base language detection
+- `aho-corasick` — dialect heuristic matcher
+- `rayon` — parallel detection
+- `crossbeam-channel` — scheduler queue
+- `axum` — HTTP server, `tokio` runtime; CLI is plain sync `fn main`
 
 ## CI
 

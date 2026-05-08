@@ -24,7 +24,13 @@ the engine and scheduler.
 ## Model
 
 **TranslateGemma 4B** — Gemma 3 4B instruction-tuned, decoder-only, fine-tuned for
-translation across 55 languages.
+translation. The translate-side `Language` enum exposes 70 entries: 55 base
+ISO 639-1 codes (the original set) + 4 base codes added for WMT24++ coverage
+(`he`, `is`, `fil`, `zu`) + 11 regional pairs from WMT24++ (`ar-EG`,
+`ar-SA`, `es-MX`, `fr-CA`, `fr-FR`, `pt-BR`, `pt-PT`, `sw-KE`, `sw-TZ`,
+`zh-CN`, `zh-TW`). 8 of the original codes (`af`, `am`, `ha`, `ms`, `mt`,
+`ne`, `si`, `yi`) sit outside the WMT24++ training distribution and are
+best-effort.
 
 - Weights: GGUF quantised — two formats supported:
   - **Q8_0** (`model-q8_0.gguf`, ~4.1 GB) — default, higher precision
@@ -117,17 +123,57 @@ Parameters are defined in `translator-core/src/scheduler/sampling.rs`.
 
 ## Language detection
 
-Source language detection uses two layers:
+`Detector::detect` returns a BCP 47 `String`. The pipeline runs four layers,
+each non-destructive — every step either refines the previous result or
+passes it through unchanged:
 
-1. **Lingua** (`lingua-rs`) — statistical n-gram model covering 75+ languages.
-   Detection runs in parallel for multi-text requests.
+1. **Lingua** (`lingua-rs`) — statistical n-gram model covering 75 base
+   languages. Returns the raw ISO 639-1 (or 639-3 for `fil` / `tl`) code in
+   lowercase. Detection runs in parallel for multi-text requests.
+2. **Script disambiguation** (deterministic, no false positives) — Unicode
+   block / character-set membership refines specific base codes:
+   - `zh` → `zh-CN` / `zh-TW` via Simplified-only vs Traditional-only
+     character set lookup. Region form (matches WMT24++); FromStr accepts
+     the script form (`zh-Hans` / `zh-Hant`) as input alias.
+   - `sr` → `sr-Cyrl` / `sr-Latn`
+   - `az` → `az-Cyrl` / `az-Latn` / `az-Arab`
+   - `pa` → `pa-Guru` / `pa-Arab`
+   - `mn` → `mn-Cyrl` / `mn-Mong`
+   When the script doesn't match any rule, the base code passes through.
+3. **Heuristic dialect refinement** (`translator-core/src/dialect.rs`) —
+   marker word/phrase scoring for same-script regional pairs:
+   - `pt` → `pt-BR` / `pt-PT`
+   - `en` → `en-US` / `en-GB`
+   - `fr` → `fr-CA` / `fr-FR`
+   Aho-Corasick matcher with word-boundary check; commits when one side
+   has ≥ 2 hits and beats the other by a margin of ≥ 2. **Streaming with
+   early return** — scanning aborts as soon as the threshold is met, so
+   cost is bounded on large inputs. If neither side commits, the base
+   code passes through. Best-effort: short or neutral text typically
+   yields no commit.
+4. **Malayalam script fallback** — Malayalam (`ml`) is detected via the
+   U+0D00–U+0D7F block when Lingua returns no result.
 
-2. **Unicode script fallback** — Malayalam (`ml`) is detected via Unicode block
-   analysis (U+0D00–U+0D7F) when Lingua returns no result. This handles script-
-   distinctive text that Lingua may under-represent.
+**Boundary contract.** The detect universe is broader than the translate-side
+`Language` enum. Codes returned by step 1 may be lingua-only (`cy`, `ka`,
+`eu`, `eo`, `la`); codes from step 2 may be script tags not in the enum
+(`sr-Cyrl`, `pa-Guru`, `mn-Mong`). When the engine's auto-detect path can't
+parse the detected code into a `Language`, it returns `UnsupportedLanguage`
+with a clear message rather than silently falling back. Callers wanting the
+broader detect surface for non-translation use cases can call the detector
+directly and parse the string themselves.
 
-Detection is skipped entirely when the caller supplies a `source_language` field in
-the request; the supplied code is normalised and used directly.
+`POST /detect-language` returns both the raw detect code (`language`) and
+its translate-side equivalent (`translate_language: Option<Language>`) —
+the latter applies `Language::FromStr` and surfaces the standard alias
+mapping (`nb`/`nn` → `no`, `tl` → `fil`, `iw` → `he`, `zh-Hans` → `zh-CN`,
+unknown region tags → base, etc.). One mapping table, two consumers
+(input parsing on `/translate` and output mapping on `/detect-language`).
+
+Detection is skipped entirely when the caller supplies a `source_language`
+field; the supplied code is parsed via `Language::FromStr` (BCP 47, dash or
+underscore, case-insensitive) and used directly. Unknown region tags fall
+back to the base language (e.g. `pt-AO` → `Pt`) with a debug log.
 
 ### Confidence score
 

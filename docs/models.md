@@ -119,7 +119,7 @@ Cloudflare R2 has no egress fees, which makes it cost-effective for frequent dow
 
 ---
 
-## Lingua: fully local language detection
+## Language detection: fully local
 
 universal-translator uses [Lingua](https://github.com/pemistahl/lingua-rs) to
 automatically detect the source language of incoming text. Lingua is entirely
@@ -127,7 +127,39 @@ self-contained:
 
 - All language model data is compiled directly into the binary as Rust crates —
   there are no external data files to manage.
-- Detection covers 75+ languages.
+- Detection covers 75 base languages.
 - Zero network calls are made at runtime. Lingua works completely offline.
 
+On top of lingua's base output, the detector layers two passes for regional
+granularity (see [ENGINE.md](../ENGINE.md#language-detection) for the full
+pipeline):
+
+- **Script disambiguation** — deterministic Unicode-block tests for
+  `zh-CN`/`zh-TW` (Han Simplified vs Traditional character-set membership),
+  `sr-Cyrl`/`sr-Latn`, `az-Cyrl`/`az-Latn`/`az-Arab`,
+  `pa-Guru`/`pa-Arab`, `mn-Cyrl`/`mn-Mong`. No false positives.
+- **Heuristic dialect markers** — best-effort word/phrase scoring for
+  `pt-BR`/`pt-PT`, `en-US`/`en-GB`, `fr-CA`/`fr-FR`. Returns the base code
+  when text is too short or neutral to commit.
+
+Pure-dialect pairs without a script difference (e.g. `ar-EG` vs `ar-SA`,
+`sw-KE` vs `sw-TZ`) return the base code — no off-the-shelf detector
+distinguishes them reliably.
+
 No configuration is required for language detection.
+
+## Translate-side language set
+
+The `Language` enum exposes 70 entries: 55 base ISO 639-1 codes + 4 added
+base codes (`he`, `is`, `fil`, `zu`) + 11 regional pairs from the WMT24++
+training set. The
+[WMT24++ dataset](https://huggingface.co/datasets/google/wmt24pp) is the
+canonical training set for TranslateGemma's regional variants. Inputs accept
+BCP 47 in dash or underscore form (`pt-BR`, `pt_BR`); the `code()` returned
+by the API/CLI is always the dash form. Unknown region tags fall back to
+the base language (e.g. `pt-AO` → `pt`).
+
+The TranslateGemma model card documents that `source_lang_code` and
+`target_lang_code` accept either ISO 639-1 alpha-2 codes (`en`) or
+regionalized variants (`en_US`, `en-GB`). The engine forwards regional
+codes verbatim.

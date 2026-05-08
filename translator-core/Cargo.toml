@@ -22,4 +22,5 @@ crossbeam-channel    = "0.5"
 rayon                = "1"
 encoding_rs          = "0.8"
 unicode-segmentation = "1"
+aho-corasick         = { workspace = true }
 opentelemetry        = { workspace = true, optional = true }
