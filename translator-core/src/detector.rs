@@ -462,11 +462,11 @@ fn is_assamese_distinctive(c: char) -> bool {
 
 /// Sorani Kurdish-distinctive letters within the Arabic script block.
 /// These extended Arabic letters are used in Sorani Kurdish but not in
-/// standard Arabic: ێ (U+06ED yeh barree with hamza below), ۆ (U+06C6 oe),
-/// ڕ (U+0695 reh with small v below), ڵ (U+06B5 lam with small v below),
+/// standard Arabic: ێ (U+06CE yeh with small v), ۆ (U+06C6 oe),
+/// ڕ (U+0695 reh with small v below), ڵ (U+06B5 lam with small v),
 /// ڤ (U+06A4 veh).
 fn is_sorani_distinctive(c: char) -> bool {
-    matches!(c as u32, 0x06ED | 0x06C6 | 0x0695 | 0x06B5 | 0x06A4)
+    matches!(c as u32, 0x06CE | 0x06C6 | 0x0695 | 0x06B5 | 0x06A4)
 }
 
 #[cfg(test)]
