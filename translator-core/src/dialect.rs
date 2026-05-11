@@ -259,20 +259,34 @@ fn hi_ne_pair() -> &'static Pair {
             "होगी",      // future feminine
             "के लिए",   // "for" (Nepali: को लागि)
         ];
-        // Nepali-distinctive: copula छ family, future हुनेछ, passive participle,
-        // Nepali day names, polite pronoun.
+        // Nepali-distinctive: copula छ family, verb morphology, postpositions,
+        // day names, polite pronoun. Multiple high-frequency forms so commit
+        // threshold (≥2 hits, ≥2 margin) fires on typical sentences.
         let ne: &[&str] = &[
-            "छन्",        // plural copula
-            "हुनेछ",      // future copula
-            "गरिने",      // passive participle
-            "गरिएको",    // past passive participle
-            "बिहीबार",   // Thursday (Nepali-specific spelling)
-            "नेपाल",      // Nepal — country name
-            "होइन",       // "is not" (Nepali; Hindi uses नहीं है)
-            "तपाईं",      // polite "you" (Hindi uses आप)
-            "गर्दछ",     // "does" (Nepali present)
-            "भन्ने",      // "saying" — Nepali subordinator
-            "हुन्छ",      // "becomes/is" (Nepali)
+            "छन्",         // plural copula
+            "हुनेछ",       // future copula
+            "हुन्छ",       // present "becomes/is"
+            "हुनुहोस्",   // polite imperative copula
+            "गर्नुहोस्",  // polite imperative "do"
+            "सक्नुहुन्छ", // polite "can"
+            "गरिने",       // passive participle (gerund)
+            "गरिएको",     // past passive participle
+            "गर्नु",       // infinitive
+            "गर्ने",       // gerund
+            "गर्दछ",      // habitual present
+            "गरे",         // past
+            "गरिए",        // past passive
+            "उनले",        // 3sg ergative
+            "तपाईं",       // polite "you"
+            "तपाईंले",    // polite ergative
+            "आफ्नो",       // reflexive possessive
+            "आइपुग्यो",   // past "arrived" (Nepali; Hindi uses पहुँच)
+            "बिहीबार",    // Thursday
+            "बिहान",       // morning (Nepali preferred over Hindi सुबह)
+            "नेपाल",       // Nepal
+            "होइन",        // "is not"
+            "भन्ने",       // subordinator "saying"
+            "ल्याउनुहोस्", // polite imperative "bring"
         ];
         Pair::build("hi", hi, "ne", ne)
     })

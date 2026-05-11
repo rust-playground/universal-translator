@@ -36,6 +36,9 @@ impl Detector {
         if let Some(code) = detect_script_only(text) {
             return Ok(code.to_string());
         }
+        if let Some(code) = detect_within_script_override(text) {
+            return Ok(code.to_string());
+        }
         if let Some(lang) = self.inner.detect_language_of(text) {
             let base = lingua_to_bcp47(&lang);
             return Ok(refine(&base, text));
@@ -72,6 +75,9 @@ impl Detector {
         if let Some(code) = detect_script_only(text) {
             return Ok((code.to_string(), script_only_name(code).to_string(), 1.0));
         }
+        if let Some(code) = detect_within_script_override(text) {
+            return Ok((code.to_string(), script_only_name(code).to_string(), 1.0));
+        }
         let values = self.inner.compute_language_confidence_values(text.to_string());
         let mut iter = values.into_iter();
         if let Some((lang, top)) = iter.next() {
@@ -93,15 +99,45 @@ impl Detector {
 fn script_only_name(code: &str) -> &'static str {
     match code {
         "ml" => "Malayalam",
+        "kn" => "Kannada",
+        "ta" => "Tamil",
+        "te" => "Telugu",
+        "gu" => "Gujarati",
+        "pa" => "Punjabi",
+        "or" => "Oriya",
         "km" => "Khmer",
         "lo" => "Lao",
         "my" => "Burmese",
         "bo" => "Tibetan",
         "si" => "Sinhala",
         "am" => "Amharic",
-        "or" => "Oriya",
+        "as" => "Assamese",
+        "ckb" => "Central Kurdish",
+        "yi" => "Yiddish",
         _ => "",
     }
+}
+
+/// Highly-distinctive within-script overrides that run **before** lingua.
+///
+/// Some characters are so unique to a specific language that we should commit
+/// regardless of what lingua thinks. Without this, lingua often misroutes
+/// Assamese text to `hi` (when mixed with Devanagari) or Sorani Kurdish to
+/// `fa`/`ur`, and the later `script_disambiguate` step never fires because
+/// the base it dispatches on (`bn`, `ar`) doesn't match lingua's output.
+fn detect_within_script_override(text: &str) -> Option<&'static str> {
+    for c in text.chars() {
+        let cp = c as u32;
+        // Assamese-distinctive letters: ৰ (U+09F0), ৱ (U+09F1).
+        if matches!(cp, 0x09F0 | 0x09F1) {
+            return Some("as");
+        }
+        // Sorani Kurdish-distinctive letters: ێ ۆ ڕ ڵ ڤ.
+        if matches!(cp, 0x06CE | 0x06C6 | 0x0695 | 0x06B5 | 0x06A4) {
+            return Some("ckb");
+        }
+    }
+    None
 }
 
 impl Default for Detector {
@@ -289,18 +325,22 @@ fn script_disambiguate(base: &str, text: &str) -> Option<&'static str> {
 
 /// Detect Yiddish within Hebrew script.
 ///
-/// Yiddish writes double-vav (וו) and double-yod (יי) as two adjacent characters
-/// — common pattern in Yiddish words (`וועט`, `דייטש`), rare in modern Hebrew.
-/// Also commits on the precomposed Hebrew Ligatures (`װ` U+05F0, `ױ` U+05F1,
-/// `ײ` U+05F2) which are Yiddish-exclusive.
+/// Yiddish orthography uses Hebrew niqqud (vowel marks) routinely — `אַ`, `אָ`,
+/// `פּ`, `פֿ`, `ייִ`, etc. — while modern Hebrew almost never includes niqqud in
+/// conversational prose. Combined with the precomposed Hebrew Ligatures
+/// (`װ` U+05F0, `ױ` U+05F1, `ײ` U+05F2, all Yiddish-exclusive), these are
+/// reliable signals.
+///
+/// Raw double-vav (וו) and double-yod (יי) digraphs are NOT used as signals
+/// here — they appear legitimately in modern Hebrew (`הכנסייה` synagogue,
+/// `האוויר` the air) and would cause false positives.
 fn disambiguate_yiddish(text: &str) -> Option<&'static str> {
     for c in text.chars() {
-        if matches!(c as u32, 0x05F0..=0x05F2) {
+        let cp = c as u32;
+        // Niqqud (U+05B0..U+05BD, U+05BF) + Yiddish ligatures (U+05F0..U+05F2).
+        if matches!(cp, 0x05B0..=0x05BD | 0x05BF | 0x05F0..=0x05F2) {
             return Some("yi");
         }
-    }
-    if text.contains("\u{05D5}\u{05D5}") || text.contains("\u{05D9}\u{05D9}") {
-        return Some("yi");
     }
     None
 }
@@ -519,11 +559,11 @@ mod tests {
     }
 
     #[test]
-    fn yiddish_double_letter_digraphs_refine_he() {
-        // וו (double vav) in וועט — classic Yiddish.
-        assert_eq!(script_disambiguate("he", "וועט קומען"), Some("yi"));
-        // יי (double yod) in דייטש.
-        assert_eq!(script_disambiguate("he", "דייטש"), Some("yi"));
+    fn yiddish_niqqud_refines_he() {
+        // אַ (alef + patach U+05B7) — standard Yiddish.
+        assert_eq!(script_disambiguate("he", "אַ גוט"), Some("yi"));
+        // קאָנפערענס has אָ (alef + kamatz U+05B8).
+        assert_eq!(script_disambiguate("he", "די קאָנפערענס"), Some("yi"));
     }
 
     #[test]
@@ -533,8 +573,36 @@ mod tests {
     }
 
     #[test]
-    fn hebrew_without_yiddish_markers_returns_none() {
+    fn modern_hebrew_with_raw_digraphs_returns_none() {
+        // הכנסייה (synagogue) has יי; האוויר (the air) has וו. Both are
+        // legitimate Hebrew — would have false-positived under a raw-digraph
+        // heuristic.
+        assert_eq!(script_disambiguate("he", "הכנסייה תתקיים"), None);
+        assert_eq!(script_disambiguate("he", "האוויר נקי"), None);
         assert_eq!(script_disambiguate("he", "שלום עליכם"), None);
+    }
+
+    #[test]
+    fn within_script_override_routes_assamese_before_lingua() {
+        // ৰ (U+09F0) is Assamese-distinctive. Even mixed with Devanagari, the
+        // pre-lingua override should fire so lingua's `hi` guess doesn't win.
+        assert_eq!(detect_within_script_override("शहরৰ कেন्द्र"), Some("as"));
+        assert_eq!(detect_within_script_override("ৱাণিজ্য"), Some("as"));
+    }
+
+    #[test]
+    fn within_script_override_routes_sorani_before_lingua() {
+        // ێ (U+06CE), ڕ (U+0695) — even when mixed with other Arabic-script,
+        // commit to ckb up front.
+        assert_eq!(detect_within_script_override("ئەو کوێرە"), Some("ckb"));
+        assert_eq!(detect_within_script_override("هاوڕێ"), Some("ckb"));
+    }
+
+    #[test]
+    fn within_script_override_returns_none_on_plain_text() {
+        assert_eq!(detect_within_script_override("hello world"), None);
+        assert_eq!(detect_within_script_override("السلام عليكم"), None);
+        assert_eq!(detect_within_script_override("আমি বাংলা বলি"), None);
     }
 
     #[test]
