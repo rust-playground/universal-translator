@@ -11,18 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Regional locale variants on `Language`** — 11 new enum variants from the
   WMT24++ training set: `ar_EG`, `ar_SA`, `es_MX`, `fr_CA`, `fr_FR`,
-  `pt_BR`, `pt_PT`, `sw_KE`, `sw_TZ`, `zh_CN`, `zh_TW`. Plus 4 new base
-  codes: `He` (Hebrew), `Is` (Icelandic), `Fil` (Filipino), `Zu` (Zulu).
-  Total 70 variants. `code()` returns BCP 47 dash form
-  (`"pt-BR"`, `"zh-CN"`).
+  `pt_BR`, `pt_PT`, `sw_KE`, `sw_TZ`, `zh_CN`, `zh_TW`. Plus 3 new base
+  codes that round out the inherited best-effort set: `He` (Hebrew),
+  `Is` (Icelandic), `Fil` (Filipino). Plus 4 added regional (`en_GB`,
+  `en_US`, `es_ES`, `zh_HK`) and harness-validated additions covering
+  HubSpot Call Transcription Tier A/B/C/D codes the 4B model can actually
+  translate. Final total: **111 variants**. `code()` returns BCP 47 dash
+  form (`"pt-BR"`, `"zh-CN"`); `full_name()` returns English label
+  (`"Brazilian Portuguese"`).
+- **Script-only fast path** in `Detector` — before lingua, commits
+  unique-script blocks deterministically: `ml`, `kn`, `ta`, `te`, `gu`,
+  `pa` (Gurmukhi), `or`, `km`, `lo`, `my`, `bo`, `si`, `am` (Ethiopic
+  defaults to `am`; Tigrinya `ti` round-trips as `am`). Fixes detection
+  for languages lingua doesn't cover or misroutes.
+- **Within-script disambiguation** — `bn` → `as` (Assamese-distinctive
+  letters ৰ U+09F0, ৱ U+09F1 not present in standard Bengali);
+  `ar` → `ckb` (Sorani Kurdish letters ێ ۆ ڕ ڵ ڤ); `he` → `yi` (Yiddish
+  double-vav/yod digraphs `וו`/`יי` and precomposed ligatures U+05F0–U+05F2).
 - **Script-based detect refinement** — `Detector` post-processes lingua's
   base output via Unicode-block tests for `zh-CN`/`zh-TW`,
   `sr-Cyrl`/`sr-Latn`, `az-Cyrl`/`az-Latn`/`az-Arab`, `pa-Guru`/`pa-Arab`,
   `mn-Cyrl`/`mn-Mong`. Deterministic, no false positives.
 - **Heuristic dialect detection** (`translator-core/src/dialect.rs`) —
-  marker-word scoring with streaming early-return for same-script regional
-  pairs: `pt-BR`/`pt-PT`, `en-US`/`en-GB`, `fr-CA`/`fr-FR`. Best-effort;
-  short or neutral text returns the base code unchanged.
+  Aho-Corasick marker-word scoring with streaming early-return for
+  same-script regional / sibling-language pairs: `pt-BR`/`pt-PT`,
+  `en-US`/`en-GB`, `fr-CA`/`fr-FR`, `es-MX`/`es-ES`,
+  `zh-TW` → `zh-HK` (Cantonese particles), `hi` → `ne` (Nepali copula
+  `छन्`/`हुनेछ`, passive participle `गरिने`, day names `बिहीबार`, etc.).
+  Best-effort; short or neutral text returns the base code unchanged.
 - **`LanguageDetectionResult.translate_language: Option<Language>`** —
   translate-side enum equivalent of the detected code, populated via the
   existing `FromStr` aliases (`nb`/`nn` → `no`, `tl` → `fil`,
@@ -52,11 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Detector::detect` and `detect_with_confidence`** return `String` (BCP 47
   code) instead of `Language`. Detect's universe is broader than the
   translate-side enum and may include codes outside it.
-- **Translate prompt format** — `translate_gemma_prompt` now uses BCP 47
-  codes (`"Translate from en to pt-BR:"`) instead of English language
-  names. Aligns with the official TranslateGemma chat-template format
-  (`source_lang_code` / `target_lang_code`) and threads regional info
-  through to the model.
+- **Translate prompt format** — `translate_gemma_prompt` uses full
+  English language names with a target-script anchor in the system turn
+  (`"Output only the translated text in Brazilian Portuguese, using the
+  native script of Brazilian Portuguese"`, then
+  `"Translate from English to Brazilian Portuguese:"`). Switched from
+  BCP 47 codes after diagnostics showed the 4B model misinterpreting
+  ambiguous 2-letter codes — `si` was producing Slovene, `or` producing
+  Spanish, `af` producing Hindi. Full names eliminate that confusion at
+  the cost of a few extra prompt tokens; consistency rates jumped from
+  ~54 PASS to 75 PASS on the eval harness.
 - **`Language::FromStr`** — accepts BCP 47 in dash or underscore form
   (`pt-BR`, `pt_BR`), case-insensitive, plus script-subtag aliases for
   Chinese (`zh-Hans` → `zh_CN`, `zh-Hant` → `zh_TW`) and the deprecated
@@ -91,6 +112,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wire change** for callers depending on the collapse: a translation request
   for `pt-br` previously produced a `pt` translation; now it produces a
   Brazilian-Portuguese-specific one.
+- **18 `Language` enum variants** that the 4B model could not actually
+  translate: `Ff` (Fulah), `Jv` (Javanese), `Kac` (Kachin), `Ln` (Lingala),
+  `Lu` (Luba-Katanga), `Luo`, `Mai` (Maithili), `Nso` (Sepedi),
+  `Ny` (Nyanja), `Om` (Oromo), `Sd` (Sindhi), `Sn` (Shona), `So` (Somali),
+  `To` (Tonga), `Wo` (Wolof), `Xh` (Xhosa), `Yo` (Yoruba), `Zu` (Zulu).
+  Identified by harness runs that found the model produced either pure
+  wrong-language output (e.g. `jv` → Indonesian, `pa` → Hindi — kept `pa`
+  since it was pre-existing on master), mixed-script salad
+  (e.g. `lu` → Devanagari+Greek+Cyrillic mix), or fluent-but-fake output
+  (e.g. `mi`-shaped text that wasn't real Maori). All 18 were branch-only
+  additions — none were in the v0.0.5 release. Detector still emits the
+  codes from lingua's coverage (`sn`, `so`, `xh`, `yo`, `zu`) when source
+  text is in those languages; `translate_language` will be `None` on the
+  `/detect-language` response since they're no longer translate targets.
 
 ## [0.0.5] — 2026-03-15
 

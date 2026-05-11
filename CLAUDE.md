@@ -42,8 +42,8 @@ cargo run -p translator-cli -- translate -t "Hello world" -l fr,de,ja          #
 cargo run -p translator-cli -- translate -t "Hello world" -l pt-BR,zh-Hant     # regional variants (dash or underscore, case-insensitive)
 cargo run -p translator-cli -- detect -t "Bonjour"                              # returns BCP 47 string
 cargo run -p translator-cli -- detect-language "Bonjour" --output json          # full result with confidence + translate_language
-cargo run -p translator-cli -- languages                                        # translate-supported (default; 70 entries)
-cargo run -p translator-cli -- languages --for detect                            # broader detect-supported list (95 entries)
+cargo run -p translator-cli -- languages                                        # translate-supported (default; 111 entries)
+cargo run -p translator-cli -- languages --for detect                            # broader detect-supported list (108 entries)
 
 # API server (http://localhost:3000)
 cargo run -p translator-api
@@ -74,25 +74,25 @@ Key API env vars: `MODEL_PATH`, `RUST_LOG`.
 
 ### Inference stack
 
-- **Model**: TranslateGemma 4B (Gemma 3 4B instruction-tuned, decoder-only). Translate-side `Language` enum has 70 variants: 55 base + 4 added base (`He`, `Is`, `Fil`, `Zu`) + 11 WMT24++ regional pairs (`ar_EG`, `ar_SA`, `es_MX`, `fr_CA`, `fr_FR`, `pt_BR`, `pt_PT`, `sw_KE`, `sw_TZ`, `zh_CN`, `zh_TW`). Variant naming: `pt_BR` style under `#[allow(non_camel_case_types)]`; `code()` returns BCP 47 dash form (`"pt-BR"`).
+- **Model**: TranslateGemma 4B (Gemma 3 4B instruction-tuned, decoder-only). Translate-side `Language` enum has **111 variants**: WMT24++ validated set (base codes + 11 regional pairs `ar_EG`, `ar_SA`, `es_MX`, `fr_CA`, `fr_FR`, `pt_BR`, `pt_PT`, `sw_KE`, `sw_TZ`, `zh_CN`, `zh_TW`), 3 added base codes (`He`, `Is`, `Fil`), 4 added regional (`en_GB`, `en_US`, `es_ES`, `zh_HK`), and harness-validated Tier A/B/C/D additions the model can actually translate. 18 originally-added Tier B/C/D codes (`ff`, `jv`, `kac`, `ln`, `lu`, `luo`, `mai`, `nso`, `ny`, `om`, `sd`, `sn`, `so`, `to`, `wo`, `xh`, `yo`, `zu`) were dropped after harness runs showed the model produced wrong-language or script-salad output for them. Variant naming: `pt_BR` style under `#[allow(non_camel_case_types)]`; `code()` returns BCP 47 dash form (`"pt-BR"`). `full_name()` returns English label (`"Brazilian Portuguese"`).
 - **Framework**: [llama.cpp](https://github.com/ggerganov/llama.cpp) via `llama-cpp-2`
 - **Tokenizer**: embedded in the GGUF file
-- **Prompt**: `translate_gemma_prompt` uses BCP 47 codes (`"Translate from en to pt-BR:"`) — matches the official TranslateGemma chat-template format and threads regional info to the model.
+- **Prompt**: `translate_gemma_prompt` uses **full English language names** plus a target-script anchor (`"Translate from English to Brazilian Portuguese:"` + system instruction pinning the target's native script). Switched from BCP 47 codes after diagnostics showed the 4B model misinterpreted ambiguous 2-letter codes (`si` → Slovene, `or` → Spanish, `af` → Hindi). Names eliminate that confusion at the cost of a few extra prompt tokens.
 
 ### Language detection (`detector.rs` + `dialect.rs`)
 
 Pipeline. Each step is non-destructive — falls through to the previous result on no commit. Full pipeline returns a `String` (BCP 47) — broader than the translate enum.
 
-1. **Lingua** — 75 base ISO 639-1 / 639-3 codes (parallel detection via Rayon for batches).
-2. **Script disambiguation** (deterministic, Unicode-block tests, no false positives) — `zh-CN`/`zh-TW` (Han Simplified vs Traditional character-set membership), `sr-Cyrl`/`sr-Latn`, `az-Cyrl`/`az-Latn`/`az-Arab`, `pa-Guru`/`pa-Arab`, `mn-Cyrl`/`mn-Mong`.
-3. **Heuristic dialect markers** (`dialect.rs`, best-effort) — Aho-Corasick word-boundary scoring with **streaming early-return** (commit when winner ≥ 2 hits and beats loser by ≥ 2). Currently covers `pt-BR`/`pt-PT`, `en-US`/`en-GB`, `fr-CA`/`fr-FR`.
-4. **Malayalam (`ml`) script-only fallback** when lingua returns nothing.
+1. **Script-only fast path** (deterministic, before lingua) — unique-script blocks committed by Unicode range: `ml` (Malayalam), `kn` (Kannada), `ta` (Tamil), `te` (Telugu), `gu` (Gujarati), `pa` (Gurmukhi), `or` (Oriya), `km` (Khmer), `lo` (Lao), `my` (Burmese), `bo` (Tibetan), `si` (Sinhala), `am` (Ethiopic — also covers Tigrinya for short text).
+2. **Lingua** — 75 base ISO 639-1 / 639-3 codes (parallel detection via Rayon for batches). Lingua codes normalized via `lingua_to_bcp47` (`tl` → `fil`, `nb`/`nn` → `no`).
+3. **Within-script disambiguation** (deterministic, Unicode-block / distinctive-letter tests, no false positives) — `zh-CN`/`zh-TW` (Han Simplified vs Traditional), `sr-Cyrl`/`sr-Latn`, `az-Cyrl`/`az-Latn`/`az-Arab`, `pa-Guru`/`pa-Arab`, `mn-Cyrl`/`mn-Mong`, `bn` → `as` (Assamese-distinctive letters ৰ/ৱ), `ar` → `ckb` (Sorani Kurdish letters ێ/ۆ/ڕ/ڵ/ڤ), `he` → `yi` (Yiddish double-vav/yod digraphs + precomposed ligatures U+05F0–U+05F2).
+4. **Heuristic dialect markers** (`dialect.rs`, best-effort) — Aho-Corasick scoring with streaming early-return (commit when winner ≥ 2 hits and beats loser by ≥ 2). Currently covers `pt-BR`/`pt-PT`, `en-US`/`en-GB`, `fr-CA`/`fr-FR`, `es-MX`/`es-ES`, `zh-TW` → `zh-HK` (Cantonese particles), `hi` → `ne` (Nepali copula/verb markers).
 
 `LanguageDetectionResult { language: String, translate_language: Option<Language>, confidence: f64 }`. `language` is the raw detector output; `translate_language` is the same code parsed via `Language::FromStr` — surfaces aliases (`nb`/`nn` → `no`, `tl` → `fil`, `iw` → `he`, `zh-Hans` → `zh-CN`, `pt-AO` → `pt`). One mapping table, two consumers (input parsing on `/translate` and output mapping on `/detect-language`).
 
 **Boundary contract:** detect's universe is broader than the translate enum. The engine's auto-detect-source path returns `UnsupportedLanguage` (not `DetectionFailed`) when the detected code is lingua-only (e.g. `cy` Welsh, `ka` Georgian). Pass an explicit `source_language` to translate from those.
 
-See `README.md` for the canonical 107-entry support table.
+See `README.md` for the canonical support table. Source of truth for live counts: `GET /languages?for=translate|detect`.
 
 ### Core data flow (`engine.rs`)
 

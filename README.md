@@ -51,7 +51,7 @@ detect`) for the live list.
 | Code     | Language                | Trans | Detect | Both |
 |----------|-------------------------|-------|--------|------|
 | af       | Afrikaans               |   ✓   |   ✓    |  ✓   |
-| am       | Amharic                 |   ✓   |        |      |
+| am       | Amharic                 |   ✓   |   ✓    |  ✓   |
 | ar       | Arabic                  |   ✓   |   ✓    |  ✓   |
 | ar-EG    | Egyptian Arabic         |   ✓   |        |      |
 | ar-SA    | Saudi Arabic            |   ✓   |        |      |
@@ -113,7 +113,7 @@ detect`) for the live list.
 | ms       | Malay                   |   ✓   |   ✓    |  ✓   |
 | mt       | Maltese                 |   ✓   |        |      |
 | nb       | Norwegian Bokmål        |       |   ✓    |      |
-| ne       | Nepali                  |   ✓   |        |      |
+| ne       | Nepali                  |   ✓   |   ✓    |  ✓   |
 | nl       | Dutch                   |   ✓   |   ✓    |  ✓   |
 | nn       | Norwegian Nynorsk       |       |   ✓    |      |
 | no       | Norwegian               |   ✓   |        |      |
@@ -126,7 +126,7 @@ detect`) for the live list.
 | pt-PT    | European Pt (heur.)     |   ✓   |   ✓    |  ✓   |
 | ro       | Romanian                |   ✓   |   ✓    |  ✓   |
 | ru       | Russian                 |   ✓   |   ✓    |  ✓   |
-| si       | Sinhala                 |   ✓   |        |      |
+| si       | Sinhala                 |   ✓   |   ✓    |  ✓   |
 | sk       | Slovak                  |   ✓   |   ✓    |  ✓   |
 | sl       | Slovenian               |   ✓   |   ✓    |  ✓   |
 | sn       | Shona                   |       |   ✓    |      |
@@ -151,14 +151,17 @@ detect`) for the live list.
 | ur       | Urdu                    |   ✓   |   ✓    |  ✓   |
 | vi       | Vietnamese              |   ✓   |   ✓    |  ✓   |
 | xh       | Xhosa                   |       |   ✓    |      |
-| yi       | Yiddish                 |   ✓   |        |      |
+| yi       | Yiddish                 |   ✓   |   ✓    |  ✓   |
 | yo       | Yoruba                  |       |   ✓    |      |
 | zh       | Chinese                 |   ✓   |   ✓    |  ✓   |
 | zh-CN    | Simplified Chinese      |   ✓   |   ✓    |  ✓   |
 | zh-TW    | Traditional Chinese     |   ✓   |   ✓    |  ✓   |
-| zu       | Zulu                    |   ✓   |   ✓    |  ✓   |
+| zu       | Zulu                    |       |   ✓    |      |
 
-107 distinct codes — Translate: 70, Detect: 93, Both: 58.
+**Counts:** Translate enum has **111 variants** (`Language::all()`); detector
+emits **108 distinct codes** (lingua's 75 base + script and dialect refinements).
+The table above lists the canonical subset; call `GET /languages?for=translate`
+or `for=detect` for the authoritative live list.
 
 **Aliases.** When detect emits a code that isn't a translate variant directly,
 `POST /detect-language` includes a `translate_language` field that maps it
