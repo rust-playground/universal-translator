@@ -22,3 +22,14 @@ target/
 models/*/
 
 .DS_Store
+
+# eval harness — locale candidate lists and run results are private per-project
+eval/candidates.csv
+eval/calibration.csv
+eval/results/*
+!eval/results/.gitkeep
+eval/.venv/
+eval/.metricx/
+eval/.setup-complete
+eval/__pycache__/
+eval/*.pyc
