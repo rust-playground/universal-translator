@@ -18,24 +18,27 @@ impl Detector {
     /// Returns a BCP 47 code (`"en"`, `"zh-Hant"`, `"pt-BR"`, `"sr-Cyrl"`).
     ///
     /// Pipeline:
-    /// 1. Lingua base detection (75 languages, lowercase ISO 639-1 / 639-3).
-    /// 2. Script post-processing — refines `zh`, `sr`, `az`, `pa`, `mn` based
+    /// 1. **Script-only fast path** — unique-script blocks (`ml`, `km`, `lo`,
+    ///    `my`, `bo`, `si`, `am`, `or`) match deterministically and beat
+    ///    anything lingua might guess. Lingua doesn't cover these languages
+    ///    so without this check it would emit a wrong-but-confident guess.
+    /// 2. Lingua base detection (75 languages, lowercase ISO 639-1 / 639-3).
+    /// 3. Script post-processing — refines `zh`, `sr`, `az`, `pa`, `mn` based
     ///    on Unicode ranges in the input.
-    /// 3. Heuristic dialect refinement — refines `pt`, `en`, `fr` based on
-    ///    region-specific marker words. Best-effort; falls back to base when
-    ///    no commit.
-    /// 4. Malayalam fallback (script-only) if lingua returns nothing.
+    /// 4. Heuristic dialect refinement — refines `pt`, `en`, `fr`, `es`,
+    ///    `zh-TW` based on region-specific marker words. Best-effort;
+    ///    falls back to base when no commit.
     ///
     /// Detect's universe is broader than the translate-side `Language` enum —
     /// callers must be prepared for codes that don't round-trip into translate
     /// (e.g. `cy`, `ka`, `eu`).
     pub fn detect(&self, text: &str) -> Result<String, TranslatorError> {
+        if let Some(code) = detect_script_only(text) {
+            return Ok(code.to_string());
+        }
         if let Some(lang) = self.inner.detect_language_of(text) {
             let base = lingua_to_bcp47(&lang);
             return Ok(refine(&base, text));
-        }
-        if let Some(code) = detect_script_only(text) {
-            return Ok(code.to_string());
         }
         Err(TranslatorError::DetectionFailed(format!(
             "Could not detect language for text: {text:?}"
@@ -60,12 +63,15 @@ impl Detector {
     /// - 0.50–0.70 — moderate; treat as a best guess
     /// - < 0.50 — weak; very short or genuinely ambiguous
     ///
-    /// Script fallback (Malayalam) and refinement steps don't alter confidence;
-    /// the score reflects the base-language pass only.
+    /// Script fallback paths report confidence = 1.0 (Unicode-block matches
+    /// are deterministic). Refinement steps don't alter confidence.
     pub fn detect_with_confidence(
         &self,
         text: &str,
     ) -> Result<(String, String, f64), TranslatorError> {
+        if let Some(code) = detect_script_only(text) {
+            return Ok((code.to_string(), script_only_name(code).to_string(), 1.0));
+        }
         let values = self.inner.compute_language_confidence_values(text.to_string());
         let mut iter = values.into_iter();
         if let Some((lang, top)) = iter.next() {
@@ -76,12 +82,25 @@ impl Detector {
             let name = format!("{lang:?}");
             return Ok((refined, name, confidence));
         }
-        if let Some(code) = detect_script_only(text) {
-            return Ok((code.to_string(), "Malayalam".to_string(), 1.0));
-        }
         Err(TranslatorError::DetectionFailed(format!(
             "Could not detect language for text: {text:?}"
         )))
+    }
+}
+
+/// English name for a script-only fallback code. Used when reporting
+/// confidence results (Lingua doesn't supply a `Language::*` for these).
+fn script_only_name(code: &str) -> &'static str {
+    match code {
+        "ml" => "Malayalam",
+        "km" => "Khmer",
+        "lo" => "Lao",
+        "my" => "Burmese",
+        "bo" => "Tibetan",
+        "si" => "Sinhala",
+        "am" => "Amharic",
+        "or" => "Oriya",
+        _ => "",
     }
 }
 
@@ -106,7 +125,9 @@ pub fn detect_supported_codes() -> &'static [(&'static str, &'static str)] {
 
 static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("af", "Afrikaans"),
+    ("am", "Amharic — script fallback"),
     ("ar", "Arabic"),
+    ("as", "Assamese — within-Bengali-script heuristic"),
     ("az", "Azerbaijani"),
     ("az-Arab", "Azerbaijani (Arabic)"),
     ("az-Cyrl", "Azerbaijani (Cyrillic)"),
@@ -114,8 +135,10 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("be", "Belarusian"),
     ("bg", "Bulgarian"),
     ("bn", "Bengali"),
+    ("bo", "Tibetan — script fallback"),
     ("bs", "Bosnian"),
     ("ca", "Catalan"),
+    ("ckb", "Central Kurdish — within-Arabic-script heuristic"),
     ("cs", "Czech"),
     ("cy", "Welsh"),
     ("da", "Danish"),
@@ -126,10 +149,13 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("en-US", "English (United States) — heuristic"),
     ("eo", "Esperanto"),
     ("es", "Spanish"),
+    ("es-ES", "European Spanish — heuristic"),
+    ("es-MX", "Mexican Spanish — heuristic"),
     ("et", "Estonian"),
     ("eu", "Basque"),
     ("fa", "Persian"),
     ("fi", "Finnish"),
+    ("fil", "Filipino"),
     ("fr", "French"),
     ("fr-CA", "Canadian French — heuristic"),
     ("fr-FR", "European French — heuristic"),
@@ -147,23 +173,27 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("ja", "Japanese"),
     ("ka", "Georgian"),
     ("kk", "Kazakh"),
+    ("km", "Khmer — script fallback"),
     ("kn", "Kannada"),
     ("ko", "Korean"),
     ("la", "Latin"),
     ("lg", "Ganda"),
+    ("lo", "Lao — script fallback"),
     ("lt", "Lithuanian"),
     ("lv", "Latvian"),
     ("mi", "Maori"),
     ("mk", "Macedonian"),
-    ("ml", "Malayalam"),
+    ("ml", "Malayalam — script fallback"),
     ("mn", "Mongolian"),
     ("mn-Cyrl", "Mongolian (Cyrillic)"),
     ("mn-Mong", "Mongolian (Traditional script)"),
     ("mr", "Marathi"),
     ("ms", "Malay"),
-    ("nb", "Norwegian Bokmål"),
+    ("my", "Burmese — script fallback"),
+    ("ne", "Nepali — heuristic"),
     ("nl", "Dutch"),
-    ("nn", "Norwegian Nynorsk"),
+    ("no", "Norwegian (Bokmål/Nynorsk normalized)"),
+    ("or", "Oriya — script fallback"),
     ("pa", "Punjabi"),
     ("pa-Arab", "Punjabi (Shahmukhi)"),
     ("pa-Guru", "Punjabi (Gurmukhi)"),
@@ -173,6 +203,7 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("pt-PT", "European Portuguese — heuristic"),
     ("ro", "Romanian"),
     ("ru", "Russian"),
+    ("si", "Sinhala — script fallback"),
     ("sk", "Slovak"),
     ("sl", "Slovenian"),
     ("sn", "Shona"),
@@ -187,7 +218,6 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("ta", "Tamil"),
     ("te", "Telugu"),
     ("th", "Thai"),
-    ("tl", "Tagalog"),
     ("tn", "Tswana"),
     ("tr", "Turkish"),
     ("ts", "Tsonga"),
@@ -195,24 +225,31 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("ur", "Urdu"),
     ("vi", "Vietnamese"),
     ("xh", "Xhosa"),
+    ("yi", "Yiddish — within-Hebrew-script heuristic"),
     ("yo", "Yoruba"),
     ("zh", "Chinese"),
     ("zh-CN", "Simplified Chinese"),
+    ("zh-HK", "Hong Kong Chinese — heuristic"),
     ("zh-TW", "Traditional Chinese"),
     ("zu", "Zulu"),
 ];
 
 /// Refine a base language code with script and dialect post-processing.
 ///
-/// Non-destructive: returns the base unchanged when no refinement applies.
+/// Pipeline: script disambiguation first (deterministic Unicode-block tests),
+/// then dialect heuristics on the script-refined code. This lets dialect run
+/// on top of a script refinement — e.g. `zh` → `zh-TW` (Traditional) → `zh-HK`
+/// if Hong Kong markers fire. Each step is non-destructive: returns the input
+/// unchanged when no refinement applies.
 fn refine(base: &str, text: &str) -> String {
-    if let Some(refined) = script_disambiguate(base, text) {
+    let after_script = match script_disambiguate(base, text) {
+        Some(refined) => refined.to_string(),
+        None => base.to_string(),
+    };
+    if let Some(refined) = dialect::disambiguate(&after_script, text) {
         return refined.to_string();
     }
-    if let Some(refined) = dialect::disambiguate(base, text) {
-        return refined.to_string();
-    }
-    base.to_string()
+    after_script
 }
 
 /// Script-based regional disambiguation.
@@ -243,8 +280,29 @@ fn script_disambiguate(base: &str, text: &str) -> Option<&'static str> {
             &[is_cyrillic, is_mongolian],
             &["mn-Cyrl", "mn-Mong"],
         ),
+        "bn" => disambiguate_by_script(text, &[is_assamese_distinctive], &["as"]),
+        "ar" => disambiguate_by_script(text, &[is_sorani_distinctive], &["ckb"]),
+        "he" => disambiguate_yiddish(text),
         _ => None,
     }
+}
+
+/// Detect Yiddish within Hebrew script.
+///
+/// Yiddish writes double-vav (וו) and double-yod (יי) as two adjacent characters
+/// — common pattern in Yiddish words (`וועט`, `דייטש`), rare in modern Hebrew.
+/// Also commits on the precomposed Hebrew Ligatures (`װ` U+05F0, `ױ` U+05F1,
+/// `ײ` U+05F2) which are Yiddish-exclusive.
+fn disambiguate_yiddish(text: &str) -> Option<&'static str> {
+    for c in text.chars() {
+        if matches!(c as u32, 0x05F0..=0x05F2) {
+            return Some("yi");
+        }
+    }
+    if text.contains("\u{05D5}\u{05D5}") || text.contains("\u{05D9}\u{05D9}") {
+        return Some("yi");
+    }
+    None
 }
 
 /// Pick the first script (in priority order) whose predicate matches any
@@ -312,17 +370,60 @@ const TRADITIONAL_EXCLUSIVE: &[char] = &[
     '偉', '傳', '傷', '倫', '偽', '餘', '傭', '俠', '侶', '僥', '偵', '側', '僑', '儈', '儕',
 ];
 
-/// Malayalam script (U+0D00–U+0D7F) — script-only fallback for when lingua
-/// returns nothing. Lingua doesn't cover Malayalam in its base 75.
+/// Script-only fallback for when lingua misses or misroutes.
+///
+/// Each block is a script that maps unambiguously to a single language in
+/// our enum. First codepoint hit wins; callers handle `None` as detection
+/// failure.
+///
+/// Devanagari and Bengali scripts are deliberately **not** covered here —
+/// they're shared across multiple supported languages (Devanagari: hi, ne,
+/// mr, mai; Bengali: bn, as) and need lingua or heuristics to disambiguate.
+///
+/// Ethiopic (`am`): script is shared with `ti` (Tigrinya). Defaults to `am`
+/// since short text in either is indistinguishable by script alone — the
+/// Tigrinya-distinctive Ge'ez letters (qha series, U+1250–U+1258) appear
+/// occasionally in Amharic too, so committing on them caused false positives.
 fn detect_script_only(text: &str) -> Option<&'static str> {
-    if text.chars().any(|c| ('\u{0D00}'..='\u{0D7F}').contains(&c)) {
-        return Some("ml");
+    for c in text.chars() {
+        let hit = match c as u32 {
+            0x0D00..=0x0D7F => Some("ml"), // Malayalam
+            0x0C80..=0x0CFF => Some("kn"), // Kannada
+            0x0B80..=0x0BFF => Some("ta"), // Tamil
+            0x0C00..=0x0C7F => Some("te"), // Telugu
+            0x0A80..=0x0AFF => Some("gu"), // Gujarati
+            0x0A00..=0x0A7F => Some("pa"), // Gurmukhi (Punjabi)
+            0x0B00..=0x0B7F => Some("or"), // Oriya
+            0x1780..=0x17FF => Some("km"), // Khmer
+            0x0E80..=0x0EFF => Some("lo"), // Lao
+            0x1000..=0x109F => Some("my"), // Burmese
+            0x0F00..=0x0FFF => Some("bo"), // Tibetan
+            0x0D80..=0x0DFF => Some("si"), // Sinhala
+            0x1200..=0x137F => Some("am"), // Ethiopic (am; ti round-trips as am)
+            _ => None,
+        };
+        if hit.is_some() {
+            return hit;
+        }
     }
     None
 }
 
+/// Convert a Lingua `Language` to the BCP 47 code our enum / consumers expect.
+///
+/// Most languages map 1:1 by lowercased ISO 639-1. A few exceptions
+/// normalize lingua's emitted form into the canonical code we use:
+/// - `tl` (Tagalog) → `fil` (Filipino). Same language pragmatically;
+///   our enum holds Fil, WMT24++ uses fil_PH.
+/// - `nb` (Bokmål) / `nn` (Nynorsk) → `no` (Norwegian macrolanguage).
+///   Our enum has a single Norwegian variant.
 fn lingua_to_bcp47(language: &LinguaLanguage) -> String {
-    language.iso_code_639_1().to_string().to_lowercase()
+    let raw = language.iso_code_639_1().to_string().to_lowercase();
+    match raw.as_str() {
+        "tl" => "fil".to_string(),
+        "nb" | "nn" => "no".to_string(),
+        other => other.to_string(),
+    }
 }
 
 // ── Script predicates ────────────────────────────────────────────────────────
@@ -351,15 +452,89 @@ fn is_mongolian(c: char) -> bool {
     matches!(c as u32, 0x1800..=0x18AF)
 }
 
+/// Assamese-distinctive letters within the Bengali script block.
+/// `ৰ` (U+09F0, BENGALI LETTER RA WITH MIDDLE DIAGONAL) and
+/// `ৱ` (U+09F1, BENGALI LETTER RA WITH LOWER DIAGONAL) are used in Assamese
+/// orthography and don't appear in standard Bengali (which uses `র` U+09B0).
+fn is_assamese_distinctive(c: char) -> bool {
+    matches!(c as u32, 0x09F0 | 0x09F1)
+}
+
+/// Sorani Kurdish-distinctive letters within the Arabic script block.
+/// These extended Arabic letters are used in Sorani Kurdish but not in
+/// standard Arabic: ێ (U+06ED yeh barree with hamza below), ۆ (U+06C6 oe),
+/// ڕ (U+0695 reh with small v below), ڵ (U+06B5 lam with small v below),
+/// ڤ (U+06A4 veh).
+fn is_sorani_distinctive(c: char) -> bool {
+    matches!(c as u32, 0x06ED | 0x06C6 | 0x0695 | 0x06B5 | 0x06A4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn malayalam_script_fallback() {
-        // Standalone helper test (doesn't construct lingua detector).
-        assert_eq!(detect_script_only("നമസ്കാരം"), Some("ml"));
-        assert_eq!(detect_script_only("hello"), None);
+    fn script_only_fallbacks() {
+        // Each block tests one unique-script language.
+        assert_eq!(detect_script_only("നമസ്കാരം"), Some("ml")); // Malayalam
+        assert_eq!(detect_script_only("ನಮಸ್ಕಾರ"), Some("kn"));    // Kannada
+        assert_eq!(detect_script_only("வணக்கம்"), Some("ta"));    // Tamil
+        assert_eq!(detect_script_only("నమస్కారం"), Some("te"));   // Telugu
+        assert_eq!(detect_script_only("નમસ્તે"), Some("gu"));      // Gujarati
+        assert_eq!(detect_script_only("ਸਤ ਸ੍ਰੀ ਅਕਾਲ"), Some("pa")); // Gurmukhi (Punjabi)
+        assert_eq!(detect_script_only("ସୁ ଆ ସ୍ୱାଗତ"), Some("or"));   // Oriya
+        assert_eq!(detect_script_only("សួស្ដី"), Some("km"));     // Khmer
+        assert_eq!(detect_script_only("ສະບາຍດີ"), Some("lo"));   // Lao
+        assert_eq!(detect_script_only("မင်္ဂလာပါ"), Some("my"));   // Burmese
+        assert_eq!(detect_script_only("བཀྲ་ཤིས་བདེ་ལེགས།"), Some("bo")); // Tibetan
+        assert_eq!(detect_script_only("ආයුබෝවන්"), Some("si"));    // Sinhala
+        assert_eq!(detect_script_only("ሰላም"), Some("am"));        // Ethiopic → am
+        assert_eq!(detect_script_only("hello"), None);            // Latin → no match
+    }
+
+    #[test]
+    fn assamese_distinctive_letter_refines_bn() {
+        // ৰ (U+09F0) appears in Assamese, not standard Bengali.
+        assert_eq!(script_disambiguate("bn", "ৰোগী আছে"), Some("as"));
+        // ৱ (U+09F1) also Assamese-distinctive.
+        assert_eq!(script_disambiguate("bn", "ৱাণিজ্য"), Some("as"));
+    }
+
+    #[test]
+    fn bengali_without_assamese_letters_returns_none() {
+        // Standard Bengali — uses র (U+09B0), not ৰ.
+        assert_eq!(script_disambiguate("bn", "আমি বাংলা বলি"), None);
+    }
+
+    #[test]
+    fn sorani_kurdish_distinctive_letter_refines_ar() {
+        // ێ (U+06ED) and ڕ (U+0695) are Sorani-distinctive.
+        assert_eq!(script_disambiguate("ar", "ئەو کوێرە"), Some("ckb"));
+        assert_eq!(script_disambiguate("ar", "هاوڕێ"), Some("ckb"));
+    }
+
+    #[test]
+    fn arabic_without_sorani_letters_returns_none() {
+        assert_eq!(script_disambiguate("ar", "السلام عليكم"), None);
+    }
+
+    #[test]
+    fn yiddish_double_letter_digraphs_refine_he() {
+        // וו (double vav) in וועט — classic Yiddish.
+        assert_eq!(script_disambiguate("he", "וועט קומען"), Some("yi"));
+        // יי (double yod) in דייטש.
+        assert_eq!(script_disambiguate("he", "דייטש"), Some("yi"));
+    }
+
+    #[test]
+    fn yiddish_precomposed_ligature_refines_he() {
+        // ײ (U+05F2 precomposed double yod).
+        assert_eq!(script_disambiguate("he", "ײד"), Some("yi"));
+    }
+
+    #[test]
+    fn hebrew_without_yiddish_markers_returns_none() {
+        assert_eq!(script_disambiguate("he", "שלום עליכם"), None);
     }
 
     #[test]
@@ -428,6 +603,22 @@ mod tests {
         assert_eq!(
             refine("pt", "Onde fica o ônibus para o aeroporto? Eu uso o trem."),
             "pt-BR"
+        );
+    }
+
+    #[test]
+    fn refine_chains_script_then_dialect_for_zh_hk() {
+        // Traditional Chinese with HK Cantonese markers should chain:
+        // zh → script_disambig → zh-TW → dialect → zh-HK.
+        let text = "我喺巴士站等的士，唔該你話我知點解咁耐。";
+        assert_eq!(refine("zh", text), "zh-HK");
+    }
+
+    #[test]
+    fn refine_applies_es_dialect() {
+        assert_eq!(
+            refine("es", "Voy a manejar el carro y rentar una computadora."),
+            "es-MX"
         );
     }
 }

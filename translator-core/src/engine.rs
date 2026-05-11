@@ -43,20 +43,23 @@ pub struct EngineConfig {
 
 /// Build a full Gemma instruct-format translation prompt.
 ///
-/// Language slots use BCP 47 codes (`en`, `pt-BR`, `zh-Hant`) — matches the
-/// official TranslateGemma chat-template format (`source_lang_code` /
-/// `target_lang_code`) and lets regional variants thread through to the model.
+/// Uses **full English language names** (`English`, `Brazilian Portuguese`)
+/// rather than BCP 47 codes. Diagnostic data showed the 4B model interpreting
+/// ambiguous 2-letter codes as other languages: `si` → Slovene, `or` → Spanish,
+/// `af` → Hindi. Full names eliminate that confusion at the cost of a few
+/// extra tokens per prompt. The system turn also pins the **target script**
+/// to discourage the model from falling back to a high-resource neighbour.
 fn translate_gemma_prompt(src_lang: Language, tgt_lang: Language, text: &str) -> String {
     format!(
         "<bos><start_of_turn>system\n\
-         You are a translation engine. Output only the translated text. \
-         Do not add explanations, alternatives, notes, or any other text.<end_of_turn>\n\
+         You are a translation engine. Output only the translated text in {tgt}, \
+         using the native script of {tgt}. Do not add explanations, alternatives, \
+         notes, or any other text.<end_of_turn>\n\
          <start_of_turn>user\n\
-         Translate from {} to {}:\n{}<end_of_turn>\n\
+         Translate from {src} to {tgt}:\n{text}<end_of_turn>\n\
          <start_of_turn>model\n",
-        src_lang.code(),
-        tgt_lang.code(),
-        text
+        src = src_lang.full_name(),
+        tgt = tgt_lang.full_name(),
     )
 }
 
@@ -542,7 +545,8 @@ mod tests {
     #[test]
     fn prompt_format_base() {
         let prompt = translate_gemma_prompt(Language::En, Language::Fr, "Hello");
-        assert!(prompt.contains("Translate from en to fr:"), "got: {prompt}");
+        assert!(prompt.contains("Translate from English to French:"), "got: {prompt}");
+        assert!(prompt.contains("native script of French"), "got: {prompt}");
         assert!(prompt.contains("Hello"));
         assert!(prompt.starts_with("<bos>"));
     }
@@ -550,12 +554,18 @@ mod tests {
     #[test]
     fn prompt_format_regional() {
         let prompt = translate_gemma_prompt(Language::En, Language::pt_BR, "Hello");
-        assert!(prompt.contains("Translate from en to pt-BR:"), "got: {prompt}");
+        assert!(
+            prompt.contains("Translate from English to Brazilian Portuguese:"),
+            "got: {prompt}"
+        );
     }
 
     #[test]
     fn prompt_format_regional_chinese() {
         let prompt = translate_gemma_prompt(Language::En, Language::zh_TW, "Hello");
-        assert!(prompt.contains("Translate from en to zh-TW:"), "got: {prompt}");
+        assert!(
+            prompt.contains("Translate from English to Traditional Chinese:"),
+            "got: {prompt}"
+        );
     }
 }

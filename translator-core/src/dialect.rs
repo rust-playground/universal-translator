@@ -24,11 +24,19 @@ use aho_corasick::AhoCorasick;
 
 /// Refine a base language code into a regional variant when markers commit.
 /// Returns `Some(refined_code)` on commit, `None` otherwise (caller keeps base).
+///
+/// The `base` argument is the input to disambiguate from — typically a base
+/// language code (`pt`, `en`, `fr`, `es`), but may also be a script-refined
+/// code (`zh-TW`) to chain a further dialect step on top of script
+/// disambiguation.
 pub fn disambiguate(base: &str, text: &str) -> Option<&'static str> {
     let pair = match base {
         "pt" => pt_pair(),
         "en" => en_pair(),
         "fr" => fr_pair(),
+        "es" => es_pair(),
+        "zh-TW" => zh_tw_pair(),
+        "hi" => hi_ne_pair(),
         _ => return None,
     };
     pair.run(text)
@@ -194,6 +202,107 @@ fn fr_pair() -> &'static Pair {
     })
 }
 
+fn es_pair() -> &'static Pair {
+    static P: OnceLock<Pair> = OnceLock::new();
+    P.get_or_init(|| {
+        // Mexican / Latin-American Spanish markers.
+        let mx: &[&str] = &[
+            "carro",       // car (Spain: coche)
+            "computadora", // computer (Spain: ordenador)
+            "celular",     // cell phone (Spain: móvil)
+            "manejar",     // to drive (Spain: conducir)
+            "platicar",    // to chat (Spain: charlar)
+            "rentar",      // to rent (Spain: alquilar)
+            "papa",        // potato (Spain: patata)
+            "jugo",        // juice (Spain: zumo)
+            "frijoles",    // beans (Spain: alubias)
+            "chévere",     // cool (LA)
+            "padrísimo",   // awesome (Mexican)
+            "qué onda",    // what's up (Mexican)
+        ];
+        // European (Castilian) Spanish markers.
+        let es: &[&str] = &[
+            "vosotros",  // 2nd plural informal — Spain only
+            "vosotras",
+            "vuestro",   // 2nd plural possessive — Spain only
+            "vuestra",
+            "ordenador", // computer
+            "móvil",     // mobile phone
+            "patata",    // potato
+            "zumo",      // juice
+            "alubias",   // beans
+            "tío",       // dude (Spain colloquial)
+            "tía",       // gal (Spain colloquial)
+            "vale",      // OK
+            "guay",      // cool
+            "ostras",    // wow / oh
+        ];
+        Pair::build("es-MX", mx, "es-ES", es)
+    })
+}
+
+/// Hindi vs Nepali — both Devanagari, lingua tends to default short text to `hi`.
+/// Refines `hi` → `ne` when Nepali-specific copula / verb forms / day names appear.
+/// Symmetric: strong Hindi markers commit `hi` (no change); strong Nepali markers
+/// commit `ne`. Neutral text returns `None` and keeps the base `hi`.
+fn hi_ne_pair() -> &'static Pair {
+    static P: OnceLock<Pair> = OnceLock::new();
+    P.get_or_init(|| {
+        // Hindi-distinctive: copula forms and day names that don't appear in Nepali.
+        let hi: &[&str] = &[
+            "हैं",       // plural copula (Nepali uses छन्)
+            "क्या",      // question word (Nepali uses के)
+            "मंगलवार",  // Tuesday (Nepali: मङ्गलबार)
+            "गुरुवार",  // Thursday (Nepali: बिहीबार)
+            "बुधवार",   // Wednesday (Nepali: बुधबार)
+            "होगा",      // future masculine (Nepali: हुनेछ)
+            "होगी",      // future feminine
+            "के लिए",   // "for" (Nepali: को लागि)
+        ];
+        // Nepali-distinctive: copula छ family, future हुनेछ, passive participle,
+        // Nepali day names, polite pronoun.
+        let ne: &[&str] = &[
+            "छन्",        // plural copula
+            "हुनेछ",      // future copula
+            "गरिने",      // passive participle
+            "गरिएको",    // past passive participle
+            "बिहीबार",   // Thursday (Nepali-specific spelling)
+            "नेपाल",      // Nepal — country name
+            "होइन",       // "is not" (Nepali; Hindi uses नहीं है)
+            "तपाईं",      // polite "you" (Hindi uses आप)
+            "गर्दछ",     // "does" (Nepali present)
+            "भन्ने",      // "saying" — Nepali subordinator
+            "हुन्छ",      // "becomes/is" (Nepali)
+        ];
+        Pair::build("hi", hi, "ne", ne)
+    })
+}
+
+fn zh_tw_pair() -> &'static Pair {
+    static P: OnceLock<Pair> = OnceLock::new();
+    P.get_or_init(|| {
+        // Hong Kong written Chinese — refines zh-TW (Traditional) into zh-HK
+        // when Cantonese-influenced vocab / particles appear. Both regions
+        // share Traditional Han characters, so this is the only signal that
+        // distinguishes them. Asymmetric: side B is empty because zh-TW is
+        // the default Traditional output and only HK-specific markers commit.
+        let hk: &[&str] = &[
+            "巴士",         // bus (TW: 公車 / 公共汽車)
+            "的士",         // taxi (TW: 計程車)
+            "唔該",         // thank you / excuse me (Cantonese)
+            "唔好意思",     // sorry (Cantonese)
+            "點解",         // why (Cantonese; TW: 為什麼)
+            "喺",           // at (Cantonese particle)
+            "嘅",           // possessive 's (Cantonese)
+            "咗",           // past-tense marker (Cantonese)
+            "係",           // is (Cantonese; standard uses 是)
+            "冇",           // not have (Cantonese)
+        ];
+        let tw: &[&str] = &[];
+        Pair::build("zh-HK", hk, "zh-TW", tw)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +366,55 @@ mod tests {
     fn unknown_base_returns_none() {
         assert_eq!(disambiguate("ja", "こんにちは"), None);
         assert_eq!(disambiguate("zh", "你好"), None);
+    }
+
+    #[test]
+    fn es_mx_commits_on_lat_am_markers() {
+        let text = "Voy a manejar el carro a mi casa y luego rentar una computadora.";
+        assert_eq!(disambiguate("es", text), Some("es-MX"));
+    }
+
+    #[test]
+    fn es_es_commits_on_castilian_markers() {
+        let text = "Vosotros tenéis un ordenador móvil que es muy guay, vale.";
+        assert_eq!(disambiguate("es", text), Some("es-ES"));
+    }
+
+    #[test]
+    fn es_neutral_returns_none() {
+        assert_eq!(disambiguate("es", "Hola, ¿cómo estás?"), None);
+    }
+
+    #[test]
+    fn ne_commits_on_nepali_markers() {
+        let text = "यस सम्मेलन बिहीबार बिहान शहरको केन्द्रमा आयोजना गरिने छ। नेपाल मा हुनेछ।";
+        assert_eq!(disambiguate("hi", text), Some("ne"));
+    }
+
+    #[test]
+    fn hi_commits_on_hindi_markers() {
+        let text = "क्या आप कृपया पुष्टि कर सकते हैं कि पैकेज मंगलवार को आ गया है?";
+        assert_eq!(disambiguate("hi", text), Some("hi"));
+    }
+
+    #[test]
+    fn devanagari_neutral_returns_none() {
+        // Short, no distinctive markers either way.
+        assert_eq!(disambiguate("hi", "नमस्ते"), None);
+    }
+
+    #[test]
+    fn zh_hk_commits_on_hk_markers() {
+        // Cantonese-influenced Traditional Chinese with bus / taxi / particles.
+        let text = "我喺巴士站等的士，唔該你話我知點解咁耐。";
+        assert_eq!(disambiguate("zh-TW", text), Some("zh-HK"));
+    }
+
+    #[test]
+    fn zh_tw_no_hk_markers_returns_none() {
+        // Clean Taiwan Traditional — no Cantonese-specific markers.
+        let text = "我在計程車站等公車,請問你知道為什麼這麼久嗎?";
+        assert_eq!(disambiguate("zh-TW", text), None);
     }
 
     #[test]
