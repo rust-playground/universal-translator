@@ -36,7 +36,9 @@ pub fn disambiguate(base: &str, text: &str) -> Option<&'static str> {
         "fr" => fr_pair(),
         "es" => es_pair(),
         "zh-TW" => zh_tw_pair(),
-        "hi" => hi_ne_pair(),
+        // Devanagari siblings — lingua often confuses ne with hi and mr.
+        // Same Nepali marker pair refines both bases toward ne when fitting.
+        "hi" | "mr" => hi_ne_pair(),
         _ => return None,
     };
     pair.run(text)
@@ -474,6 +476,14 @@ mod tests {
     fn devanagari_neutral_returns_none() {
         // Short, no distinctive markers either way.
         assert_eq!(disambiguate("hi", "नमस्ते"), None);
+    }
+
+    #[test]
+    fn ne_commits_on_भएका_थिए() {
+        // Real Nepali sample from the harness — past-perfect "भएका थिए"
+        // is two distinctive Nepali markers in one phrase.
+        let text = "ट्वेल्व विद्यार्थी नवीकरणीय ऊर्जा प्रणालीमा आधारित कार्यशालामा सहभागी भएका थिए।";
+        assert_eq!(disambiguate("hi", text), Some("ne"));
     }
 
     #[test]
