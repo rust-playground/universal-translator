@@ -248,44 +248,103 @@ fn es_pair() -> &'static Pair {
 fn hi_ne_pair() -> &'static Pair {
     static P: OnceLock<Pair> = OnceLock::new();
     P.get_or_init(|| {
-        // Hindi-distinctive: copula forms and day names that don't appear in Nepali.
+        // Hindi-distinctive: copula, question word, day names, future forms,
+        // vocabulary that differs from Nepali.
         let hi: &[&str] = &[
-            "हैं",       // plural copula (Nepali uses छन्)
-            "क्या",      // question word (Nepali uses के)
-            "मंगलवार",  // Tuesday (Nepali: मङ्गलबार)
-            "गुरुवार",  // Thursday (Nepali: बिहीबार)
-            "बुधवार",   // Wednesday (Nepali: बुधबार)
-            "होगा",      // future masculine (Nepali: हुनेछ)
-            "होगी",      // future feminine
-            "के लिए",   // "for" (Nepali: को लागि)
+            "हैं",         // plural copula (Nepali: छन्)
+            " है",          // singular copula (Nepali: छ)
+            "क्या",        // question word (Nepali: के)
+            "की ",          // feminine genitive (Nepali uses को universally)
+            "मंगलवार",    // Tuesday (Nepali: मङ्गलबार)
+            "गुरुवार",    // Thursday (Nepali: बिहीबार)
+            "बुधवार",     // Wednesday
+            "होगा",        // future masc (Nepali: हुनेछ)
+            "होगी",        // future fem
+            "होंगे",       // future plural
+            "के लिए",     // "for" (Nepali: को लागि)
+            "नया ",         // new (Nepali: नयाँ)
+            "अगला",        // next (Nepali: अर्को)
+            "बड़ा",         // big (Nepali: ठूलो)
+            "छोटा",        // small (Nepali: सानो)
+            "लाल",          // red (Nepali: रातो)
+            "रहा है",      // continuous Hindi
+            "रहे हैं",     // continuous plural Hindi
+            "रहा था",      // past continuous
+            "करते हैं",    // habitual present plural
+            "सकते हैं",    // modal plural
+            "पहुँच",        // arrive (Nepali: आइपुग)
         ];
-        // Nepali-distinctive: copula छ family, verb morphology, postpositions,
-        // day names, polite pronoun. Multiple high-frequency forms so commit
-        // threshold (≥2 hits, ≥2 margin) fires on typical sentences.
+        // Nepali-distinctive: copula छ family, verb morphology, distinctive
+        // vocabulary, polite pronouns. Multiple high-frequency forms so the
+        // commit threshold (≥2 hits, ≥2 margin) fires on typical sentences.
         let ne: &[&str] = &[
-            "छन्",         // plural copula
-            "हुनेछ",       // future copula
-            "हुन्छ",       // present "becomes/is"
-            "हुनुहोस्",   // polite imperative copula
-            "गर्नुहोस्",  // polite imperative "do"
-            "सक्नुहुन्छ", // polite "can"
-            "गरिने",       // passive participle (gerund)
-            "गरिएको",     // past passive participle
-            "गर्नु",       // infinitive
-            "गर्ने",       // gerund
-            "गर्दछ",      // habitual present
-            "गरे",         // past
-            "गरिए",        // past passive
-            "उनले",        // 3sg ergative
-            "तपाईं",       // polite "you"
-            "तपाईंले",    // polite ergative
-            "आफ्नो",       // reflexive possessive
-            "आइपुग्यो",   // past "arrived" (Nepali; Hindi uses पहुँच)
-            "बिहीबार",    // Thursday
-            "बिहान",       // morning (Nepali preferred over Hindi सुबह)
-            "नेपाल",       // Nepal
-            "होइन",        // "is not"
-            "भन्ने",       // subordinator "saying"
+            // copula / aux
+            "छन्",          // plural copula
+            "हुनेछ",        // future copula
+            "हुन्छ",        // present
+            "हुनुहोस्",    // polite imperative copula
+            "हुनुपर्छ",   // modal "must be"
+            "हो ",           // standalone "is" (Nepali)
+            "थिए",          // past plural copula
+            "थियो",         // past singular
+            "होइन",         // "is not"
+            // verb morphology
+            "गर्नुहोस्",   // polite imperative
+            "गर्नुपर्छ",  // modal "must do"
+            "सक्नुहुन्छ",  // polite "can"
+            "गरिने",        // passive participle / gerund
+            "गरिएको",      // past passive
+            "गरिए",         // past passive short
+            "गर्नु",        // infinitive
+            "गर्ने",        // gerund
+            "गर्दछ",       // habitual present
+            "गरे",          // past
+            "गरेको",       // past habitual
+            "गरेका",       // past habitual plural
+            "गरेर",         // absolutive
+            "भएको",        // past participle
+            "भएका",        // past participle plural
+            "भएकी",        // past participle fem
+            "रहेको",       // past habitual
+            "रहेका",       // past habitual plural
+            "रहेछ",         // hearsay
+            "आइपुग्यो",    // past arrive (Nepali; Hindi uses पहुँच)
+            "आउँछ",         // present "comes"
+            "जान्छ",        // present "goes"
+            // pronouns / possessives
+            "तपाईं",        // polite "you"
+            "तपाईंले",     // polite ergative
+            "आफ्नो",        // reflexive
+            "आफू",          // self
+            "हामी",         // we
+            "हाम्रो",       // our
+            "उनले",         // 3sg ergative
+            // distinctive vocabulary
+            "नयाँ",         // new
+            "अर्को",        // next/other
+            "ठूलो",         // big
+            "सानो",         // small
+            "राम्रो",       // good
+            "रातो",         // red
+            "सेतो",         // white
+            "गाउँ",         // village
+            "बुबा",         // father
+            "आमा",          // mother
+            "सबैभन्दा",   // most (superlative)
+            "अगाडि",        // before
+            "पछाडि",        // after
+            "नजिकै",        // near (emphatic)
+            "लागि",         // "for" (Nepali postposition; Hindi: के लिए)
+            "जस्तै",        // like
+            "त्यस्तै",     // such
+            "केही",         // some
+            // day / time names
+            "बिहीबार",     // Thursday
+            "बिहान",        // morning
+            "नेपाल",        // Nepal
+            "नेपाली",      // Nepali
+            // subordinator
+            "भन्ने",        // "saying"
             "ल्याउनुहोस्", // polite imperative "bring"
         ];
         Pair::build("hi", hi, "ne", ne)

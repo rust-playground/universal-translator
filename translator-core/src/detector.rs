@@ -33,10 +33,13 @@ impl Detector {
     /// callers must be prepared for codes that don't round-trip into translate
     /// (e.g. `cy`, `ka`, `eu`).
     pub fn detect(&self, text: &str) -> Result<String, TranslatorError> {
-        if let Some(code) = detect_script_only(text) {
+        // Within-script overrides run first — distinctive letters like ৰ (Assamese)
+        // and ێ (Sorani) should win even when text contains a stray char from
+        // another unique-script block. Otherwise mixed-script outputs misroute.
+        if let Some(code) = detect_within_script_override(text) {
             return Ok(code.to_string());
         }
-        if let Some(code) = detect_within_script_override(text) {
+        if let Some(code) = detect_script_only(text) {
             return Ok(code.to_string());
         }
         if let Some(lang) = self.inner.detect_language_of(text) {
@@ -72,10 +75,10 @@ impl Detector {
         &self,
         text: &str,
     ) -> Result<(String, String, f64), TranslatorError> {
-        if let Some(code) = detect_script_only(text) {
+        if let Some(code) = detect_within_script_override(text) {
             return Ok((code.to_string(), script_only_name(code).to_string(), 1.0));
         }
-        if let Some(code) = detect_within_script_override(text) {
+        if let Some(code) = detect_script_only(text) {
             return Ok((code.to_string(), script_only_name(code).to_string(), 1.0));
         }
         let values = self.inner.compute_language_confidence_values(text.to_string());
