@@ -89,12 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sr-Cyrl`) or codes outside the translate set (`cy`, `nb`, `tl`).
   **Breaking wire change** on `/detect-language` and CLI
   `detect-language --output json`: `language` is no longer nullable.
-- **`/languages` response shape** is now
-  `{"languages": [{"code", "name"}, ...]}` (was `{"languages": [code, ...]}`).
-  **Breaking wire change** for clients that consumed the array directly.
-- **`translator-api-client::languages()`** returns `Vec<LanguageEntry>`
-  (was `Vec<Language>`). New `languages_detect()` method calls
-  `?for=detect`.
+- **`translator-api-client::languages()`** still returns `Vec<Language>`.
+  New `languages_detect()` method calls `?for=detect` and returns
+  `Vec<String>` (detect emits codes outside the translate enum, e.g. `cy`
+  Welsh; parse with `code.parse::<Language>().ok()` if needed). Wire
+  format on both endpoints is unchanged from v0.0.5 — array of BCP 47
+  code strings.
 - **Auto-detect translate flow** — when the detector returns a code that
   isn't in the translate enum (e.g. `cy` Welsh), the engine now returns
   `UnsupportedLanguage` with a clear message rather than

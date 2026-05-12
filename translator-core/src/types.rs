@@ -41,14 +41,6 @@ pub struct TranslationResultSet {
     pub results: Vec<TranslationResult>,
 }
 
-/// One entry in a `/languages` response. `code` is BCP 47; `name` is the
-/// English display label. Used for both translate-side and detect-side lists.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LanguageEntry {
-    pub code: String,
-    pub name: String,
-}
-
 /// Result of a standalone language detection request.
 ///
 /// Two language fields are present because the detector's output universe

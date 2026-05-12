@@ -3,20 +3,13 @@ use std::time::Duration;
 
 use futures::Stream;
 use translator_core::types::{
-    LanguageDetectionResult, LanguageEntry, TranslationRequest, TranslationResult,
-    TranslationResultSet,
+    LanguageDetectionResult, TranslationRequest, TranslationResult, TranslationResultSet,
 };
+use translator_core::Language;
 
 use crate::error::ClientError;
 use crate::retry::RetryConfig;
 use crate::stream::parse_sse_stream;
-
-/// Internal selector for `/languages?for=`.
-#[derive(Copy, Clone)]
-enum LanguagesFor {
-    Translate,
-    Detect,
-}
 
 /// HTTP client for the Universal Translator API.
 #[derive(Clone)]
@@ -137,34 +130,45 @@ impl TranslatorClient {
         Ok(parse_sse_stream(resp))
     }
 
-    /// GET `/languages` — list translate-supported languages with retry.
-    pub async fn languages(&self) -> Result<Vec<LanguageEntry>, ClientError> {
-        self.languages_for(LanguagesFor::Translate).await
-    }
-
-    /// GET `/languages?for=detect` — list detect-supported codes (broader
-    /// than translate; includes lingua's full coverage plus script and
-    /// heuristic refinements). Codes returned here may not round-trip into
-    /// translation; check against `languages()` to know what translate accepts.
-    pub async fn languages_detect(&self) -> Result<Vec<LanguageEntry>, ClientError> {
-        self.languages_for(LanguagesFor::Detect).await
-    }
-
-    async fn languages_for(&self, kind: LanguagesFor) -> Result<Vec<LanguageEntry>, ClientError> {
+    /// GET `/languages` — list translate-supported languages.
+    ///
+    /// Returns typed `Language` values. Use `.code()` and `.full_name()` on
+    /// each entry; no need for a separate name field on the wire.
+    pub async fn languages(&self) -> Result<Vec<Language>, ClientError> {
         #[derive(serde::Deserialize)]
         struct Resp {
-            languages: Vec<LanguageEntry>,
+            languages: Vec<Language>,
         }
-
-        let suffix = match kind {
-            LanguagesFor::Translate => "?for=translate",
-            LanguagesFor::Detect => "?for=detect",
-        };
 
         self.with_retry(|| async {
             let resp = self
                 .http
-                .get(format!("{}/languages{suffix}", self.base_url))
+                .get(format!("{}/languages?for=translate", self.base_url))
+                .send()
+                .await?;
+            let resp: Resp = handle_response(resp).await?;
+            Ok(resp.languages)
+        })
+        .await
+    }
+
+    /// GET `/languages?for=detect` — list detect-supported codes (broader
+    /// than translate; includes lingua's full coverage plus script and
+    /// heuristic refinements).
+    ///
+    /// Returns raw BCP 47 code strings since the detect universe includes
+    /// codes outside the translate `Language` enum (e.g. `cy`, `eu`, `ka`).
+    /// Parse with `code.parse::<Language>().ok()` if you need the enum form.
+    pub async fn languages_detect(&self) -> Result<Vec<String>, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            languages: Vec<String>,
+        }
+
+        self.with_retry(|| async {
+            let resp = self
+                .http
+                .get(format!("{}/languages?for=detect", self.base_url))
                 .send()
                 .await?;
             let resp: Resp = handle_response(resp).await?;
