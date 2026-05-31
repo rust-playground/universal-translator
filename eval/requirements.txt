@@ -1,0 +1,16 @@
+# Harness-side runtime deps. MetricX brings its own pinned deps via
+# .metricx/requirements.txt (transformers[torch], sentencepiece, datasets,
+# mt-metrics-eval) — installed by `make setup`.
+requests>=2.31
+
+# Compatibility pins. MetricX pins datasets==2.13.1 / transformers==4.30.2
+# (June 2023) which were tested against the now-old pyarrow / numpy /
+# protobuf APIs. Newer releases break them:
+#   pyarrow >= 14  removed PyExtensionType (datasets 2.13 needs it)
+#   numpy >= 2     broke binary compat with transformers 4.30
+#   protobuf >= 5  removed APIs transformers 4.30 uses
+# Installed AFTER MetricX's requirements so pip downgrades these.
+pyarrow<14
+numpy<2
+protobuf>=3.19,<3.21
+fsspec<=2023.6.0

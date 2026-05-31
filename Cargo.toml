@@ -34,3 +34,4 @@ opentelemetry_sdk      = { version = "0.31" }
 opentelemetry-otlp     = { version = "0.31", features = ["trace", "metrics", "logs", "grpc-tonic"] }
 tracing-opentelemetry  = { version = "0.32" }
 opentelemetry-appender-tracing = { version = "0.31" }
+aho-corasick        = "1"

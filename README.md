@@ -5,7 +5,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)]()
 
-A universal text translator built in Rust. Uses [llama.cpp](https://github.com/ggerganov/llama.cpp) (via the `llama-cpp-2` Rust crate) for fast, fully local inference of [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) (Gemma 3 4B instruction-tuned), covering 55 languages, and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection.
+A universal text translator built in Rust. Uses [llama.cpp](https://github.com/ggerganov/llama.cpp) (via the `llama-cpp-2` Rust crate) for fast, fully local inference of [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) (Gemma 3 4B instruction-tuned) — 98 translate-side languages and locales (WMT24++ validated set plus harness-validated additions) — and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection (75 base languages, plus script and heuristic refinements that surface regional variants like `zh-Hant` and `pt-BR`).
 
 No API keys required. No network calls at runtime. Everything runs on your machine.
 
@@ -18,29 +18,175 @@ No API keys required. No network calls at runtime. Everything runs on your machi
 
 ## Supported languages
 
-55 supported languages:
+The translate side and detect side have different ceilings. Translate is built
+on [WMT24++](https://huggingface.co/datasets/google/wmt24pp), the canonical
+TranslateGemma training set. Detect is layered on
+[Lingua](https://github.com/pemistahl/lingua-rs) (75 base languages) with two
+post-processing passes for regional granularity.
 
-| Code | Language | Code | Language | Code | Language |
-|------|----------|------|----------|------|----------|
-| af | Afrikaans | hr | Croatian | pt | Portuguese |
-| am | Amharic | hu | Hungarian | ro | Romanian |
-| ar | Arabic | id | Indonesian | ru | Russian |
-| bg | Bulgarian | it | Italian | si | Sinhala |
-| bn | Bengali | ja | Japanese | sk | Slovak |
-| ca | Catalan | kn | Kannada | sl | Slovenian |
-| cs | Czech | ko | Korean | sr | Serbian |
-| da | Danish | lt | Lithuanian | sv | Swedish |
-| de | German | lv | Latvian | sw | Swahili |
-| el | Greek | ml | Malayalam | ta | Tamil |
-| **en** | **English** | mr | Marathi | te | Telugu |
-| es | Spanish | ms | Malay | th | Thai |
-| et | Estonian | mt | Maltese | tr | Turkish |
-| fa | Persian | ne | Nepali | uk | Ukrainian |
-| fi | Finnish | nl | Dutch | ur | Urdu |
-| fr | French | no | Norwegian | vi | Vietnamese |
-| gu | Gujarati | pa | Punjabi | yi | Yiddish |
-| ha | Hausa | pl | Polish | zh | Chinese |
-| hi | Hindi | | | | |
+**How to read the table:**
+
+- **Trans** ✓ — code is accepted as a `source_language` / `target_languages`
+  value by the engine. Inputs are BCP 47, dash or underscore, case-insensitive
+  (`pt-BR`, `pt_BR`, `PT-br` all work). Unknown region tags fall back to the
+  base language (e.g. `pt-AO` → `pt`).
+- **Detect** ✓ — the detector can emit this exact code as a result.
+- **Both** ✓ — code round-trips: detect can produce it AND translate accepts it.
+- **(heur.)** — produced by the heuristic dialect classifier (marker-word
+  scoring). Best-effort; falls back to the base language when text is too
+  short or neutral to commit. May false-positive on adversarial input.
+- **[Brackets]** — script-tag refinement using Unicode-block tests
+  (`zh-Hans`, `sr-Cyrl`, etc.). Deterministic, no false positives.
+- Codes only checked under **Detect** (e.g. `cy`, `ka`, `eu`) are languages
+  Lingua identifies but the engine cannot translate. The auto-detect translate
+  flow returns `UnsupportedLanguage` for these — pass an explicit
+  `source_language` to translate from a different language.
+- 8 codes (`af`, `am`, `ha`, `ms`, `mt`, `ne`, `si`, `yi`) are translate-supported
+  but not in the WMT24++ training distribution. They work because Gemma 3
+  instruct generalizes, but quality is best-effort.
+
+Run `cargo run -p translator-cli -- languages --for translate` (or `--for
+detect`) for the live list.
+
+| Code     | Language                | Trans | Detect | Both |
+|----------|-------------------------|-------|--------|------|
+| af       | Afrikaans               |   ✓   |   ✓    |  ✓   |
+| am       | Amharic                 |   ✓   |   ✓    |  ✓   |
+| ar       | Arabic                  |   ✓   |   ✓    |  ✓   |
+| ar-EG    | Egyptian Arabic         |   ✓   |        |      |
+| ar-SA    | Saudi Arabic            |   ✓   |        |      |
+| az       | Azerbaijani             |       |   ✓    |      |
+| az-Arab  | Azerbaijani [Arabic]    |       |   ✓    |      |
+| az-Cyrl  | Azerbaijani [Cyrl]      |       |   ✓    |      |
+| az-Latn  | Azerbaijani [Latn]      |       |   ✓    |      |
+| be       | Belarusian              |       |   ✓    |      |
+| bg       | Bulgarian               |   ✓   |   ✓    |  ✓   |
+| bn       | Bengali                 |   ✓   |   ✓    |  ✓   |
+| bs       | Bosnian                 |       |   ✓    |      |
+| ca       | Catalan                 |   ✓   |   ✓    |  ✓   |
+| cs       | Czech                   |   ✓   |   ✓    |  ✓   |
+| cy       | Welsh                   |       |   ✓    |      |
+| da       | Danish                  |   ✓   |   ✓    |  ✓   |
+| de       | German                  |   ✓   |   ✓    |  ✓   |
+| el       | Greek                   |   ✓   |   ✓    |  ✓   |
+| en       | English                 |   ✓   |   ✓    |  ✓   |
+| en-GB    | English [UK] (heur.)    |       |   ✓    |      |
+| en-US    | English [US] (heur.)    |       |   ✓    |      |
+| eo       | Esperanto               |       |   ✓    |      |
+| es       | Spanish                 |   ✓   |   ✓    |  ✓   |
+| es-MX    | Mexican Spanish         |   ✓   |        |      |
+| et       | Estonian                |   ✓   |   ✓    |  ✓   |
+| eu       | Basque                  |       |   ✓    |      |
+| fa       | Persian                 |   ✓   |   ✓    |  ✓   |
+| fi       | Finnish                 |   ✓   |   ✓    |  ✓   |
+| fil      | Filipino                |   ✓   |        |      |
+| fr       | French                  |   ✓   |   ✓    |  ✓   |
+| fr-CA    | Canadian French (heur.) |   ✓   |   ✓    |  ✓   |
+| fr-FR    | European French (heur.) |   ✓   |   ✓    |  ✓   |
+| ga       | Irish                   |       |   ✓    |      |
+| gu       | Gujarati                |   ✓   |   ✓    |  ✓   |
+| ha       | Hausa                   |       |   ✓    |      |
+| he       | Hebrew                  |   ✓   |   ✓    |  ✓   |
+| hi       | Hindi                   |   ✓   |   ✓    |  ✓   |
+| hr       | Croatian                |   ✓   |   ✓    |  ✓   |
+| hu       | Hungarian               |   ✓   |   ✓    |  ✓   |
+| hy       | Armenian                |       |   ✓    |      |
+| id       | Indonesian              |   ✓   |   ✓    |  ✓   |
+| is       | Icelandic               |   ✓   |   ✓    |  ✓   |
+| it       | Italian                 |   ✓   |   ✓    |  ✓   |
+| ja       | Japanese                |   ✓   |   ✓    |  ✓   |
+| ka       | Georgian                |       |   ✓    |      |
+| kk       | Kazakh                  |       |   ✓    |      |
+| kn       | Kannada                 |   ✓   |   ✓    |  ✓   |
+| ko       | Korean                  |   ✓   |   ✓    |  ✓   |
+| la       | Latin                   |       |   ✓    |      |
+| lg       | Ganda                   |       |   ✓    |      |
+| lt       | Lithuanian              |   ✓   |   ✓    |  ✓   |
+| lv       | Latvian                 |   ✓   |   ✓    |  ✓   |
+| mi       | Maori                   |       |   ✓    |      |
+| mk       | Macedonian              |       |   ✓    |      |
+| ml       | Malayalam               |   ✓   |   ✓    |  ✓   |
+| mn       | Mongolian               |       |   ✓    |      |
+| mn-Cyrl  | Mongolian [Cyrl]        |       |   ✓    |      |
+| mn-Mong  | Mongolian [Mong]        |       |   ✓    |      |
+| mr       | Marathi                 |   ✓   |   ✓    |  ✓   |
+| ms       | Malay                   |   ✓   |   ✓    |  ✓   |
+| nb       | Norwegian Bokmål        |       |   ✓    |      |
+| ne       | Nepali                  |   ✓   |   ✓    |  ✓   |
+| nl       | Dutch                   |   ✓   |   ✓    |  ✓   |
+| nn       | Norwegian Nynorsk       |       |   ✓    |      |
+| no       | Norwegian               |   ✓   |        |      |
+| pa       | Punjabi                 |       |   ✓    |      |
+| pa-Arab  | Punjabi [Shahmukhi]     |       |   ✓    |      |
+| pa-Guru  | Punjabi [Gurmukhi]      |       |   ✓    |      |
+| pl       | Polish                  |   ✓   |   ✓    |  ✓   |
+| pt       | Portuguese              |   ✓   |   ✓    |  ✓   |
+| pt-BR    | Brazilian Pt (heur.)    |   ✓   |   ✓    |  ✓   |
+| pt-PT    | European Pt (heur.)     |   ✓   |   ✓    |  ✓   |
+| ro       | Romanian                |   ✓   |   ✓    |  ✓   |
+| ru       | Russian                 |   ✓   |   ✓    |  ✓   |
+| si       | Sinhala                 |   ✓   |   ✓    |  ✓   |
+| sk       | Slovak                  |   ✓   |   ✓    |  ✓   |
+| sl       | Slovenian               |   ✓   |   ✓    |  ✓   |
+| sn       | Shona                   |       |   ✓    |      |
+| so       | Somali                  |       |   ✓    |      |
+| sq       | Albanian                |       |   ✓    |      |
+| sr       | Serbian                 |   ✓   |   ✓    |  ✓   |
+| sr-Cyrl  | Serbian [Cyrl]          |       |   ✓    |      |
+| sr-Latn  | Serbian [Latn]          |       |   ✓    |      |
+| st       | Southern Sotho          |       |   ✓    |      |
+| sv       | Swedish                 |   ✓   |   ✓    |  ✓   |
+| sw       | Swahili                 |   ✓   |   ✓    |  ✓   |
+| sw-KE    | Kenyan Swahili          |   ✓   |        |      |
+| sw-TZ    | Tanzanian Swahili       |   ✓   |        |      |
+| ta       | Tamil                   |   ✓   |   ✓    |  ✓   |
+| te       | Telugu                  |   ✓   |   ✓    |  ✓   |
+| th       | Thai                    |   ✓   |   ✓    |  ✓   |
+| tl       | Tagalog                 |       |   ✓    |      |
+| tn       | Tswana                  |       |   ✓    |      |
+| tr       | Turkish                 |   ✓   |   ✓    |  ✓   |
+| ts       | Tsonga                  |       |   ✓    |      |
+| uk       | Ukrainian               |   ✓   |   ✓    |  ✓   |
+| ur       | Urdu                    |   ✓   |   ✓    |  ✓   |
+| vi       | Vietnamese              |   ✓   |   ✓    |  ✓   |
+| xh       | Xhosa                   |       |   ✓    |      |
+| yi       | Yiddish                 |   ✓   |   ✓    |  ✓   |
+| yo       | Yoruba                  |       |   ✓    |      |
+| zh       | Chinese                 |   ✓   |   ✓    |  ✓   |
+| zh-CN    | Simplified Chinese      |   ✓   |   ✓    |  ✓   |
+| zh-TW    | Traditional Chinese     |   ✓   |   ✓    |  ✓   |
+| zu       | Zulu                    |       |   ✓    |      |
+
+**Counts:** Translate enum has **98 variants** (`Language::all()`); detector
+emits **116 distinct codes** (lingua's 75 base + script and dialect refinements).
+The table above lists the canonical subset; call `GET /languages?for=translate`
+or `for=detect` for the authoritative live list.
+
+**Aliases.** When detect emits a code that isn't a translate variant directly,
+`POST /detect-language` includes a `translate_language` field that maps it
+to the right `Language` enum member. `FromStr` accepts any of these forms as
+input on `/translate`, so callers can pass either side:
+
+- `zh-Hans` ⇔ `zh-CN`, `zh-Hant` ⇔ `zh-TW` — script vs region BCP 47 subtag
+  style for the **same locale**. Detect emits the region form (matches
+  WMT24++); FromStr accepts both.
+- `nb` (Bokmål), `nn` (Nynorsk) → `no` — distinct ISO 639-1 codes for
+  distinct written standards. The model wasn't trained per-variant, so
+  translate has only the macrolanguage `no`. Detect emits `nb`/`nn`
+  (preserves the linguistic distinction); `translate_language` reports
+  `"no"`.
+- `tl` (Tagalog) → `fil` (Filipino) — distinct ISO 639-1 codes. Lingua
+  emits `tl`; WMT24++ uses `fil`. Detect emits `tl`; `translate_language`
+  reports `"fil"`.
+- `iw` → `he` — deprecated ISO 639-1 form for Hebrew, accepted as input.
+
+Example detect responses:
+```json
+{ "language": "nb",   "translate_language": "no",  "confidence": 0.92 }
+{ "language": "tl",   "translate_language": "fil", "confidence": 0.94 }
+{ "language": "cy",   "translate_language": null,  "confidence": 0.88 }  // Welsh — not translate-supported
+{ "language": "pt-BR","translate_language": "pt-BR","confidence": 0.96 } // already aligned
+```
 
 Source language is detected automatically — no configuration required.
 

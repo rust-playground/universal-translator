@@ -3457,6 +3457,7 @@ dependencies = [
 name = "translator-core"
 version = "0.0.5"
 dependencies = [
+ "aho-corasick",
  "crossbeam-channel",
  "encoding_rs",
  "lingua",

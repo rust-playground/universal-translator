@@ -42,17 +42,24 @@ pub struct EngineConfig {
 // ── Prompt builder ───────────────────────────────────────────────────────────
 
 /// Build a full Gemma instruct-format translation prompt.
+///
+/// Uses **full English language names** (`English`, `Brazilian Portuguese`)
+/// rather than BCP 47 codes. Diagnostic data showed the 4B model interpreting
+/// ambiguous 2-letter codes as other languages: `si` → Slovene, `or` → Spanish,
+/// `af` → Hindi. Full names eliminate that confusion at the cost of a few
+/// extra tokens per prompt. The system turn also pins the **target script**
+/// to discourage the model from falling back to a high-resource neighbour.
 fn translate_gemma_prompt(src_lang: Language, tgt_lang: Language, text: &str) -> String {
     format!(
         "<bos><start_of_turn>system\n\
-         You are a translation engine. Output only the translated text. \
-         Do not add explanations, alternatives, notes, or any other text.<end_of_turn>\n\
+         You are a translation engine. Output only the translated text in {tgt}, \
+         using the native script of {tgt}. Do not add explanations, alternatives, \
+         notes, or any other text.<end_of_turn>\n\
          <start_of_turn>user\n\
-         Translate from {} to {}:\n{}<end_of_turn>\n\
+         Translate from {src} to {tgt}:\n{text}<end_of_turn>\n\
          <start_of_turn>model\n",
-        src_lang.full_name(),
-        tgt_lang.full_name(),
-        text
+        src = src_lang.full_name(),
+        tgt = tgt_lang.full_name(),
     )
 }
 
@@ -313,17 +320,24 @@ impl TranslationEngine {
         self.detector.detect(text)
     }
 
-    /// Detect the language of `text`, returning full metadata including Lingua confidence.
+    /// Detect the language of `text` and return full metadata.
+    ///
+    /// Returns both the raw BCP 47 code (`language`) and its translate-side
+    /// equivalent (`translate_language`). They differ when the detector
+    /// emits an alias of a supported language — e.g. `"nb"` (Bokmål) is
+    /// detected but `translate_language = Some(No)` because the engine has
+    /// only the Norwegian macrolanguage. See `LanguageDetectionResult` for
+    /// the full mapping rules.
     pub fn detect_language_full(
         &self,
         text: &str,
     ) -> Result<LanguageDetectionResult, TranslatorError> {
         let (code, _language_name, confidence) = self.detector.detect_with_confidence(text)?;
-        let lang = code.parse::<Language>().ok();
+        let translate_language = code.parse::<Language>().ok();
         Ok(LanguageDetectionResult {
-            language: lang,
+            language: code,
+            translate_language,
             confidence,
-            translation_supported: lang.is_some(),
         })
     }
 
@@ -358,8 +372,9 @@ impl TranslationEngine {
                 .map(|text| {
                     let code = self.detector.detect(text)?;
                     code.parse::<Language>().map_err(|_| {
-                        TranslatorError::DetectionFailed(format!(
-                            "detected language '{code}' is not in the supported set"
+                        TranslatorError::UnsupportedLanguage(format!(
+                            "detected source language '{code}' is not supported for translation; \
+                             specify a supported source explicitly"
                         ))
                     })
                 })
@@ -528,10 +543,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_format() {
+    fn prompt_format_base() {
         let prompt = translate_gemma_prompt(Language::En, Language::Fr, "Hello");
-        assert!(prompt.contains("Translate from English to French:"));
+        assert!(prompt.contains("Translate from English to French:"), "got: {prompt}");
+        assert!(prompt.contains("native script of French"), "got: {prompt}");
         assert!(prompt.contains("Hello"));
         assert!(prompt.starts_with("<bos>"));
+    }
+
+    #[test]
+    fn prompt_format_regional() {
+        let prompt = translate_gemma_prompt(Language::En, Language::pt_BR, "Hello");
+        assert!(
+            prompt.contains("Translate from English to Brazilian Portuguese:"),
+            "got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn prompt_format_regional_chinese() {
+        let prompt = translate_gemma_prompt(Language::En, Language::zh_TW, "Hello");
+        assert!(
+            prompt.contains("Translate from English to Traditional Chinese:"),
+            "got: {prompt}"
+        );
     }
 }

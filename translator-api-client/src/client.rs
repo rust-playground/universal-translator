@@ -2,10 +2,10 @@ use std::future::Future;
 use std::time::Duration;
 
 use futures::Stream;
-use translator_core::Language;
 use translator_core::types::{
     LanguageDetectionResult, TranslationRequest, TranslationResult, TranslationResultSet,
 };
+use translator_core::Language;
 
 use crate::error::ClientError;
 use crate::retry::RetryConfig;
@@ -130,7 +130,10 @@ impl TranslatorClient {
         Ok(parse_sse_stream(resp))
     }
 
-    /// GET `/languages` — list supported languages with retry.
+    /// GET `/languages` — list translate-supported languages.
+    ///
+    /// Returns typed `Language` values. Use `.code()` and `.full_name()` on
+    /// each entry; no need for a separate name field on the wire.
     pub async fn languages(&self) -> Result<Vec<Language>, ClientError> {
         #[derive(serde::Deserialize)]
         struct Resp {
@@ -140,7 +143,32 @@ impl TranslatorClient {
         self.with_retry(|| async {
             let resp = self
                 .http
-                .get(format!("{}/languages", self.base_url))
+                .get(format!("{}/languages?for=translate", self.base_url))
+                .send()
+                .await?;
+            let resp: Resp = handle_response(resp).await?;
+            Ok(resp.languages)
+        })
+        .await
+    }
+
+    /// GET `/languages?for=detect` — list detect-supported codes (broader
+    /// than translate; includes lingua's full coverage plus script and
+    /// heuristic refinements).
+    ///
+    /// Returns raw BCP 47 code strings since the detect universe includes
+    /// codes outside the translate `Language` enum (e.g. `cy`, `eu`, `ka`).
+    /// Parse with `code.parse::<Language>().ok()` if you need the enum form.
+    pub async fn languages_detect(&self) -> Result<Vec<String>, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            languages: Vec<String>,
+        }
+
+        self.with_retry(|| async {
+            let resp = self
+                .http
+                .get(format!("{}/languages?for=detect", self.base_url))
                 .send()
                 .await?;
             let resp: Resp = handle_response(resp).await?;
