@@ -348,6 +348,28 @@ fn hi_ne_pair() -> &'static Pair {
             // subordinator
             "भन्ने",        // "saying"
             "ल्याउनुहोस्", // polite imperative "bring"
+            // High-frequency grammar absent from Hindi — these lift recall on
+            // ordinary sentences (the harness false-negatives that detected as
+            // hi/mr). Each is distinctive: Hindi uses है/ने/पड़ता/िए instead.
+            " छ",           // bare present copula (Hindi: " है"); leading space
+                            // avoids matching छ inside इच्छा/अच्छा
+            "हरू",          // plural suffix (Hindi: ें/ओं) — बच्चाहरू, पातहरू
+            "पर्छ",         // modal "must/has to" (Hindi: पड़ता है / चाहिए)
+            "नुभयो",        // honorific past (दिनुभयो, गर्नुभयो)
+            "नुहोस्",       // honorific imperative (थम्नुहोस्, ल्याउनुहोस्)
+            "नेछ",          // future suffix (हुनेछ, चल्नेछ, गरिनेछ)
+            "गरिन्छ",       // passive present
+            "ल्याउँछ",      // present "brings"
+            "आइपुग्छ",      // present "arrives" (Hindi: पहुँचता है)
+            "मात्र",        // "only" (Hindi: केवल / सिर्फ)
+            "दुवै",         // "both" (Hindi: दोनों)
+            "तेस्रो",       // "third" (Hindi: तीसरा)
+            "चाँडै",        // "soon" (Hindi: जल्दी)
+            "सम्म",         // "until" postposition (Hindi: तक)
+            "लागेको",       // "begun/about to" participle
+            "उनीले",        // 3sg ergative variant of उनले
+            "बेलुका",       // "evening" (Hindi: शाम)
+            "हप्ता",        // "week" (Hindi: सप्ताह / हफ़्ता)
         ];
         Pair::build("hi", hi, "ne", ne)
     })
@@ -484,6 +506,22 @@ mod tests {
         // is two distinctive Nepali markers in one phrase.
         let text = "ट्वेल्व विद्यार्थी नवीकरणीय ऊर्जा प्रणालीमा आधारित कार्यशालामा सहभागी भएका थिए।";
         assert_eq!(disambiguate("hi", text), Some("ne"));
+    }
+
+    #[test]
+    fn ne_commits_on_enriched_grammar_markers() {
+        // Real harness Nepali row that previously detected as mr (तेस्रो + गरेको
+        // + bare छ now commit ne).
+        let text = "कम्पनीले तेस्रो त्रैमासिकमा रेकर्ड मुनाफा घोषणा गरेको छ।";
+        assert_eq!(disambiguate("hi", text), Some("ne"));
+    }
+
+    #[test]
+    fn punjabi_target_hindi_output_stays_hi() {
+        // pa→Hindi is a genuine model failure: the output IS Hindi. The detector
+        // must keep calling it hi (not ne) so the harness still flags it FAIL.
+        let text = "यह सम्मेलन मंगलवार की सुबह शहर के केंद्र में आयोजित किया जाएगा।";
+        assert_ne!(disambiguate("hi", text), Some("ne"));
     }
 
     #[test]

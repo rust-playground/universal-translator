@@ -4,6 +4,7 @@ pub mod dialect;
 pub mod engine;
 pub mod error;
 pub mod language;
+pub mod lexical;
 pub mod model;
 pub mod scheduler;
 pub mod types;

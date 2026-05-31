@@ -2,6 +2,7 @@ use lingua::{Language as LinguaLanguage, LanguageDetector, LanguageDetectorBuild
 
 use crate::dialect;
 use crate::error::TranslatorError;
+use crate::lexical;
 
 pub struct Detector {
     inner: LanguageDetector,
@@ -43,6 +44,13 @@ impl Detector {
             return Ok(code.to_string());
         }
         if let Some(lang) = self.inner.detect_language_of(text) {
+            // Latin cross-language reclassification (gl/oc/ast/lb/ceb/su) runs
+            // before refine: lingua only knows the parent, so these minority
+            // languages must be recovered from marker words. On commit they have
+            // no sub-dialects, so skip refine entirely.
+            if let Some(code) = lexical::reclassify_latin(text) {
+                return Ok(code.to_string());
+            }
             let base = lingua_to_bcp47(&lang);
             return Ok(refine(&base, text));
         }
@@ -86,6 +94,12 @@ impl Detector {
         if let Some((lang, top)) = iter.next() {
             let second = iter.next().map(|(_, s)| s).unwrap_or(0.0);
             let confidence = if top + second > 0.0 { top / (top + second) } else { 1.0 };
+            // Latin cross-language reclassification (see `detect`). Reported
+            // confidence stays lingua's parent score — the reclassification is a
+            // heuristic refinement, like dialect disambiguation.
+            if let Some(code) = lexical::reclassify_latin(text) {
+                return Ok((code.to_string(), script_only_name(code).to_string(), confidence));
+            }
             let base = lingua_to_bcp47(&lang);
             let refined = refine(&base, text);
             let name = format!("{lang:?}");
@@ -114,9 +128,18 @@ fn script_only_name(code: &str) -> &'static str {
         "bo" => "Tibetan",
         "si" => "Sinhala",
         "am" => "Amharic",
+        "ti" => "Tigrinya",
+        "ps" => "Pashto",
         "as" => "Assamese",
         "ckb" => "Central Kurdish",
         "yi" => "Yiddish",
+        // Latin cross-language reclassification (lexical.rs).
+        "gl" => "Galician",
+        "oc" => "Occitan",
+        "ast" => "Asturian",
+        "lb" => "Luxembourgish",
+        "ceb" => "Cebuano",
+        "su" => "Sundanese",
         _ => "",
     }
 }
@@ -138,6 +161,13 @@ fn detect_within_script_override(text: &str) -> Option<&'static str> {
         // Sorani Kurdish-distinctive letters: ێ ۆ ڕ ڵ ڤ.
         if matches!(cp, 0x06CE | 0x06C6 | 0x0695 | 0x06B5 | 0x06A4) {
             return Some("ckb");
+        }
+        // Pashto-distinctive letters within the Arabic script block: ښ ږ ګ ړ ډ ټ ڼ.
+        // None appear in Persian/Arabic/Urdu prose, so this is a zero-false-positive
+        // commit (mirrors the Sorani case). Pashto without one of these letters
+        // falls through to lingua (typically `fa`).
+        if matches!(cp, 0x069A | 0x0696 | 0x06AB | 0x0693 | 0x0689 | 0x067C | 0x06BC) {
+            return Some("ps");
         }
     }
     None
@@ -167,6 +197,7 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("am", "Amharic — script fallback"),
     ("ar", "Arabic"),
     ("as", "Assamese — within-Bengali-script heuristic"),
+    ("ast", "Asturian — lexical heuristic"),
     ("az", "Azerbaijani"),
     ("az-Arab", "Azerbaijani (Arabic)"),
     ("az-Cyrl", "Azerbaijani (Cyrillic)"),
@@ -177,6 +208,7 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("bo", "Tibetan — script fallback"),
     ("bs", "Bosnian"),
     ("ca", "Catalan"),
+    ("ceb", "Cebuano — lexical heuristic"),
     ("ckb", "Central Kurdish — within-Arabic-script heuristic"),
     ("cs", "Czech"),
     ("cy", "Welsh"),
@@ -199,6 +231,7 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("fr-CA", "Canadian French — heuristic"),
     ("fr-FR", "European French — heuristic"),
     ("ga", "Irish"),
+    ("gl", "Galician — lexical heuristic"),
     ("gu", "Gujarati"),
     ("ha", "Hausa"),
     ("he", "Hebrew"),
@@ -216,6 +249,7 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("kn", "Kannada"),
     ("ko", "Korean"),
     ("la", "Latin"),
+    ("lb", "Luxembourgish — lexical heuristic"),
     ("lg", "Ganda"),
     ("lo", "Lao — script fallback"),
     ("lt", "Lithuanian"),
@@ -232,11 +266,13 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("ne", "Nepali — heuristic"),
     ("nl", "Dutch"),
     ("no", "Norwegian (Bokmål/Nynorsk normalized)"),
+    ("oc", "Occitan — lexical heuristic"),
     ("or", "Oriya — script fallback"),
     ("pa", "Punjabi"),
     ("pa-Arab", "Punjabi (Shahmukhi)"),
     ("pa-Guru", "Punjabi (Gurmukhi)"),
     ("pl", "Polish"),
+    ("ps", "Pashto — within-Arabic-script heuristic"),
     ("pt", "Portuguese"),
     ("pt-BR", "Brazilian Portuguese — heuristic"),
     ("pt-PT", "European Portuguese — heuristic"),
@@ -252,11 +288,13 @@ static DETECT_SUPPORTED_CODES: &[(&str, &str)] = &[
     ("sr-Cyrl", "Serbian (Cyrillic)"),
     ("sr-Latn", "Serbian (Latin)"),
     ("st", "Southern Sotho"),
+    ("su", "Sundanese — lexical heuristic"),
     ("sv", "Swedish"),
     ("sw", "Swahili"),
     ("ta", "Tamil"),
     ("te", "Telugu"),
     ("th", "Thai"),
+    ("ti", "Tigrinya — within-Ethiopic-script heuristic"),
     ("tn", "Tswana"),
     ("tr", "Turkish"),
     ("ts", "Tsonga"),
@@ -423,10 +461,10 @@ const TRADITIONAL_EXCLUSIVE: &[char] = &[
 /// they're shared across multiple supported languages (Devanagari: hi, ne,
 /// mr, mai; Bengali: bn, as) and need lingua or heuristics to disambiguate.
 ///
-/// Ethiopic (`am`): script is shared with `ti` (Tigrinya). Defaults to `am`
-/// since short text in either is indistinguishable by script alone — the
-/// Tigrinya-distinctive Ge'ez letters (qha series, U+1250–U+1258) appear
-/// occasionally in Amharic too, so committing on them caused false positives.
+/// Ethiopic: script is shared by `am` (Amharic) and `ti` (Tigrinya). The block
+/// is routed through [`lexical::disambiguate_geez`], which defaults to `am` and
+/// commits to `ti` only on Tigrinya-distinctive function words. Short text in
+/// either stays `am` (indistinguishable by script alone).
 fn detect_script_only(text: &str) -> Option<&'static str> {
     for c in text.chars() {
         let hit = match c as u32 {
@@ -442,7 +480,7 @@ fn detect_script_only(text: &str) -> Option<&'static str> {
             0x1000..=0x109F => Some("my"), // Burmese
             0x0F00..=0x0FFF => Some("bo"), // Tibetan
             0x0D80..=0x0DFF => Some("si"), // Sinhala
-            0x1200..=0x137F => Some("am"), // Ethiopic (am; ti round-trips as am)
+            0x1200..=0x137F => Some(lexical::disambiguate_geez(text)), // Ethiopic: am vs ti
             _ => None,
         };
         if hit.is_some() {
@@ -606,6 +644,34 @@ mod tests {
         assert_eq!(detect_within_script_override("hello world"), None);
         assert_eq!(detect_within_script_override("السلام عليكم"), None);
         assert_eq!(detect_within_script_override("আমি বাংলা বলি"), None);
+    }
+
+    #[test]
+    fn within_script_override_routes_pashto_before_lingua() {
+        // ښ (U+069A), ګ (U+06AB) are Pashto-distinctive — never in Persian/Arabic.
+        assert_eq!(detect_within_script_override("د کنفرانس ورځ، په ښار کې وشي."), Some("ps"));
+        assert_eq!(detect_within_script_override("ګورو ته ورځ"), Some("ps"));
+    }
+
+    #[test]
+    fn within_script_override_persian_without_pashto_letters_is_none() {
+        // Plain Persian — no Pashto-distinctive letters, so ps must not fire.
+        assert_eq!(detect_within_script_override("سلام علیکم چطور هستید"), None);
+    }
+
+    #[test]
+    fn ethiopic_defaults_to_amharic() {
+        // Real Amharic — copula/passive anchors keep it `am`.
+        assert_eq!(
+            detect_script_only("የተሰጠው ኮንፈረንስ፣ ሰኞ ጠዋት ከተማ ማዕከል ላይ ይካሄዳል።"),
+            Some("am")
+        );
+    }
+
+    #[test]
+    fn ethiopic_commits_tigrinya_on_markers() {
+        // Real Tigrinya — distinctive function words ኣብ / ናይ commit `ti`.
+        assert_eq!(detect_script_only("ዋሓኑ ኣብ ናይ ወጻኢ ወርሒ፣ ብሓደ።"), Some("ti"));
     }
 
     #[test]
