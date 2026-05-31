@@ -9,12 +9,13 @@ use crate::error::TranslatorError;
 
 /// Supported translate-side languages and locales.
 ///
-/// 111 variants: WMT24++ validated set (53 base + 11 regional pairs), plus
-/// codes added for HubSpot/harness coverage. The original 21 added codes
-/// were pruned by harness runs — 18 dropped because the model produced
-/// wrong-language or script-salad output (e.g. `Pa` → Hindi, `Jv` → Indonesian,
-/// `Kac` → Burmese). Remaining additions are codes the model can actually
-/// translate, even when the detector struggles to disambiguate them.
+/// 98 variants: WMT24++ validated set (53 base + 11 regional pairs), plus
+/// codes added for HubSpot/harness coverage. Codes the 4B model cannot
+/// actually produce were pruned by harness runs — it emits wrong-language or
+/// script-salad output for them (e.g. `Pa` → Hindi, `Ti` → Amharic,
+/// `Tk`/`Tt` → Kazakh, `Jv` → Indonesian, `Kac` → Burmese). Remaining
+/// additions are codes the model can translate, even when the detector
+/// struggles to disambiguate them.
 ///
 /// The detector returns a `String` (BCP 47 code) and may produce codes outside
 /// this enum (lingua-only base languages, script subtags such as `sr-Cyrl`,
@@ -28,7 +29,7 @@ use crate::error::TranslatorError;
 /// Quality tiers (best-effort labels — see eval/ harness for systematic
 /// evaluation):
 /// - WMT24++ validated: 53 base + 11 regional pairs. Google has metrics.
-/// - Inherited best-effort: `Af`, `Am`, `Ha`, `Ms`, `Mt`, `Ne`, `Si`, `Yi` —
+/// - Inherited best-effort: `Af`, `Am`, `Ms`, `Ne`, `Si`, `Yi` —
 ///   in the original master enum but not in WMT24++.
 /// - Evaluation-validated additions: confirmed translatable by harness
 ///   (eval/results/).
@@ -48,7 +49,6 @@ pub enum Language {
     Be,
     Bg,
     Bn,
-    Bo,
     Bs,
     Ca,
     Ceb,
@@ -74,14 +74,12 @@ pub enum Language {
     fr_FR,
     Gl,
     Gu,
-    Ha,
     He,
     Hi,
     Hr,
     Hu,
     Hy,
     Id,
-    Ig,
     Is,
     It,
     Ja,
@@ -92,25 +90,20 @@ pub enum Language {
     Ko,
     Ky,
     Lb,
-    Lg,
     Lo,
     Lt,
     Lv,
-    Mg,
-    Mi,
     Mk,
     Ml,
     Mn,
     Mr,
     Ms,
-    Mt,
     My,
     Ne,
     Nl,
     No,
     Oc,
     Or,
-    Pa,
     Pl,
     Ps,
     Pt,
@@ -118,7 +111,6 @@ pub enum Language {
     pt_PT,
     Ro,
     Ru,
-    Rup,
     Rw,
     Si,
     Sk,
@@ -134,23 +126,19 @@ pub enum Language {
     Te,
     Tg,
     Th,
-    Ti,
-    Tk,
     Tr,
-    Tt,
     Uk,
     Ur,
     Uz,
     Vi,
     Yi,
-    Yue,
     Zh,
     zh_CN,
     zh_HK,
     zh_TW,
 }
 
-static ALL_LANGUAGES: [Language; 111] = [
+static ALL_LANGUAGES: [Language; 98] = [
     Language::Af,
     Language::Am,
     Language::Ar,
@@ -162,7 +150,6 @@ static ALL_LANGUAGES: [Language; 111] = [
     Language::Be,
     Language::Bg,
     Language::Bn,
-    Language::Bo,
     Language::Bs,
     Language::Ca,
     Language::Ceb,
@@ -188,14 +175,12 @@ static ALL_LANGUAGES: [Language; 111] = [
     Language::fr_FR,
     Language::Gl,
     Language::Gu,
-    Language::Ha,
     Language::He,
     Language::Hi,
     Language::Hr,
     Language::Hu,
     Language::Hy,
     Language::Id,
-    Language::Ig,
     Language::Is,
     Language::It,
     Language::Ja,
@@ -206,25 +191,20 @@ static ALL_LANGUAGES: [Language; 111] = [
     Language::Ko,
     Language::Ky,
     Language::Lb,
-    Language::Lg,
     Language::Lo,
     Language::Lt,
     Language::Lv,
-    Language::Mg,
-    Language::Mi,
     Language::Mk,
     Language::Ml,
     Language::Mn,
     Language::Mr,
     Language::Ms,
-    Language::Mt,
     Language::My,
     Language::Ne,
     Language::Nl,
     Language::No,
     Language::Oc,
     Language::Or,
-    Language::Pa,
     Language::Pl,
     Language::Ps,
     Language::Pt,
@@ -232,7 +212,6 @@ static ALL_LANGUAGES: [Language; 111] = [
     Language::pt_PT,
     Language::Ro,
     Language::Ru,
-    Language::Rup,
     Language::Rw,
     Language::Si,
     Language::Sk,
@@ -248,16 +227,12 @@ static ALL_LANGUAGES: [Language; 111] = [
     Language::Te,
     Language::Tg,
     Language::Th,
-    Language::Ti,
-    Language::Tk,
     Language::Tr,
-    Language::Tt,
     Language::Uk,
     Language::Ur,
     Language::Uz,
     Language::Vi,
     Language::Yi,
-    Language::Yue,
     Language::Zh,
     Language::zh_CN,
     Language::zh_HK,
@@ -279,7 +254,6 @@ impl Language {
             Self::Be => "be",
             Self::Bg => "bg",
             Self::Bn => "bn",
-            Self::Bo => "bo",
             Self::Bs => "bs",
             Self::Ca => "ca",
             Self::Ceb => "ceb",
@@ -305,14 +279,12 @@ impl Language {
             Self::fr_FR => "fr-FR",
             Self::Gl => "gl",
             Self::Gu => "gu",
-            Self::Ha => "ha",
             Self::He => "he",
             Self::Hi => "hi",
             Self::Hr => "hr",
             Self::Hu => "hu",
             Self::Hy => "hy",
             Self::Id => "id",
-            Self::Ig => "ig",
             Self::Is => "is",
             Self::It => "it",
             Self::Ja => "ja",
@@ -323,25 +295,20 @@ impl Language {
             Self::Ko => "ko",
             Self::Ky => "ky",
             Self::Lb => "lb",
-            Self::Lg => "lg",
             Self::Lo => "lo",
             Self::Lt => "lt",
             Self::Lv => "lv",
-            Self::Mg => "mg",
-            Self::Mi => "mi",
             Self::Mk => "mk",
             Self::Ml => "ml",
             Self::Mn => "mn",
             Self::Mr => "mr",
             Self::Ms => "ms",
-            Self::Mt => "mt",
             Self::My => "my",
             Self::Ne => "ne",
             Self::Nl => "nl",
             Self::No => "no",
             Self::Oc => "oc",
             Self::Or => "or",
-            Self::Pa => "pa",
             Self::Pl => "pl",
             Self::Ps => "ps",
             Self::Pt => "pt",
@@ -349,7 +316,6 @@ impl Language {
             Self::pt_PT => "pt-PT",
             Self::Ro => "ro",
             Self::Ru => "ru",
-            Self::Rup => "rup",
             Self::Rw => "rw",
             Self::Si => "si",
             Self::Sk => "sk",
@@ -365,16 +331,12 @@ impl Language {
             Self::Te => "te",
             Self::Tg => "tg",
             Self::Th => "th",
-            Self::Ti => "ti",
-            Self::Tk => "tk",
             Self::Tr => "tr",
-            Self::Tt => "tt",
             Self::Uk => "uk",
             Self::Ur => "ur",
             Self::Uz => "uz",
             Self::Vi => "vi",
             Self::Yi => "yi",
-            Self::Yue => "yue",
             Self::Zh => "zh",
             Self::zh_CN => "zh-CN",
             Self::zh_HK => "zh-HK",
@@ -396,7 +358,6 @@ impl Language {
             Self::Be => "Belarusian",
             Self::Bg => "Bulgarian",
             Self::Bn => "Bengali",
-            Self::Bo => "Tibetan",
             Self::Bs => "Bosnian",
             Self::Ca => "Catalan",
             Self::Ceb => "Cebuano",
@@ -422,14 +383,12 @@ impl Language {
             Self::fr_FR => "European French",
             Self::Gl => "Galician",
             Self::Gu => "Gujarati",
-            Self::Ha => "Hausa",
             Self::He => "Hebrew",
             Self::Hi => "Hindi",
             Self::Hr => "Croatian",
             Self::Hu => "Hungarian",
             Self::Hy => "Armenian",
             Self::Id => "Indonesian",
-            Self::Ig => "Igbo",
             Self::Is => "Icelandic",
             Self::It => "Italian",
             Self::Ja => "Japanese",
@@ -440,25 +399,20 @@ impl Language {
             Self::Ko => "Korean",
             Self::Ky => "Kyrgyz",
             Self::Lb => "Luxembourgish",
-            Self::Lg => "Ganda",
             Self::Lo => "Lao",
             Self::Lt => "Lithuanian",
             Self::Lv => "Latvian",
-            Self::Mg => "Malagasy",
-            Self::Mi => "Maori",
             Self::Mk => "Macedonian",
             Self::Ml => "Malayalam",
             Self::Mn => "Mongolian",
             Self::Mr => "Marathi",
             Self::Ms => "Malay",
-            Self::Mt => "Maltese",
             Self::My => "Burmese",
             Self::Ne => "Nepali",
             Self::Nl => "Dutch",
             Self::No => "Norwegian",
             Self::Oc => "Occitan",
             Self::Or => "Oriya",
-            Self::Pa => "Punjabi",
             Self::Pl => "Polish",
             Self::Ps => "Pashto",
             Self::Pt => "Portuguese",
@@ -466,7 +420,6 @@ impl Language {
             Self::pt_PT => "European Portuguese",
             Self::Ro => "Romanian",
             Self::Ru => "Russian",
-            Self::Rup => "Aromanian",
             Self::Rw => "Kinyarwanda",
             Self::Si => "Sinhala",
             Self::Sk => "Slovak",
@@ -482,16 +435,12 @@ impl Language {
             Self::Te => "Telugu",
             Self::Tg => "Tajik",
             Self::Th => "Thai",
-            Self::Ti => "Tigrinya",
-            Self::Tk => "Turkmen",
             Self::Tr => "Turkish",
-            Self::Tt => "Tatar",
             Self::Uk => "Ukrainian",
             Self::Ur => "Urdu",
             Self::Uz => "Uzbek",
             Self::Vi => "Vietnamese",
             Self::Yi => "Yiddish",
-            Self::Yue => "Cantonese",
             Self::Zh => "Chinese",
             Self::zh_CN => "Simplified Chinese",
             Self::zh_HK => "Hong Kong Chinese",
@@ -503,7 +452,7 @@ impl Language {
     /// 0 = CJK, 1 = Indic, 2 = RTL, 3 = Thai, 4 = Latin/Cyrillic.
     pub fn script_group(self) -> u8 {
         match self {
-            Self::Zh | Self::zh_CN | Self::zh_HK | Self::zh_TW | Self::Yue | Self::Ja | Self::Ko => 0,
+            Self::Zh | Self::zh_CN | Self::zh_HK | Self::zh_TW | Self::Ja | Self::Ko => 0,
             Self::Hi
             | Self::Bn
             | Self::Gu
@@ -511,7 +460,6 @@ impl Language {
             | Self::Ml
             | Self::Mr
             | Self::Ne
-            | Self::Pa
             | Self::Si
             | Self::Ta
             | Self::Te => 1,
@@ -529,7 +477,7 @@ impl Language {
         }
     }
 
-    /// All 111 supported translate-side languages, sorted by BCP 47 code.
+    /// All 98 supported translate-side languages, sorted by BCP 47 code.
     pub fn all() -> &'static [Language] {
         &ALL_LANGUAGES
     }
@@ -588,7 +536,6 @@ fn lookup_exact(normalized: &str) -> Option<Language> {
         "be" => Some(Be),
         "bg" => Some(Bg),
         "bn" => Some(Bn),
-        "bo" => Some(Bo),
         "bs" => Some(Bs),
         "ca" => Some(Ca),
         "ceb" => Some(Ceb),
@@ -608,14 +555,12 @@ fn lookup_exact(normalized: &str) -> Option<Language> {
         "fr" => Some(Fr),
         "gl" => Some(Gl),
         "gu" => Some(Gu),
-        "ha" => Some(Ha),
         "he" | "iw" => Some(He),
         "hi" => Some(Hi),
         "hr" => Some(Hr),
         "hu" => Some(Hu),
         "hy" => Some(Hy),
         "id" => Some(Id),
-        "ig" => Some(Ig),
         "is" => Some(Is),
         "it" => Some(It),
         "ja" => Some(Ja),
@@ -626,31 +571,25 @@ fn lookup_exact(normalized: &str) -> Option<Language> {
         "ko" => Some(Ko),
         "ky" => Some(Ky),
         "lb" => Some(Lb),
-        "lg" => Some(Lg),
         "lo" => Some(Lo),
         "lt" => Some(Lt),
         "lv" => Some(Lv),
-        "mg" => Some(Mg),
-        "mi" => Some(Mi),
         "mk" => Some(Mk),
         "ml" => Some(Ml),
         "mn" => Some(Mn),
         "mr" => Some(Mr),
         "ms" => Some(Ms),
-        "mt" => Some(Mt),
         "my" => Some(My),
         "ne" => Some(Ne),
         "nl" => Some(Nl),
         "no" | "nb" | "nn" => Some(No),
         "oc" => Some(Oc),
         "or" => Some(Or),
-        "pa" => Some(Pa),
         "pl" => Some(Pl),
         "ps" => Some(Ps),
         "pt" => Some(Pt),
         "ro" => Some(Ro),
         "ru" => Some(Ru),
-        "rup" => Some(Rup),
         "rw" => Some(Rw),
         "si" => Some(Si),
         "sk" => Some(Sk),
@@ -664,16 +603,12 @@ fn lookup_exact(normalized: &str) -> Option<Language> {
         "te" => Some(Te),
         "tg" => Some(Tg),
         "th" => Some(Th),
-        "ti" => Some(Ti),
-        "tk" => Some(Tk),
         "tr" => Some(Tr),
-        "tt" => Some(Tt),
         "uk" => Some(Uk),
         "ur" => Some(Ur),
         "uz" => Some(Uz),
         "vi" => Some(Vi),
         "yi" => Some(Yi),
-        "yue" => Some(Yue),
         "zh" => Some(Zh),
         // Regional pairs (and BCP 47 script subtag aliases for Chinese)
         "ar-eg" => Some(ar_EG),
@@ -752,8 +687,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_111_languages() {
-        assert_eq!(Language::all().len(), 111);
+    fn all_98_languages() {
+        assert_eq!(Language::all().len(), 98);
     }
 
     #[test]

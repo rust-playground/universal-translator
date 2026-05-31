@@ -5,7 +5,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)]()
 
-A universal text translator built in Rust. Uses [llama.cpp](https://github.com/ggerganov/llama.cpp) (via the `llama-cpp-2` Rust crate) for fast, fully local inference of [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) (Gemma 3 4B instruction-tuned) — 70 translate-side languages and locales (55 base + 11 WMT24++ regional pairs + 4 added base codes) — and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection (75 base languages, plus script and heuristic refinements that surface regional variants like `zh-Hant` and `pt-BR`).
+A universal text translator built in Rust. Uses [llama.cpp](https://github.com/ggerganov/llama.cpp) (via the `llama-cpp-2` Rust crate) for fast, fully local inference of [TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it) (Gemma 3 4B instruction-tuned) — 98 translate-side languages and locales (WMT24++ validated set plus harness-validated additions) — and [Lingua](https://github.com/pemistahl/lingua-rs) for automatic source-language detection (75 base languages, plus script and heuristic refinements that surface regional variants like `zh-Hant` and `pt-BR`).
 
 No API keys required. No network calls at runtime. Everything runs on your machine.
 
@@ -85,7 +85,7 @@ detect`) for the live list.
 | fr-FR    | European French (heur.) |   ✓   |   ✓    |  ✓   |
 | ga       | Irish                   |       |   ✓    |      |
 | gu       | Gujarati                |   ✓   |   ✓    |  ✓   |
-| ha       | Hausa                   |   ✓   |   ✓    |  ✓   |
+| ha       | Hausa                   |       |   ✓    |      |
 | he       | Hebrew                  |   ✓   |   ✓    |  ✓   |
 | hi       | Hindi                   |   ✓   |   ✓    |  ✓   |
 | hr       | Croatian                |   ✓   |   ✓    |  ✓   |
@@ -111,13 +111,12 @@ detect`) for the live list.
 | mn-Mong  | Mongolian [Mong]        |       |   ✓    |      |
 | mr       | Marathi                 |   ✓   |   ✓    |  ✓   |
 | ms       | Malay                   |   ✓   |   ✓    |  ✓   |
-| mt       | Maltese                 |   ✓   |        |      |
 | nb       | Norwegian Bokmål        |       |   ✓    |      |
 | ne       | Nepali                  |   ✓   |   ✓    |  ✓   |
 | nl       | Dutch                   |   ✓   |   ✓    |  ✓   |
 | nn       | Norwegian Nynorsk       |       |   ✓    |      |
 | no       | Norwegian               |   ✓   |        |      |
-| pa       | Punjabi                 |   ✓   |   ✓    |  ✓   |
+| pa       | Punjabi                 |       |   ✓    |      |
 | pa-Arab  | Punjabi [Shahmukhi]     |       |   ✓    |      |
 | pa-Guru  | Punjabi [Gurmukhi]      |       |   ✓    |      |
 | pl       | Polish                  |   ✓   |   ✓    |  ✓   |
@@ -158,8 +157,8 @@ detect`) for the live list.
 | zh-TW    | Traditional Chinese     |   ✓   |   ✓    |  ✓   |
 | zu       | Zulu                    |       |   ✓    |      |
 
-**Counts:** Translate enum has **111 variants** (`Language::all()`); detector
-emits **108 distinct codes** (lingua's 75 base + script and dialect refinements).
+**Counts:** Translate enum has **98 variants** (`Language::all()`); detector
+emits **116 distinct codes** (lingua's 75 base + script and dialect refinements).
 The table above lists the canonical subset; call `GET /languages?for=translate`
 or `for=detect` for the authoritative live list.
 
